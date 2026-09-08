@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from darkweb_collector.adapters.base import SiteAdapter
+from darkweb_collector.adapters.breachforums import BreachforumsAdapter
 from darkweb_collector.adapters.changan import ChanganAdapter
 from darkweb_collector.adapters.chaos import ChaosAdapter
 from darkweb_collector.adapters.cracked import CrackedAdapter
@@ -16,6 +17,7 @@ ADAPTERS: dict[str, SiteAdapter] = {
     DragonforceAdapter.site_name: DragonforceAdapter(),
     DarkforumsAdapter.site_name: DarkforumsAdapter(),
     CrackedAdapter.site_name: CrackedAdapter(),
+    BreachforumsAdapter.site_name: BreachforumsAdapter(),
     PwnfrmAdapter.site_name: PwnfrmAdapter(),
     RaidforumsAdapter.site_name: RaidforumsAdapter(),
     ChaosAdapter.site_name: ChaosAdapter(),

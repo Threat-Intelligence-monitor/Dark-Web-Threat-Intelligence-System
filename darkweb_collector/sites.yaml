@@ -97,6 +97,32 @@
       "browser_storage_state_file": "browser-state/cracked/storage-state.json"
     },
     {
+      "site_name": "breachforums",
+      "enabled": true,
+      "seed_urls": [
+        "https://bf.st/Forum-Databases?sortby=started&order=desc&datecut=9999",
+        "https://bf.st/Forum-Other-Leaks?sortby=started&order=desc&datecut=9999",
+        "https://bf.st/Forum-Leaks-Market?sortby=started&order=desc&datecut=9999",
+        "https://bf.st/Forum-Sellers-Place?sortby=started&order=desc&datecut=9999"
+      ],
+      "seed_fetch_mode": "browser",
+      "detail_fetch_mode": "browser",
+      "browser_queue": "browser_public",
+      "profile": "hot",
+      "max_topics_per_run": 20,
+      "max_detail_pages_per_run": 10,
+      "cooldown_seconds": 900,
+      "output_dir": "output/breachforums",
+      "dedupe_window_minutes": 180,
+      "recent_pages_per_run": 1,
+      "backfill_pages_per_run": 5,
+      "frontier_max_pending": 500,
+      "max_concurrent_details": 1,
+      "display_name": "BreachForums（bf.st）",
+      "render_wait_seconds": 8,
+      "fetch_timeout_seconds": 90
+    },
+    {
       "site_name": "raidforums",
       "enabled": true,
       "seed_urls": [

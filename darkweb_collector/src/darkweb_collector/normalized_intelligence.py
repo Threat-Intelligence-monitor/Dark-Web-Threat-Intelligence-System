@@ -37,6 +37,7 @@ from darkweb_collector.db import (
     upsert_normalized_intelligence_cache_state,
 )
 from darkweb_collector.runtime import output_root, project_root
+from darkweb_collector.sites.breachforums import normalize_breachforums_timestamp
 from darkweb_collector.sites.cracked import normalize_cracked_timestamp
 from darkweb_collector.sites.darkforums import clean_extracted_attackers, normalize_darkforums_timestamp
 from darkweb_collector.sites.pwnfrm import normalize_pwnfrm_timestamp
@@ -62,6 +63,7 @@ WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
 SOURCE_LABELS = {
     "changan": "长安不夜城",
+    "breachforums": "BreachForums（bf.st）",
     "cracked": "Cracked",
     "darkforums": "DarkForums",
     "dragonforce": "DragonForce",
@@ -406,6 +408,7 @@ NOISY_VICTIM_DOMAINS = {
 }
 
 SOURCE_HOSTNAME_KEYWORDS = {
+    "breachforums",
     "cracked",
     "darkforums",
     "dragonforce",
@@ -420,6 +423,7 @@ SOURCE_HOSTNAME_KEYWORDS = {
 
 
 _FORUM_TIMESTAMP_NORMALIZERS = {
+    "breachforums": normalize_breachforums_timestamp,
     "cracked": normalize_cracked_timestamp,
     "darkforums": normalize_darkforums_timestamp,
     "pwnfrm": normalize_pwnfrm_timestamp,
