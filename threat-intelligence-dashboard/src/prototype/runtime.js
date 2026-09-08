@@ -1109,12 +1109,21 @@ export function initializePrototype() {
     })
   }
 
+  function navigateSearch(target) {
+    const link = document.createElement('a')
+    link.href = target
+    link.hidden = true
+    document.querySelector('.prototype-screen').appendChild(link)
+    link.click()
+    link.remove()
+  }
+
   function setupGlobalSearch() {
     $$('[data-global-search]').forEach((input) => {
       input.addEventListener('keydown', (event) => {
         if (event.key !== 'Enter') return
         const query = input.value.trim()
-        if (query) window.location.href = `/intelligence?q=${encodeURIComponent(query)}`
+        if (query) navigateSearch(`/intelligence?q=${encodeURIComponent(query)}`)
       })
     })
     const query = new URLSearchParams(window.location.search).get('q')
@@ -1150,10 +1159,11 @@ export function initializePrototype() {
       url.searchParams.delete('page')
       const target = `${url.pathname}${url.search}`
       if (`${window.location.pathname}${window.location.search}` === target) {
+        results.dispatchEvent(new Event('prototype:server-refresh'))
         moveToResults()
         return
       }
-      window.location.href = target
+      navigateSearch(target)
     }
 
     form.addEventListener('submit', (event) => {
@@ -1178,7 +1188,7 @@ export function initializePrototype() {
 
     $('[data-intel-reset]')?.addEventListener('click', () => {
       if (results.dataset.serverPagination === 'true') {
-        window.location.href = '/intelligence'
+        navigateSearch('/intelligence')
         return
       }
       if (new URLSearchParams(window.location.search).has('q')) {

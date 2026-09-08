@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from hashlib import sha1
 import json
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import sqlite3
 from threading import Lock
+from time import monotonic
 from typing import Any
 
 import darkweb_collector.monitoring_rules as monitoring_rules_module
@@ -22,11 +24,11 @@ from darkweb_collector.document_exposure import (
 )
 from darkweb_collector.db import (
     count_normalized_intelligence_events,
-    count_normalized_intelligence_events_by_type,
     get_db_connection,
     get_normalized_intelligence_cache_state,
     get_site_connectivity_probe_map,
     list_vulnerability_records,
+    search_normalized_intelligence_events,
 )
 from darkweb_collector.job_diagnostics import (
     classify_error,
@@ -36,6 +38,7 @@ from darkweb_collector.job_diagnostics import (
 )
 from darkweb_collector.normalized_intelligence import (
     _build_vulnerability_base_event,
+    _hydrate_event_row,
     _label_source as _normalized_source_label,
     build_display_title,
     ensure_normalized_intelligence,
@@ -660,6 +663,36 @@ EVENT_SEARCH_TYPES = {
     "vulnerability": "vulnerability",
 }
 
+_SEARCH_CACHE_TTL = 15.0
+_SEARCH_CACHE_LIMIT = 128
+_SEARCH_CACHE_LOCK = Lock()
+_SEARCH_COUNTS_CACHE: OrderedDict = OrderedDict()
+_SEARCH_PAGE_CACHE: OrderedDict = OrderedDict()
+
+
+def _search_cache_get(cache, key):
+    if key is None:
+        return None
+    with _SEARCH_CACHE_LOCK:
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        if monotonic() - entry[0] >= _SEARCH_CACHE_TTL:
+            del cache[key]
+            return None
+        cache.move_to_end(key)
+        return deepcopy(entry[1])
+
+
+def _search_cache_put(cache, key, value):
+    if key is None:
+        return
+    with _SEARCH_CACHE_LOCK:
+        cache[key] = (monotonic(), deepcopy(value))
+        cache.move_to_end(key)
+        while len(cache) > _SEARCH_CACHE_LIMIT:
+            cache.popitem(last=False)
+
 
 def build_event_search_payload(
     *,
@@ -668,10 +701,46 @@ def build_event_search_payload(
     query: str = "",
     event_type: str = "all",
     sort: str = "latest",
+    timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
+    started = monotonic()
+    if timings is None:
+        timings = {}
     database_event_type = EVENT_SEARCH_TYPES[event_type]
     with get_db_connection() as connection:
-        database_counts = count_normalized_intelligence_events_by_type(connection, query=query)
+        timings["connection"] = (monotonic() - started) * 1000
+        phase = monotonic()
+        identity = getattr(connection, "cache_identity", None)
+        # Keep the revision, counts and page within the same database snapshot.
+        begin = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ" if identity and identity[0] == "postgresql" else "BEGIN"
+        connection.execute(begin)
+        state = get_normalized_intelligence_cache_state(connection)
+        if state is None and count_normalized_intelligence_events(connection) == 0:
+            connection.rollback()
+            ensure_normalized_intelligence(connection, enrichment_budget=0)
+            connection.commit()
+            connection.execute(begin)
+            state = get_normalized_intelligence_cache_state(connection)
+        timings["revision"] = (monotonic() - phase) * 1000
+        counts_key = (
+            identity, state["source_signature"], state["refreshed_at"], state["event_count"], query
+        ) if identity and state else None
+        page_key = (counts_key, event_type, sort, page, page_size) if counts_key else None
+        cached = _search_cache_get(_SEARCH_PAGE_CACHE, page_key)
+        if cached is not None:
+            timings["cache"] = 0.0
+            timings["total"] = (monotonic() - started) * 1000
+            return cached
+        phase = monotonic()
+        result = search_normalized_intelligence_events(
+            connection, event_type=database_event_type, query=query, sort=sort,
+            limit=page_size, page=page,
+            counts=_search_cache_get(_SEARCH_COUNTS_CACHE, counts_key),
+        )
+        timings["query"] = (monotonic() - phase) * 1000
+        timings.update(result.get("timings", {}))
+        database_counts = result["counts"]
+        _search_cache_put(_SEARCH_COUNTS_CACHE, counts_key, database_counts)
         counts = {
             "ransomware": int(database_counts.get("ransomware") or 0),
             "data-leak": int(database_counts.get("data_leak") or 0),
@@ -680,17 +749,11 @@ def build_event_search_payload(
         counts["all"] = sum(counts.values())
         total = counts[event_type]
         page_count = max(1, (total + page_size - 1) // page_size)
-        normalized_page = min(page, page_count)
-        normalized_events = load_normalized_event_page(
-            connection,
-            event_type=database_event_type,
-            limit=page_size,
-            offset=(normalized_page - 1) * page_size,
-            query=query,
-            sort=sort,
-        )
+        normalized_page = result["page"]
+        phase = monotonic()
+        normalized_events = [_hydrate_event_row(row) for row in result["rows"]]
 
-    return {
+    payload = {
         "items": [normalized_event_to_list_item(item) for item in normalized_events],
         "total": total,
         "page": normalized_page,
@@ -703,6 +766,10 @@ def build_event_search_payload(
         "sort": sort,
         "counts": counts,
     }
+    _search_cache_put(_SEARCH_PAGE_CACHE, page_key, payload)
+    timings["hydrate"] = (monotonic() - phase) * 1000
+    timings["total"] = (monotonic() - started) * 1000
+    return payload
 
 
 def _build_forum_event_detail_by_id(

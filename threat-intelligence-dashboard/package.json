@@ -1,6 +1,6 @@
 {
   "name": "threat-intelligence-dashboard",
-  "version": "20260906.0.0",
+  "version": "20260908.0.0",
   "private": true,
   "type": "module",
   "scripts": {
