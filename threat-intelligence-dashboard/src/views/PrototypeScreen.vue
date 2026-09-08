@@ -17,7 +17,6 @@ const screens = import.meta.glob('@/prototype/screens/*.html', {
 const route = useRoute()
 const router = useRouter()
 const screenRoot = ref(null)
-const cachedScreens = new Map()
 let renderVersion = 0
 let activeFile = ''
 
@@ -84,32 +83,11 @@ function handleNavigation(event) {
 async function renderScreen() {
   const version = ++renderVersion
   const file = route.meta.screen
-  disposePrototypeScreen(screenRoot.value)
-  if (activeFile && activeFile !== file && screenRoot.value) {
-    const readyState = screenRoot.value.querySelector('.runtime-data-state[data-state="ready"]')
-    if (activeFile === 'intelligence.html' && readyState) {
-      const fragment = document.createDocumentFragment()
-      fragment.append(...screenRoot.value.childNodes)
-      cachedScreens.set(activeFile, {
-        bodyClassName: document.body.className,
-        fragment,
-        title: document.title,
-      })
-    }
-  }
-
-  const cached = activeFile !== file ? cachedScreens.get(file) : null
-  if (cached) {
-    cachedScreens.delete(file)
-    document.title = cached.title
-    document.body.className = cached.bodyClassName
-    document.body.dataset.prototypePage = file
-    document.body.dataset.prototypeSource = route.meta.source || ''
-    document.body.dataset.prototypeRecordId = String(route.params.eventId || route.params.hitId || route.params.runId || '')
-    screenRoot.value.replaceChildren(cached.fragment)
-    activeFile = file
+  if (activeFile === 'intelligence.html' && file === activeFile && screenRoot.value) {
+    await hydratePrototypeScreen({ root: screenRoot.value, route, file })
     return
   }
+  disposePrototypeScreen(screenRoot.value)
 
   const source = screenSource(file)
   const parsed = new DOMParser().parseFromString(source, 'text/html')

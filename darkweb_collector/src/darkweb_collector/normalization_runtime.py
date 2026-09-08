@@ -9,6 +9,7 @@ from typing import Any
 
 from darkweb_collector.db import get_db_connection
 import darkweb_collector.normalized_intelligence as normalized_intelligence
+from darkweb_collector.search_index import ensure_keyword_index_ready
 
 
 logger = logging.getLogger("darkweb_collector.normalization_runtime")
@@ -79,6 +80,9 @@ def run_normalization_cycle() -> dict[str, Any]:
                 )
                 pending = normalized_intelligence.should_refresh_normalized_intelligence(connection)
                 converged = not pending
+            if ensure_keyword_index_ready(connection):
+                logger.info("keyword search index backfill completed")
+            connection.commit()
         if converged:
             logger.info("normalized intelligence refresh converged in %.2fs", time.perf_counter() - started)
         with _state_lock:

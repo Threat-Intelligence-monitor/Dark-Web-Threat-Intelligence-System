@@ -10,6 +10,14 @@ import time
 
 from darkweb_collector.crawl_frontier import ensure_frontier_schema
 from darkweb_collector.postgres_backend import connect_postgres
+from darkweb_collector.search_schema import REPORT_TIME, SEARCH_ORDER, SEVERITY_RANK, ensure_search_indexes
+from darkweb_collector.search_index import (
+    SEARCH_EXPRESSION,
+    ensure_keyword_index_schema,
+    mark_search_index_revision,
+    search_indexed_events,
+    sync_search_documents,
+)
 from darkweb_collector.runtime import (
     active_release_config,
     configured_database_schema,
@@ -685,6 +693,8 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             raise
     ensure_frontier_schema(connection)
     _ensure_legacy_columns(connection)
+    ensure_search_indexes(connection)
+    ensure_keyword_index_schema(connection)
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_monitoring_keyword_notifications_event_key
@@ -718,6 +728,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
     for attempt in range(1, 6):
         connection = sqlite3.connect(db_path, factory=ManagedConnection, timeout=30.0)
         connection.row_factory = sqlite3.Row
+        connection.cache_identity = ("sqlite", str(resolved))
         try:
             connection.execute("PRAGMA busy_timeout=30000")
             skip_wsl_checks = _should_skip_wal(resolved)
@@ -736,8 +747,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
                     if schema_key not in _SCHEMA_INIT_FINGERPRINTS:
                         if skip_wsl_checks and stat.st_size > 0:
                             ensure_frontier_schema(connection)
+                            ensure_search_indexes(connection)
+                            ensure_keyword_index_schema(connection)
                         else:
                             _ensure_schema(connection)
+                        connection.commit()
                         _SCHEMA_INIT_FINGERPRINTS.add(schema_key)
             return connection
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
@@ -1605,16 +1619,10 @@ def replace_normalized_intelligence_events(
             for row in rows
         ],
     )
+    sync_search_documents(connection, rows)
 
 
-_NORMALIZED_INTELLIGENCE_SEARCH_EXPRESSION = (
-    "LOWER(COALESCE(title, '') || ' ' || COALESCE(attacker, '') || ' ' || "
-    "COALESCE(victim, '') || ' ' || COALESCE(victim_key, '') || ' ' || "
-    "COALESCE(industry, '') || ' ' || "
-    "COALESCE(region, '') || ' ' || COALESCE(source_site_name, '') || ' ' || "
-    "COALESCE(category, '') || ' ' || COALESCE(detail_text, '') || ' ' || "
-    "COALESCE(source_url, '') || ' ' || COALESCE(event_metadata_json, ''))"
-)
+_NORMALIZED_INTELLIGENCE_SEARCH_EXPRESSION = SEARCH_EXPRESSION
 
 
 def _normalized_intelligence_filters(event_type: str = "", query: str = "") -> tuple[str, list[object]]:
@@ -1639,15 +1647,7 @@ def list_normalized_intelligence_events(
     query: str = "",
     sort: str = "latest",
 ) -> list[dict]:
-    order_by = {
-        "latest": "COALESCE(NULLIF(disclosure_time, ''), updated_at) DESC, event_id DESC",
-        "oldest": "COALESCE(NULLIF(disclosure_time, ''), updated_at) ASC, event_id ASC",
-        "severity": (
-            "CASE LOWER(severity) WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
-            "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, "
-            "risk_score DESC, COALESCE(NULLIF(disclosure_time, ''), updated_at) DESC, event_id DESC"
-        ),
-    }.get(sort)
+    order_by = SEARCH_ORDER.get(sort)
     if order_by is None:
         raise ValueError(f"unsupported normalized intelligence sort: {sort}")
     if offset < 0:
@@ -1673,6 +1673,91 @@ def list_normalized_intelligence_events(
         tuple(parameters),
     )
     return [dict(row) for row in cursor.fetchall()]
+
+
+def search_normalized_intelligence_events(
+    connection: sqlite3.Connection,
+    *,
+    event_type: str = "",
+    query: str = "",
+    sort: str = "latest",
+    limit: int = 20,
+    page: int = 1,
+    counts: dict[str, int] | None = None,
+) -> dict:
+    """Share an uncached substring scan between counts and a narrow page sort."""
+    if sort not in SEARCH_ORDER:
+        raise ValueError(f"unsupported normalized intelligence sort: {sort}")
+    limit = int(limit)
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    page = max(1, int(page))
+    indexed = search_indexed_events(
+        connection, query=query, event_type=event_type, sort=sort,
+        limit=limit, page=page, counts=counts,
+    ) if str(query or "").strip() else None
+    if indexed is not None:
+        return indexed
+    if (counts is not None or not str(query or "").strip()
+            or getattr(connection, "backend_name", "sqlite") != "postgresql"):
+        if counts is None:
+            counts = count_normalized_intelligence_events_by_type(connection, query=query)
+        total = counts.get(event_type, 0) if event_type else sum(counts.values())
+        page = min(page, max(1, (total + limit - 1) // limit))
+        rows = list_normalized_intelligence_events(
+            connection, event_type=event_type, query=query, sort=sort,
+            limit=limit, offset=(page - 1) * limit,
+        ) if total else []
+        return {"rows": rows, "counts": counts, "page": page}
+
+    where, parameters = _normalized_intelligence_filters(query=query)
+    order = {
+        "latest": "report_time DESC, event_id DESC",
+        "oldest": "report_time ASC, event_id ASC",
+        "severity": "severity_rank DESC, risk_score DESC, report_time DESC, event_id DESC",
+    }[sort]
+    # Materialize only identifiers and small sort keys, not article bodies or JSON.
+    # The LEFT JOIN retains the count row even when the selected category is empty.
+    records = connection.execute(
+        f"""
+        WITH matches AS MATERIALIZED (
+            SELECT event_id, event_type, {REPORT_TIME} AS report_time,
+                   {SEVERITY_RANK} AS severity_rank, risk_score
+            FROM normalized_intelligence_events {where}
+        ), totals AS (
+            SELECT COUNT(CASE WHEN event_type = 'data_leak' THEN 1 END) AS search_data_leak,
+                   COUNT(CASE WHEN event_type = 'ransomware' THEN 1 END) AS search_ransomware,
+                   COUNT(CASE WHEN event_type = 'vulnerability' THEN 1 END) AS search_vulnerability,
+                   COUNT(CASE WHEN ? = '' OR event_type = ? THEN 1 END) AS search_total
+            FROM matches
+        ), bounds AS (
+            SELECT totals.*,
+                   CASE WHEN search_total = 0 THEN 1
+                        WHEN ? > (search_total + ? - 1) / ?
+                        THEN (search_total + ? - 1) / ? ELSE ? END AS search_page
+            FROM totals
+        ), selected AS (
+            SELECT * FROM matches WHERE ? = '' OR event_type = ?
+            ORDER BY {order} LIMIT ? OFFSET (SELECT (search_page - 1) * ? FROM bounds)
+        )
+        SELECT n.*, bounds.search_data_leak, bounds.search_ransomware,
+               bounds.search_vulnerability, bounds.search_page
+        FROM bounds LEFT JOIN selected s ON 1 = 1
+        LEFT JOIN normalized_intelligence_events n ON n.event_id = s.event_id
+        ORDER BY {', '.join('s.' + item.strip() for item in order.split(','))}
+        """,
+        tuple(parameters + [event_type, event_type, page, limit, limit, limit, limit,
+                            page, event_type, event_type, limit, limit]),
+    ).fetchall()
+    first = records[0]
+    result_counts = {kind: int(first[f"search_{kind}"]) for kind in
+                     ("data_leak", "ransomware", "vulnerability")}
+    rows = []
+    for record in records:
+        if record["event_id"] is not None:
+            rows.append({key: value for key, value in dict(record).items()
+                         if not key.startswith("search_")})
+    return {"rows": rows, "counts": result_counts, "page": int(first["search_page"])}
 
 
 def count_normalized_intelligence_events(
@@ -1755,6 +1840,7 @@ def upsert_normalized_intelligence_cache_state(
         """,
         (source_signature, event_count, refreshed_at),
     )
+    mark_search_index_revision(connection, source_signature, event_count, refreshed_at)
 
 
 def list_monitoring_keywords(connection: sqlite3.Connection) -> list[dict]:

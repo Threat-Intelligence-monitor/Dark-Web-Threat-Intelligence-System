@@ -11,6 +11,7 @@ from threading import Lock, Thread
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Request
+from fastapi import Response
 from fastapi import WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -738,6 +739,7 @@ def jobs() -> dict:
 
 @app.get("/api/events/search")
 def event_search(
+    response: Response,
     page: int = 1,
     page_size: int = 20,
     q: str = "",
@@ -754,13 +756,22 @@ def event_search(
         raise HTTPException(status_code=422, detail="不支持的事件类型")
     if sort not in {"latest", "oldest", "severity"}:
         raise HTTPException(status_code=422, detail="不支持的排序方式")
-    return _reload_api_modules().build_event_search_payload(
+    timings: dict[str, float] = {}
+    payload = _reload_api_modules().build_event_search_payload(
         page=page,
         page_size=page_size,
         query=q.strip(),
         event_type=event_type,
         sort=sort,
+        timings=timings,
     )
+    response.headers["Server-Timing"] = ", ".join(
+        f"{phase};dur={duration:.2f}" for phase, duration in timings.items()
+    )
+    logger.info("intelligence search query_chars=%d type=%s page=%d timings_ms=%s",
+                len(q.strip()), event_type, page,
+                {phase: round(duration, 2) for phase, duration in timings.items()})
+    return payload
 
 
 @app.get("/api/events/{event_id}")

@@ -9,6 +9,8 @@ from threading import BoundedSemaphore, Lock
 from typing import Any, Callable, Sequence
 
 from darkweb_collector.crawl_frontier import ensure_frontier_schema
+from darkweb_collector.search_schema import ensure_search_indexes
+from darkweb_collector.search_index import ensure_keyword_index_schema
 
 
 class PostgreSQLBackendError(RuntimeError):
@@ -323,6 +325,8 @@ def _get_pool(
                 with raw.cursor() as cursor:
                     cursor.execute("SELECT pg_advisory_xact_lock(hashtext(current_schema()), hashtext('crawl_frontier_v1'))")
                     ensure_frontier_schema(cursor)
+                    ensure_search_indexes(cursor)
+                    ensure_keyword_index_schema(cursor, postgres=True)
                 raw.commit()
             finally:
                 pool.putconn(raw)
@@ -388,11 +392,15 @@ def connect_postgres(
         gate.release()
         raise PostgreSQLBackendError("PostgreSQL connection pool is exhausted") from exc
     try:
-        return PostgresConnection(
+        connection = PostgresConnection(
             raw,
             identity_tables=identity_tables,
             release=lambda connection: _return_pool_connection(pool, gate, connection),
         )
+        connection.cache_identity = (
+            "postgresql", schema, raw.info.host, raw.info.port, raw.info.dbname, raw.info.user,
+        )
+        return connection
     except Exception:
         _return_pool_connection(pool, gate, raw)
         raise
