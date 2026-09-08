@@ -58,6 +58,25 @@ const CACHEABLE_JSON_PATHS = new Set([
 ])
 const jsonResponseCache = new Map()
 const inFlightJsonRequests = new Map()
+const searchResponseCache = new Map()
+let searchCacheAccount = ''
+
+async function requestSearch(url) {
+  const account = localStorage.getItem('dwti-current-user') || ''
+  if (account !== searchCacheAccount) {
+    searchResponseCache.clear()
+    searchCacheAccount = account
+  }
+  const cached = searchResponseCache.get(url)
+  if (cached && Date.now() - cached.storedAt < JSON_CACHE_TTL_MS) return cached.payload
+  const payload = await requestJsonUncached(url)
+  if (account === (localStorage.getItem('dwti-current-user') || '')) {
+    searchResponseCache.delete(url)
+    searchResponseCache.set(url, { payload, storedAt: Date.now() })
+    while (searchResponseCache.size > 24) searchResponseCache.delete(searchResponseCache.keys().next().value)
+  }
+  return payload
+}
 
 async function requestJson(url, options = {}) {
   const { preferCached = false, ...fetchOptions } = options
@@ -1136,9 +1155,28 @@ async function hydrateIntelligence(root) {
   const list = query(root, '#intel-results')
   if (list) {
     list.__runtimeItemTemplate ||= query(list, '.intel-result-item')?.cloneNode(true)
-    list.replaceChildren()
   }
   if (!list) return
+  const request = {}
+  root.__intelligenceRequest = request
+  const account = localStorage.getItem('dwti-current-user') || ''
+  if (list.__searchAccount !== account) {
+    delete list.dataset.loaded
+    list.__searchAccount = account
+  }
+  const current = () => root.__intelligenceRequest === request && root.contains(list)
+    && account === (localStorage.getItem('dwti-current-user') || '')
+  if (!list.dataset.loaded) {
+    list.replaceChildren()
+    queryAll(root, '.intel-result-tabs b, [data-intel-total]').forEach((node) => { node.textContent = '—' })
+  }
+  setDataState(root, 'loading', list.dataset.loaded ? '正在更新查询结果，暂时显示上次结果…' : '正在查询情报…')
+  const empty = query(root, '[data-table-empty="intel-results"]')
+  if (empty) empty.hidden = true
+  list.inert = true
+  list.setAttribute('aria-busy', 'true')
+  const pagination = query(root, '[data-pagination-for="intel-results"]')
+  if (pagination) pagination.inert = true
 
   const locationParameters = new URLSearchParams(window.location.search)
   const searchQuery = locationParameters.get('q')?.trim() || ''
@@ -1181,15 +1219,19 @@ async function hydrateIntelligence(root) {
     link.remove()
   }
 
-  list.addEventListener('prototype:server-page', (event) => {
-    navigate({ page: Math.max(1, Number(event.detail?.page || 1)) })
-  })
-  list.addEventListener('prototype:server-filter', (event) => {
-    navigate({ type: event.detail?.eventType || 'all' }, true)
-  })
-  list.addEventListener('prototype:server-sort', (event) => {
-    navigate({ sort: event.detail?.sort || 'latest' }, true)
-  })
+  if (!list.__searchNavigationBound) {
+    list.__searchNavigationBound = true
+    list.addEventListener('prototype:server-refresh', () => hydrateIntelligence(root))
+    list.addEventListener('prototype:server-page', (event) => {
+      navigate({ page: Math.max(1, Number(event.detail?.page || 1)) })
+    })
+    list.addEventListener('prototype:server-filter', (event) => {
+      navigate({ type: event.detail?.eventType || 'all' }, true)
+    })
+    list.addEventListener('prototype:server-sort', (event) => {
+      navigate({ sort: event.detail?.sort || 'latest' }, true)
+    })
+  }
 
   const parameters = new URLSearchParams({
     page: String(requestedPage),
@@ -1198,7 +1240,17 @@ async function hydrateIntelligence(root) {
     sort: requestedSort,
   })
   if (searchQuery) parameters.set('q', searchQuery)
-  const payload = await requestJson(`/api/events/search?${parameters}`, { preferCached: true })
+  let payload
+  try {
+    payload = await requestSearch(`/api/events/search?${parameters}`)
+  } catch (error) {
+    if (current()) {
+      list.setAttribute('aria-busy', 'false')
+      setDataState(root, 'error', `查询失败：${error.message}。请重新提交查询。`)
+    }
+    return
+  }
+  if (!current()) return
   const events = (payload.items || []).filter((item) => eventType(item))
   list.dataset.serverTotal = String(payload.total || 0)
   list.dataset.serverPage = String(payload.page || 1)
@@ -1211,6 +1263,7 @@ async function hydrateIntelligence(root) {
     window.history.replaceState({}, '', `${normalizedUrl.pathname}${normalizedUrl.search}`)
   }
   renderIntelligenceItems(root, events, payload.counts || {})
+  if (empty) empty.hidden = events.length > 0
   const cutoff = Date.now() - 24 * 60 * 60 * 1000
   const recent = events.filter((item) => {
     const timestamp = new Date(item.updatedTimeRaw || item.updated_time_raw || item.disclosureTimeRaw || item.disclosure_time_raw || 0).getTime()
@@ -1223,6 +1276,11 @@ async function hydrateIntelligence(root) {
     new Set(recent.flatMap((item) => [item.victim, item.attacker, item.vendor]).filter(Boolean)).size,
   ]
   queryAll(root, '.intel-corpus-item b').forEach((node, index) => { node.textContent = number(values[index]) })
+  list.dataset.loaded = 'true'
+  list.inert = false
+  list.setAttribute('aria-busy', 'false')
+  if (pagination) pagination.inert = false
+  setDataState(root, 'ready')
 }
 
 async function hydrateRansomware(root, state) {
@@ -3152,6 +3210,7 @@ async function hydrateCodeDetail(root, state, id) {
 
 export function disposePrototypeScreen(root) {
   if (!root) return
+  root.__intelligenceRequest = null
   if (root.__codeContinuousStatusTimer) {
     window.clearInterval(root.__codeContinuousStatusTimer)
     root.__codeContinuousStatusTimer = null
@@ -3162,6 +3221,10 @@ export async function hydratePrototypeScreen({ root, route, file }) {
   if (!root) return
   hydrateAccount(root)
   if (!DATA_FILES.has(file)) return
+  if (file === 'intelligence.html') {
+    await hydrateIntelligence(root)
+    return
+  }
   prepareDataPage(root, file)
   const state = { tables: new Map(), refresh: null }
   installActionGuard(root, state)
