@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from darkweb_collector.sites.breachforums import parse_breachforums_detail, parse_breachforums_list
 from darkweb_collector.sites.example_forum import parse_example_forum_homepage
 from darkweb_collector.sites.dragonforce import parse_dragonforce_homepage
 from darkweb_collector.sites.darkforums import parse_darkforums_list, parse_darkforums_detail
@@ -23,6 +24,8 @@ PARSERS: dict[str, Parser] = {
     "chaos_detail": parse_chaos_detail,
     "cracked_list": parse_cracked_list,
     "cracked_detail": parse_cracked_detail,
+    "breachforums_list": parse_breachforums_list,
+    "breachforums_detail": parse_breachforums_detail,
     "pwnfrm_list": parse_pwnfrm_list,
     "pwnfrm_detail": parse_pwnfrm_detail,
     "raidforums_list": parse_raidforums_list,
