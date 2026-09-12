@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
+import logging
 import os
 import re
 import signal
@@ -12,8 +13,9 @@ import ssl
 import subprocess
 import time
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, RLock, Thread
 from typing import Any
 
 import psutil
@@ -85,6 +87,20 @@ DEFAULT_BUILTIN_BRIDGES = {
     "meek_lite": DEFAULT_MEEK_LITE_BRIDGES,
 }
 _process_lock = Lock()
+_operation_lock = RLock()
+_recovery_stop = Event()
+_recovery_thread: Thread | None = None
+logger = logging.getLogger(__name__)
+
+
+def _serialized_operation(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _operation_lock:
+            return function(*args, **kwargs)
+    return wrapped
+
+
 _process: subprocess.Popen | None = None
 _last_error = ""
 _exit_ip_lock = Lock()
@@ -172,6 +188,7 @@ def _normalize_settings(payload: dict[str, Any]) -> dict[str, Any]:
     data_directory = _string(payload.get("data_directory"))
     return {
         "enabled": bool(payload.get("enabled", False)),
+        "recovery_requested": bool(payload.get("recovery_requested", payload.get("enabled", False))),
         "bridge_mode": mode,
         "tor_executable": _string(payload.get("tor_executable")),
         "transport_executable": _string(payload.get("transport_executable")),
@@ -227,6 +244,7 @@ def load_tor_bridge_settings() -> dict[str, Any]:
     return settings
 
 
+@_serialized_operation
 def save_tor_bridge_settings(payload: dict[str, Any]) -> dict[str, Any]:
     previous = load_tor_bridge_settings()
     settings = _normalize_settings({**previous, **payload, "updated_at": _now_iso()})
@@ -990,12 +1008,23 @@ def _refresh_process_state(settings: dict[str, Any]) -> tuple[bool, int | None]:
     return False, None
 
 
+def _save_recovery_intent(requested: bool) -> None:
+    # A disconnect must still work when the saved bridge configuration is invalid.
+    payload = {**_load_raw_settings(), "recovery_requested": requested, "updated_at": _now_iso()}
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@_serialized_operation
 def start_tor_bridge() -> dict[str, Any]:
     global _last_error, _process
     settings = load_tor_bridge_settings()
     if not settings.get("enabled"):
         raise RuntimeError("Tor bridge is disabled")
     _validate_start_inputs(settings)
+    if not settings.get("recovery_requested"):
+        _save_recovery_intent(True)
     paths = _runtime_paths(settings)
     already_running = False
     with _process_lock:
@@ -1037,14 +1066,80 @@ def start_tor_bridge() -> dict[str, Any]:
     return get_tor_bridge_status()
 
 
+@_serialized_operation
 def stop_tor_bridge() -> dict[str, Any]:
     global _last_error, _process
     settings = load_tor_bridge_settings()
+    _save_recovery_intent(False)
     with _process_lock:
         _terminate_process_locked(settings)
         _last_error = ""
         _reset_exit_ip_state()
     return get_tor_bridge_status()
+
+
+class _RecoveryMonitor:
+    def __init__(self) -> None:
+        self.unhealthy_since: float | None = None
+        self.next_attempt = 0.0
+        self.retry_delay = 60.0
+
+    @_serialized_operation
+    def tick(self) -> None:
+        settings = load_tor_bridge_settings()
+        if not settings.get("enabled") or not settings.get("recovery_requested"):
+            self.__init__()
+            return
+        status = get_tor_bridge_status()
+        now = time.monotonic()
+        if status["connected"]:
+            self.__init__()
+            return
+        if self.unhealthy_since is None:
+            self.unhealthy_since = now
+        # Let Tor repair circuits and finish bootstrap before replacing its process.
+        grace = 300 if status["process_running"] else 60
+        if now - self.unhealthy_since < grace or now < self.next_attempt:
+            return
+        self.next_attempt = now + self.retry_delay
+        self.retry_delay = min(self.retry_delay * 2, 900)
+        self.unhealthy_since = now
+        if status.get("runtime_errors"):
+            logger.warning("Tor recovery waiting for valid runtime configuration")
+            return
+        logger.warning("Tor connection unavailable; restarting managed Tor runtime")
+        # Do not call the public stop action: it records a user's manual disconnect.
+        with _process_lock:
+            _terminate_process_locked(settings)
+            _reset_exit_ip_state()
+        start_tor_bridge()
+
+
+def _run_recovery_monitor() -> None:
+    monitor = _RecoveryMonitor()
+    while not _recovery_stop.wait(15):
+        try:
+            monitor.tick()
+        except Exception:
+            # Runtime errors may contain bridge addresses; keep background logs bounded.
+            logger.warning("Tor recovery check failed; will retry in the background")
+
+
+@_serialized_operation
+def start_tor_bridge_recovery() -> None:
+    global _recovery_thread
+    if _recovery_thread is not None and _recovery_thread.is_alive():
+        return
+    _recovery_stop.clear()
+    _recovery_thread = Thread(target=_run_recovery_monitor, name="tor-recovery", daemon=True)
+    _recovery_thread.start()
+
+
+def stop_tor_bridge_recovery() -> None:
+    _recovery_stop.set()
+    thread = _recovery_thread
+    if thread is not None:
+        thread.join(timeout=15)
 
 
 def get_tor_bridge_status() -> dict[str, Any]:
