@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from darkweb_collector.search_schema import event_report_time
+
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -758,13 +760,7 @@ def _format_date(value: str | None) -> str:
 
 
 def _event_updated_time(event: dict[str, Any]) -> str:
-    metadata = event.get("metadata") or {}
-    explicit_updated = metadata.get("updated_time") or event.get("disclosure_time") or ""
-    if explicit_updated:
-        return str(explicit_updated)
-    if event.get("event_type") == "vulnerability":
-        return str(event.get("updated_at") or "")
-    return ""
+    return event_report_time(event)
 
 
 def _event_hash(*parts: str) -> str:

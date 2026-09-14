@@ -49,10 +49,12 @@ from darkweb_collector.normalized_intelligence import (
     normalized_event_to_list_item,
 )
 from darkweb_collector.normalization_runtime import get_normalization_runtime_status
+from darkweb_collector.queueing import queue_for_detail, queue_for_seed
 from darkweb_collector.runtime import active_release_config, default_db_path, output_root, project_root
 from darkweb_collector.sites.darkforums import normalize_darkforums_timestamp
 from darkweb_collector.site_auth import site_auth_readiness, site_display_name
 from darkweb_collector.utils import safe_stem
+from darkweb_collector.worker_supervisor import queue_health_errors
 
 
 SECTION_LABELS = {
@@ -122,6 +124,7 @@ JOB_STATUS_LABELS = {
 
 RECENT_FAILURE_WINDOW_HOURS = 24
 FAILED_JOB_HISTORY_LIMIT = 30
+FAILED_JOB_HISTORY_DAYS = 7
 STALE_RUNNING_MINUTES = 30
 STALE_ENQUEUED_MINUTES = 10
 RANSOMWARE_EVENT_LIMIT = 0
@@ -2269,6 +2272,75 @@ def _runtime_db_status() -> dict[str, Any]:
     return status
 
 
+def build_failed_jobs_payload(page: int = 1, page_size: int = FAILED_JOB_HISTORY_LIMIT, query: str = "", site: str = "") -> dict[str, Any]:
+    page = max(1, int(page))
+    page_size = min(100, max(1, int(page_size)))
+    cutoff = (_now_utc() - timedelta(days=FAILED_JOB_HISTORY_DAYS)).isoformat()
+    try:
+        configs = load_site_configs()
+        config_map = {config.site_name: config for config in configs}
+    except Exception:
+        config_map = {}
+    clauses = ["status = 'failed'", "COALESCE(finished_at, started_at, enqueued_at) >= ?"]
+    params: list[Any] = [cutoff]
+    if site.strip():
+        clauses.append("site_name = ?")
+        params.append(site.strip())
+    if query.strip():
+        # Match literal text, including SQL wildcard characters, across all pages.
+        escaped = query.strip().lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+        pattern = f"%{escaped}%"
+        fields = ("site_name", "job_id", "job_type", "queue_name", "target", "error_message")
+        search = [f"LOWER(COALESCE({field}, '')) LIKE ? ESCAPE '!'" for field in fields]
+        params.extend([pattern] * len(fields))
+        aliases = [name for name, config in config_map.items() if query.strip().lower() in site_display_name(config).lower()]
+        if aliases:
+            search.append("site_name IN (" + ",".join("?" for _ in aliases) + ")")
+            params.extend(aliases)
+        clauses.append("(" + " OR ".join(search) + ")")
+    where = " AND ".join(clauses)
+    with get_db_connection() as connection:
+        total = int(connection.execute(f"SELECT COUNT(*) FROM crawl_jobs WHERE {where}", tuple(params)).fetchone()[0])
+        page = min(page, max(1, (total + page_size - 1) // page_size))
+        failed_job_rows = [dict(row) for row in connection.execute(
+            f"""SELECT job_id, site_name, job_type, queue_name, target, status,
+                       enqueued_at, started_at, finished_at, duration_ms, error_message
+                FROM crawl_jobs WHERE {where}
+                ORDER BY COALESCE(finished_at, started_at, enqueued_at) DESC, job_id DESC
+                LIMIT ? OFFSET ?""", tuple(params) + (page_size, (page - 1) * page_size)
+        ).fetchall()]
+    items = [
+        {
+            "job_id": row.get("job_id"),
+            "site_name": row.get("site_name"),
+            "display_name": (
+                site_display_name(config_map[row["site_name"]])
+                if row.get("site_name") in config_map
+                else row.get("site_name")
+            ),
+            "job_type": row.get("job_type"),
+            "queue_name": row.get("queue_name"),
+            "target": row.get("target"),
+            "status": "failed",
+            "enqueued_at": _format_dt(row.get("enqueued_at")),
+            "started_at": _format_dt(row.get("started_at")),
+            "finished_at": _format_dt(row.get("finished_at") or row.get("started_at")),
+            "duration_ms": row.get("duration_ms"),
+            "error_message": row.get("error_message") or "",
+            "error_category": classify_error(row.get("error_message") or ""),
+        }
+        for row in failed_job_rows
+    ]
+    return {
+        "failed_job_history": items,
+        "failed_job_history_total": total,
+        "failed_job_history_limit": page_size,
+        "page": page,
+        "page_size": page_size,
+        "days": FAILED_JOB_HISTORY_DAYS,
+    }
+
+
 def build_jobs_payload() -> dict[str, Any]:
     failure_cutoff = _now_utc() - timedelta(hours=RECENT_FAILURE_WINDOW_HOURS)
     with get_db_connection() as connection:
@@ -2281,23 +2353,6 @@ def build_jobs_payload() -> dict[str, Any]:
                 ORDER BY COALESCE(finished_at, started_at, enqueued_at) DESC
                 LIMIT 1000
                 """
-            ).fetchall()
-        ]
-        failed_job_history_total = int(
-            connection.execute("SELECT COUNT(*) FROM crawl_jobs WHERE status = 'failed'").fetchone()[0]
-        )
-        failed_job_rows = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT job_id, site_name, job_type, queue_name, target, status,
-                       enqueued_at, started_at, finished_at, duration_ms, error_message
-                FROM crawl_jobs
-                WHERE status = 'failed'
-                ORDER BY COALESCE(finished_at, started_at, enqueued_at) DESC
-                LIMIT ?
-                """,
-                (FAILED_JOB_HISTORY_LIMIT,),
             ).fetchall()
         ]
         forum_detail_counts = {
@@ -2359,29 +2414,6 @@ def build_jobs_payload() -> dict[str, Any]:
         enabled_map = {site_name: True for site_name in configured_sites}
         config_map = {}
 
-    failed_job_history = [
-        {
-            "job_id": row.get("job_id"),
-            "site_name": row.get("site_name"),
-            "display_name": (
-                site_display_name(config_map[row["site_name"]])
-                if row.get("site_name") in config_map
-                else row.get("site_name")
-            ),
-            "job_type": row.get("job_type"),
-            "queue_name": row.get("queue_name"),
-            "target": row.get("target"),
-            "status": "failed",
-            "enqueued_at": _format_dt(row.get("enqueued_at")),
-            "started_at": _format_dt(row.get("started_at")),
-            "finished_at": _format_dt(row.get("finished_at") or row.get("started_at")),
-            "duration_ms": row.get("duration_ms"),
-            "error_message": row.get("error_message") or "",
-            "error_category": classify_error(row.get("error_message") or ""),
-        }
-        for row in failed_job_rows
-    ]
-
     running_jobs = sum(1 for row in crawl_jobs if _effective_job_status(row) == "running")
     stale_jobs = sum(
         1
@@ -2389,6 +2421,7 @@ def build_jobs_payload() -> dict[str, Any]:
         if _effective_job_status(row) == "stale" and not row.get("finished_at")
     )
 
+    worker_errors = queue_health_errors()
     site_health = []
     unresolved_problem_rows: list[dict[str, Any]] = []
     for site_name in configured_sites:
@@ -2418,6 +2451,12 @@ def build_jobs_payload() -> dict[str, Any]:
             latest_unresolved_problem.get("error_message") if latest_unresolved_problem else ""
         )
         config = config_map.get(site_name)
+        dependency_errors = {}
+        if config is not None and config.enabled:
+            for queue_name in (queue_for_seed(config), queue_for_detail(config)):
+                if queue_name in worker_errors:
+                    dependency_errors[queue_name] = worker_errors[queue_name]
+        worker_error = "；".join(dict.fromkeys(dependency_errors.values()))
         auth = site_auth_readiness(config) if config is not None else {
             "auth_required": False,
             "auth_status": "not_required",
@@ -2486,7 +2525,9 @@ def build_jobs_payload() -> dict[str, Any]:
                 "connectivity_failure_reason": connectivity_probe.get("failure_reason") or "",
                 "connectivity_error": connectivity_probe.get("error") or "",
                 "overall_status": (
-                    "待登录"
+                    "异常"
+                    if worker_error
+                    else "待登录"
                     if auth_required and auth_waiting
                     else "会话失效"
                     if auth_required
@@ -2519,8 +2560,10 @@ def build_jobs_payload() -> dict[str, Any]:
                 "failed_jobs_24h": failed_jobs_24h,
                 "last_success_at": _format_dt(latest_success.get("finished_at") if latest_success else None),
                 "last_error": (
-                    (latest_unresolved_problem.get("error_message") if latest_unresolved_problem else "")
+                    worker_error or (latest_unresolved_problem.get("error_message") if latest_unresolved_problem else "")
                 ),
+                "worker_error": worker_error,
+                "queue_errors": dependency_errors,
                 "auth_required": auth_required,
                 "auth_status": auth["auth_status"],
                 "auth_platform": auth["auth_platform"],
@@ -2537,7 +2580,9 @@ def build_jobs_payload() -> dict[str, Any]:
                 "staleSeedDetected": effective_seed_status == "stale",
                 "latestSeedJobAgeMinutes": seed_age_minutes,
                 "blockingReason": (
-                    "auth_required"
+                    "worker_unavailable"
+                    if worker_error
+                    else "auth_required"
                     if auth_required
                     else "failure_cooldown"
                     if circuit_breaker_open
@@ -2564,7 +2609,7 @@ def build_jobs_payload() -> dict[str, Any]:
     ]
     failed_jobs_24h = sum(failure_counts_24h.values())
 
-    overall_status = "采集中" if running_jobs > 0 else "部分失败" if recent_failures or stale_jobs > 0 else "正常"
+    overall_status = "部分失败" if any(item["worker_error"] for item in site_health) else "采集中" if running_jobs > 0 else "部分失败" if recent_failures or stale_jobs > 0 else "正常"
     vulnerability_sync = {
         **get_vulnerability_sync_status(),
         "record_count": int(vulnerability_count_row["count"]) if vulnerability_count_row else 0,
@@ -2582,9 +2627,7 @@ def build_jobs_payload() -> dict[str, Any]:
         "stale_jobs": stale_jobs,
         "failed_jobs_24h": failed_jobs_24h,
         "recent_failures": recent_failures,
-        "failed_job_history": failed_job_history,
-        "failed_job_history_total": failed_job_history_total,
-        "failed_job_history_limit": FAILED_JOB_HISTORY_LIMIT,
+        **build_failed_jobs_payload(),
         "site_health": site_health,
         "browser_runtime": get_browser_runtime_status(),
         "normalization_runtime": get_normalization_runtime_status(),

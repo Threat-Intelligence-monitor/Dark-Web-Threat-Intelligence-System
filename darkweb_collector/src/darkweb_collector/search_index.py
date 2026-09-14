@@ -6,15 +6,17 @@ import json
 from time import perf_counter
 from uuid import uuid4
 
+from darkweb_collector.search_schema import event_report_time, MISSING_TIME
+
 FIELDS = ("title", "attacker", "victim", "victim_key", "industry", "region",
           "source_site_name", "category", "detail_text", "source_url", "event_metadata_json")
 SEARCH_TEXT = "LOWER(" + " || ' ' || ".join(f"COALESCE({field}, '')" for field in FIELDS) + ")"
 SEARCH_EXPRESSION = SEARCH_TEXT
 KINDS = ("data_leak", "ransomware", "vulnerability")
 ORDERS = {
-    "latest": "report_time DESC, event_id DESC",
-    "oldest": "report_time ASC, event_id ASC",
-    "severity": "severity_rank DESC, risk_score DESC, report_time DESC, event_id DESC",
+    "latest": f"{MISSING_TIME} ASC, report_time DESC, event_id DESC",
+    "oldest": f"{MISSING_TIME} ASC, report_time ASC, event_id ASC",
+    "severity": f"severity_rank DESC, risk_score DESC, {MISSING_TIME} ASC, report_time DESC, event_id DESC",
 }
 
 
@@ -78,7 +80,7 @@ def sync_search_documents(connection, rows=None):
         event_id = row["event_id"]
         current_ids.add(event_id)
         fingerprint = _fingerprint(row)
-        report_time = row.get("disclosure_time") or row["updated_at"]
+        report_time = event_report_time(row)
         severity = {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(str(row["severity"]).lower(), 0)
         values = (row["event_type"], report_time, severity, row["risk_score"])
         old = previous.get(event_id)

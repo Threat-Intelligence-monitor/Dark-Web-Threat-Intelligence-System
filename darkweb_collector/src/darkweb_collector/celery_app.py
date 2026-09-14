@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 
 from celery import Celery
+from celery.signals import worker_ready
+
+from darkweb_collector.worker_supervisor import mark_worker_ready
 
 
 def _broker_url() -> str:
@@ -25,3 +28,4 @@ app.conf.update(
 )
 
 app.autodiscover_tasks(["darkweb_collector"])
+worker_ready.connect(mark_worker_ready, weak=False)

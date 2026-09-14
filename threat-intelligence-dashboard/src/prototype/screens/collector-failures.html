@@ -57,12 +57,12 @@
           <header class="collector-table-toolbar">
             <div><span>历史失败记录</span><strong data-bind="failure-history-count">0 条</strong></div>
             <div class="collector-filter-row">
-              <label class="compact-search"><span class="sr-only">搜索历史失败记录</span><input class="input" type="search" placeholder="搜索站点、任务、目标或错误" data-table-search="collector-failure-history-list"></label>
+              <label class="compact-search"><span class="sr-only">搜索历史失败记录</span><input class="input" type="search" placeholder="搜索站点、任务、目标或错误" data-failure-history-search></label>
             </div>
           </header>
-          <div class="task-list" id="collector-failure-history-list" data-table data-failure-history-list data-od-id="collector-failure-history-list"></div>
-          <div class="collector-table-empty" data-table-empty="collector-failure-history-list">暂无真实失败任务记录。</div>
-          <footer class="collector-table-foot"><span data-failure-history-note>仅展示数据库中状态为 failed 的真实任务，不受 24 小时窗口和后续成功影响。</span></footer>
+          <div class="task-list" id="collector-failure-history-list" data-failure-history-list data-od-id="collector-failure-history-list"></div>
+          <div class="collector-table-empty" data-failure-history-empty>暂无真实失败任务记录。</div>
+          <footer class="collector-table-foot"><span data-failure-history-note>按失败时间显示近 7 天记录，支持跨页搜索。</span><div class="collector-filter-row"><button class="btn btn-secondary" type="button" data-failure-history-page="-1" disabled>上一页</button><span class="num" data-bind="failure-history-page">1 / 1</span><button class="btn btn-secondary" type="button" data-failure-history-page="1" disabled>下一页</button></div></footer>
         </section>
       </main>
     </div>

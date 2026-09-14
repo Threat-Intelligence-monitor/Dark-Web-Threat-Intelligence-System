@@ -2371,6 +2371,7 @@ export function initializePrototype() {
             const state = document.createElement('span')
             state.className = `status-dot ${isHealthy(item) ? 'running' : 'stopped'}`
             state.textContent = primary
+            if (item.worker_error) state.title = item.worker_error
             cell.appendChild(state)
           } else if (index === 5) {
             cell.className = 'health-extra'
@@ -2465,6 +2466,12 @@ export function initializePrototype() {
         addressValue.title = sourceUrls.join('\n') || '未配置'
         address.append(addressLabel, addressValue)
         detailPanel.appendChild(detailGrid)
+        if (item.worker_error) {
+          const error = document.createElement('p')
+          error.className = 'settings-error-line'
+          error.textContent = `采集异常：${item.worker_error}`
+          detailPanel.appendChild(error)
+        }
         if (item.frontier?.enabled) {
           const frontier = item.frontier
           const progress = document.createElement('div')
@@ -2729,23 +2736,49 @@ export function initializePrototype() {
       refreshTable(list)
     }
 
+    const failureHistoryState = { page: 1, query: '', requestId: 0 }
+    function failureHistoryUrl() {
+      const params = new URLSearchParams({ page: String(failureHistoryState.page), page_size: '30', query: failureHistoryState.query })
+      return `/api/jobs/failures?${params}`
+    }
+    async function refreshFailureHistory() {
+      const requestId = ++failureHistoryState.requestId
+      const payload = await request(failureHistoryUrl())
+      if (requestId === failureHistoryState.requestId) renderFailureHistory(payload)
+    }
+    let failureSearchTimer
+    $('[data-failure-history-search]', root)?.addEventListener('input', (event) => {
+      failureHistoryState.query = event.target.value.trim()
+      failureHistoryState.page = 1
+      failureHistoryState.requestId += 1
+      clearTimeout(failureSearchTimer)
+      failureSearchTimer = setTimeout(() => refreshFailureHistory().catch((error) => showToast(error.message)), 300)
+    })
+    $$('[data-failure-history-page]', root).forEach((button) => button.addEventListener('click', () => {
+      failureHistoryState.page = Math.max(1, failureHistoryState.page + Number(button.dataset.failureHistoryPage))
+      refreshFailureHistory().catch((error) => showToast(error.message))
+    }))
+
     function renderFailureHistory(payload = {}) {
       const history = Array.isArray(payload.failed_job_history) ? payload.failed_job_history : []
       const total = Number(payload.failed_job_history_total ?? history.length)
-      const limit = Number(payload.failed_job_history_limit || history.length)
-      bindText('failure-history-count', total > history.length ? `最近 ${history.length} 条` : `${total} 条`)
+      const pageSize = Number(payload.page_size || 30)
+      failureHistoryState.page = Number(payload.page || 1)
+      const pages = Math.max(1, Math.ceil(total / pageSize))
+      bindText('failure-history-count', `近 7 天 · ${total} 条`)
+      bindText('failure-history-page', `${failureHistoryState.page} / ${pages}`)
+      $$('[data-failure-history-page]', root).forEach((button) => {
+        button.disabled = Number(button.dataset.failureHistoryPage) < 0 ? failureHistoryState.page <= 1 : failureHistoryState.page >= pages
+      })
 
       const list = $('[data-failure-history-list]', root)
       if (!list) return
       list.replaceChildren()
-      list.dataset.page = '1'
 
       const note = $('[data-failure-history-note]', root)
-      if (note) {
-        note.textContent = total > history.length
-          ? `数据库共有 ${total} 条真实失败任务，当前展示最近 ${Math.min(limit, history.length)} 条。`
-          : `共 ${total} 条真实失败任务；不受 24 小时窗口和后续成功影响。`
-      }
+      if (note) note.textContent = `按失败时间显示近 7 天记录，共 ${total} 条；每页 ${pageSize} 条，搜索覆盖全部结果。`
+      const empty = $('[data-failure-history-empty]', root)
+      if (empty) empty.hidden = history.length > 0
 
       history.forEach((item) => {
         const article = document.createElement('article')
@@ -2792,7 +2825,6 @@ export function initializePrototype() {
         article.append(state, identity, context, meta)
         list.appendChild(article)
       })
-      refreshTable(list)
     }
 
     function renderJobs(payload = {}) {
@@ -2812,7 +2844,6 @@ export function initializePrototype() {
       bindText('normalized-count', runtime.copied_counts?.normalized_intelligence_events ?? '—')
       renderSiteHealth(payload.site_health || [])
       renderTasks(payload)
-      renderFailureHistory(payload)
       setBadge('site-health-summary', overall === '正常' ? '全部正常' : '部分异常', overall === '正常' ? 'badge-success' : 'badge-high')
     }
 
@@ -2989,6 +3020,7 @@ export function initializePrototype() {
     async function refreshCollector(options = {}) {
       const tasks = []
       if (root.hasAttribute('data-needs-jobs')) tasks.push(['/api/jobs', renderJobs, 'jobs'])
+      if ($('[data-failure-history-list]', root)) tasks.push([null, refreshFailureHistory, 'jobs'])
       if ($('#netdisk-cursor-table', root)) tasks.push(['/api/document-exposures/netdisk/source-health?source_family=netdisk_aggregator', renderNetdiskCursors, 'netdisk'])
       if (root.hasAttribute('data-needs-tor') || $('[data-bind="tor-status"]', root)) tasks.push(['/api/tor-bridge/status', renderTor, 'tor'])
       if (root.hasAttribute('data-needs-bot')) tasks.push(['/api/bot/status', renderBot, 'bot'])
@@ -3010,7 +3042,7 @@ export function initializePrototype() {
       }
       if ($('.document-session-grid', root)) tasks.push(['/api/platform-sessions?module=document_exposure', renderDocumentSessions, 'document-sessions'])
       if ($('.source-access-table', root)) tasks.push(['/api/exposure-platforms?module=document_exposure', renderExposurePlatforms, 'exposure-platforms'])
-      const results = await Promise.allSettled(tasks.map(async ([url, render]) => render(await request(url))))
+      const results = await Promise.allSettled(tasks.map(async ([url, render]) => url ? render(await request(url)) : render()))
       const capabilityResults = new Map()
       tasks.forEach(([, , capability], index) => {
         if (!capability) return

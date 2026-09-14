@@ -150,6 +150,10 @@ darkweb stop
 
 Windows 脚本会优先复用可达的显式 `REDIS_URL`。未配置服务时，脚本自动下载并校验 Microsoft Garnet 2.1.4 与项目私有 .NET 10.0.11，监听 `127.0.0.1:6380` 并固定使用 DB 0，不再要求通过 `winget` 安装 Memurai Developer。新安装环境的 Garnet 检查点、AOF、SQLite、迁移批次、证据镜像和缓存均使用已配置的数据根目录，默认每 6 小时执行一次后台检查点；完整第三方许可见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。
 
+Windows 一键启动的采集 Worker 由后台守护进程管理，每 15 秒检查进程与队列类型，意外退出后按 15 秒至 5 分钟退避重试。Celery 就绪后才标记运行；守护进程离线、Worker 未就绪或队列类型异常会在依赖该队列的站点上显示异常原因。队列类型异常时不自动删除数据，需保留现场并定点处理后恢复。守护状态位于当前 release 的 `darkweb_collector/.runtime/windows/worker-health/`，日志沿用各 Worker 日志。该机制不替代 Garnet 底层修复，也不保证卡住但仍存活的任务已恢复。
+
+任务列表的历史失败区支持查看近 7 天记录，每页 30 条，搜索覆盖该时间范围内全部失败记录。情报检索的报告时间排序与列表显示时间保持一致；首次启动会以每批 500 条回填旧记录的规范时间，并同步全文检索排序索引，大库首次初始化可能比平时更久。
+
 全新安装 PostgreSQL 时，程序文件仍由 EDB 安装到系统程序目录，但数据库集群通过官方 `--datadir` 参数创建在 `<数据根目录>\postgresql\16\data`。已经存在的 PostgreSQL 服务会被复用且不会被脚本直接复制或改写；如果其集群仍在 C 盘，`darkweb status` 和数据迁移页面会明确告警，需要另行执行 PostgreSQL 备份恢复后再释放旧集群空间。
 
 可通过 `DARKWEB_GARNET_CHECKPOINT_INTERVAL_SECONDS` 调整后台检查点间隔，最低为 300 秒；离线部署可分别用 `DARKWEB_GARNET_ARCHIVE_PATH` 和 `DARKWEB_DOTNET_RUNTIME_ARCHIVE_PATH` 指向已下载的官方压缩包，启动器仍会执行固定哈希校验。

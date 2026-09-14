@@ -10,7 +10,7 @@ import time
 
 from darkweb_collector.crawl_frontier import ensure_frontier_schema
 from darkweb_collector.postgres_backend import connect_postgres
-from darkweb_collector.search_schema import REPORT_TIME, SEARCH_ORDER, SEVERITY_RANK, ensure_search_indexes
+from darkweb_collector.search_schema import REPORT_TIME, SEARCH_ORDER, SEVERITY_RANK, ensure_search_indexes, event_report_time
 from darkweb_collector.search_index import (
     SEARCH_EXPRESSION,
     ensure_keyword_index_schema,
@@ -1585,8 +1585,8 @@ def replace_normalized_intelligence_events(
             event_type, category, leak_type, title, attacker, victim, victim_key,
             industry, region, disclosure_time, severity, risk_score, source_url,
             detail_text, mirror_resources_json, screenshot_resources_json,
-            json_preview_url, risk_reasons_json, event_metadata_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            json_preview_url, risk_reasons_json, event_metadata_json, updated_at, report_time
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -1615,6 +1615,7 @@ def replace_normalized_intelligence_events(
                 row["risk_reasons_json"],
                 row["event_metadata_json"],
                 row["updated_at"],
+                event_report_time(row),
             )
             for row in rows
         ],
@@ -1712,9 +1713,9 @@ def search_normalized_intelligence_events(
 
     where, parameters = _normalized_intelligence_filters(query=query)
     order = {
-        "latest": "report_time DESC, event_id DESC",
-        "oldest": "report_time ASC, event_id ASC",
-        "severity": "severity_rank DESC, risk_score DESC, report_time DESC, event_id DESC",
+        "latest": "missing_time ASC, report_time DESC, event_id DESC",
+        "oldest": "missing_time ASC, report_time ASC, event_id ASC",
+        "severity": "severity_rank DESC, risk_score DESC, missing_time ASC, report_time DESC, event_id DESC",
     }[sort]
     # Materialize only identifiers and small sort keys, not article bodies or JSON.
     # The LEFT JOIN retains the count row even when the selected category is empty.
@@ -1722,6 +1723,7 @@ def search_normalized_intelligence_events(
         f"""
         WITH matches AS MATERIALIZED (
             SELECT event_id, event_type, {REPORT_TIME} AS report_time,
+                   CASE WHEN report_time IS NULL OR report_time = '' THEN 1 ELSE 0 END AS missing_time,
                    {SEVERITY_RANK} AS severity_rank, risk_score
             FROM normalized_intelligence_events {where}
         ), totals AS (

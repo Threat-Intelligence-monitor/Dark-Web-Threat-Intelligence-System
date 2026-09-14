@@ -567,7 +567,12 @@
             <el-table-column label="站点" :min-width="siteHealthSiteMinWidth" show-overflow-tooltip>
               <template #default="{ row }">{{ row.display_name || row.site_name }}</template>
             </el-table-column>
-            <el-table-column prop="overall_status" label="总体状态" :width="siteHealthStatusWidth" />
+            <el-table-column prop="overall_status" label="总体状态" :width="siteHealthStatusWidth">
+              <template #default="{ row }">
+                <StatusBadge v-if="row.worker_error" :label="row.overall_status" tone="danger" :title="row.worker_error" />
+                <span v-else>{{ row.overall_status }}</span>
+              </template>
+            </el-table-column>
             <el-table-column v-if="showSiteHealthWide" prop="seed_status" label="种子页状态" :width="siteHealthWideStatusWidth" />
             <el-table-column v-if="showSiteHealthWide" prop="detail_status" label="详情页状态" :width="siteHealthWideStatusWidth" />
             <el-table-column prop="running_jobs" label="运行中" :width="siteHealthSmallMetricWidth" />

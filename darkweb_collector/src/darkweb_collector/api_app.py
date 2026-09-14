@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from threading import Lock, Thread
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi import HTTPException
 from fastapi import Request
 from fastapi import Response
@@ -730,6 +730,16 @@ def intelligence_page(page: str, limit: int | None = None, days: int = 7) -> dic
         return _reload_api_modules().build_intelligence_page_payload(page, limit=limit)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/jobs/failures")
+def job_failures(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    query: str = Query("", max_length=500),
+    site: str = Query("", max_length=200),
+) -> dict:
+    return _reload_api_modules().build_failed_jobs_payload(page, page_size, query, site)
 
 
 @app.get("/api/jobs")
