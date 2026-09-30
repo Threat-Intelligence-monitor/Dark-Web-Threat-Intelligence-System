@@ -131,6 +131,7 @@ const navTree = [
   { type: 'item', path: '/vulnerability-alerts', title: '漏洞预警', icon: 'WarningFilled' },
   { type: 'item', path: '/threat-situation', title: '威胁态势', icon: 'TrendCharts' },
   { type: 'item', path: '/collector-control', title: '采集控制', icon: 'VideoPlay' },
+  { type: 'item', path: '/social-monitoring', title: '社交平台监测', icon: 'ChatLineRound' },
   {
     type: 'group',
     key: 'document-exposure',

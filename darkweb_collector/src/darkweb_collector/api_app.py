@@ -123,6 +123,20 @@ from darkweb_collector.code_monitoring import (
     scan_code_watchlist_once,
     warm_code_monitoring_cache,
 )
+from darkweb_collector.social_monitoring import (
+    ENGINES as SOCIAL_ENGINES,
+    get_hit as get_social_hit,
+    get_watchlist as get_social_watchlist,
+    list_hits as list_social_hits,
+    list_scans as list_social_scans,
+    list_watchlists as list_social_watchlists,
+    public_hit_preview as get_social_preview,
+    review_hit as review_social_hit,
+    save_watchlist as save_social_watchlist,
+    start_manual_scan as start_social_scan,
+    start_social_worker,
+    stop_social_worker,
+)
 from darkweb_collector.document_exposure_sessions import (
     auto_detect_platform_sessions,
     build_platform_session_payloads,
@@ -367,6 +381,19 @@ def _require_admin(request: Request, *, action: str = "管理账号") -> dict[st
     return user
 
 
+def _require_social_access(request: Request, *, admin: bool = False) -> dict[str, object]:
+    if not _auth_enabled():
+        return {"username": "local", "role": "admin"}
+    user = getattr(request.state, "current_user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="未登录或登录已过期")
+    if user.get("role") == "admin":
+        return user
+    if admin or "social_monitoring" not in (user.get("modules") or []):
+        raise HTTPException(status_code=403, detail="当前账号没有社交平台监测权限")
+    return user
+
+
 def _requires_auth(request: Request) -> bool:
     path = request.url.path
     if not _auth_enabled() or request.method == "OPTIONS":
@@ -465,6 +492,11 @@ def warm_payloads_on_startup() -> None:
         start_normalization_worker()
     except Exception:
         logger.exception("failed to start normalized intelligence background refresh")
+    if os.environ.get("DARKWEB_SKIP_SOCIAL_MONITORING") != "1":
+        try:
+            start_social_worker()
+        except Exception:
+            logger.exception("failed to start social monitoring scheduler")
     global _warmup_started
     if os.environ.get("DARKWEB_SKIP_API_WARMUP") == "1":
         logger.info("skipping API warmup because DARKWEB_SKIP_API_WARMUP=1")
@@ -483,6 +515,7 @@ def warm_payloads_on_startup() -> None:
 @app.on_event("shutdown")
 def stop_background_workers() -> None:
     stop_normalization_worker()
+    stop_social_worker()
 
 
 @app.get("/api/health")
@@ -1071,6 +1104,22 @@ class CodeMonitoringContinuousStartRequest(BaseModel):
 
 class CodeMonitoringContinuousStopRequest(BaseModel):
     watchlist_id: int = Field(..., gt=0)
+
+
+class SocialWatchlistRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    aliases: list[str] = Field(min_length=1, max_length=8)
+    risk_terms: list[str] = Field(min_length=1, max_length=12)
+    queries: list[str] = Field(min_length=1, max_length=4)
+    enabled: bool = True
+    interval_minutes: int = Field(120, ge=60, le=1440)
+    max_posts_per_platform: int = Field(8, ge=1, le=30)
+
+
+class SocialReviewRequest(BaseModel):
+    status: str
+    evidence_url: str = ""
+    note: str = ""
 
 
 class GitHubAppConfigRequest(BaseModel):
@@ -2003,3 +2052,92 @@ def send_dingtalk(payload: DingTalkSendRequest) -> dict:
         return post_dingtalk_markdown(payload.content, config=config, title=payload.title)
     except DingTalkBotError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/social-monitoring/status")
+def social_monitoring_status(request: Request) -> dict:
+    _require_social_access(request)
+    return {
+        "platforms": ["x", "facebook"],
+        "mode": "public_search_index",
+        "coverage_limited": True,
+        "message": "仅发现公开搜索引擎已收录的帖子；Facebook 可能只能读取公开元数据，不能保证实时或全量。",
+        "sources": [
+            {"key": key, "platform": platform, "url": f"https://cse.google.com/cse?cx={engine_id}"}
+            for platform, engines in SOCIAL_ENGINES.items()
+            for key, engine_id in engines
+        ],
+    }
+
+
+@app.get("/api/social-monitoring/watchlists")
+def social_monitoring_watchlists(request: Request) -> list[dict]:
+    _require_social_access(request)
+    return list_social_watchlists()
+
+
+@app.post("/api/social-monitoring/watchlists", status_code=201)
+def create_social_monitoring_watchlist(request: Request, payload: SocialWatchlistRequest) -> dict:
+    _require_social_access(request, admin=True)
+    try:
+        return save_social_watchlist(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/social-monitoring/watchlists/{watchlist_id}")
+def update_social_monitoring_watchlist(request: Request, watchlist_id: str, payload: SocialWatchlistRequest) -> dict:
+    _require_social_access(request, admin=True)
+    try:
+        return save_social_watchlist(payload.model_dump(), watchlist_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if str(exc) == "watchlist not found" else 400, detail=str(exc)) from exc
+
+
+@app.post("/api/social-monitoring/watchlists/{watchlist_id}/scan", status_code=202)
+def run_social_monitoring_watchlist(request: Request, watchlist_id: str) -> dict:
+    _require_social_access(request, admin=True)
+    try:
+        return start_social_scan(watchlist_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/social-monitoring/watchlists/{watchlist_id}/hits")
+def social_monitoring_hits(request: Request, watchlist_id: str, limit: int = Query(100, ge=1, le=500)) -> list[dict]:
+    _require_social_access(request)
+    if not get_social_watchlist(watchlist_id):
+        raise HTTPException(status_code=404, detail="watchlist not found")
+    return list_social_hits(watchlist_id, limit=limit)
+
+
+@app.get("/api/social-monitoring/watchlists/{watchlist_id}/scans")
+def social_monitoring_scans(request: Request, watchlist_id: str, limit: int = Query(30, ge=1, le=100)) -> list[dict]:
+    _require_social_access(request)
+    if not get_social_watchlist(watchlist_id):
+        raise HTTPException(status_code=404, detail="watchlist not found")
+    return list_social_scans(watchlist_id, limit=limit)
+
+
+@app.get("/api/social-monitoring/hits/{hit_id}/preview")
+def social_monitoring_preview(request: Request, hit_id: str, response: Response) -> dict:
+    _require_social_access(request)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return get_social_preview(hit_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/social-monitoring/hits/{hit_id}/review")
+def social_monitoring_review(request: Request, hit_id: str, payload: SocialReviewRequest) -> dict:
+    user = _require_social_access(request)
+    if not get_social_hit(hit_id):
+        raise HTTPException(status_code=404, detail="hit not found")
+    try:
+        return review_social_hit(hit_id, payload.status, payload.evidence_url, payload.note,
+                                 str(user.get("username") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

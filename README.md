@@ -260,6 +260,10 @@ $env:DARKWEB_GITHUB_TOKEN_FILE = "C:\ProgramData\DarkWebThreatIntel\github-token
 
 系统不会轮换多个个人账号来规避 GitHub 限制。需要隔离不同客户授权范围时，应为不同采集实例配置各自的 GitHub App。
 
+## 社交平台监测
+
+“社交平台监测”支持为监测对象设置企业别名、风险词和搜索词，定期发现 X/Facebook 已被公开搜索引擎收录的单帖，并保留原帖补全、去重、扫描状态和人工核验记录。它不使用账号池，也不宣称覆盖平台全站。来源和运行限制见 [社交平台监测说明](darkweb_collector/SOCIAL_MONITORING.md)。
+
 ## Tor 网桥
 
 前端提供 Tor 网桥配置页面。启用后，后端会生成独立 `torrc`，启动本地 Tor 进程，并提供本地 SOCKS 代理给采集逻辑使用。
