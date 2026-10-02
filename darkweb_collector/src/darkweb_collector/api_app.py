@@ -173,7 +173,9 @@ from darkweb_collector.tor_bridge_control import (
     get_tor_bridge_status,
     save_tor_bridge_settings,
     start_tor_bridge,
+    start_tor_bridge_recovery,
     stop_tor_bridge,
+    stop_tor_bridge_recovery,
     write_torrc,
 )
 from darkweb_collector.version_check import build_version_status, current_version_payload
@@ -437,6 +439,7 @@ def _run_payload_warmup() -> None:
 
 @app.on_event("startup")
 def warm_payloads_on_startup() -> None:
+    start_tor_bridge_recovery()
     try:
         with get_db_connection() as connection:
             reconciled_jobs = reconcile_stale_crawl_jobs(connection)
@@ -482,6 +485,7 @@ def warm_payloads_on_startup() -> None:
 
 @app.on_event("shutdown")
 def stop_background_workers() -> None:
+    stop_tor_bridge_recovery()
     stop_normalization_worker()
 
 
