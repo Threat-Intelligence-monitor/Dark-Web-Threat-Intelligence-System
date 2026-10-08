@@ -6,6 +6,7 @@ export const MODULE_KEYS = Object.freeze({
   VULNERABILITY_ALERTS: 'vulnerability_alerts',
   COLLECTOR_CONTROL: 'collector_control',
   FILE_MONITORING: 'file_monitoring',
+  SOCIAL_MONITORING: 'social_monitoring',
 })
 
 export const ASSIGNABLE_MODULES = Object.freeze([
@@ -15,6 +16,7 @@ export const ASSIGNABLE_MODULES = Object.freeze([
   { key: MODULE_KEYS.VULNERABILITY_ALERTS, label: '漏洞预警', path: '/vulnerability-alerts' },
   { key: MODULE_KEYS.COLLECTOR_CONTROL, label: '采集控制', path: '/collector-control' },
   { key: MODULE_KEYS.FILE_MONITORING, label: '文件监测', path: '/document-exposure/netdisk' },
+  { key: MODULE_KEYS.SOCIAL_MONITORING, label: '社交平台监测', path: '/social-monitoring' },
 ])
 
 export const ASSIGNABLE_MODULE_KEYS = Object.freeze(ASSIGNABLE_MODULES.map((item) => item.key))

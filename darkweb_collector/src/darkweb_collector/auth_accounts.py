@@ -21,6 +21,7 @@ ASSIGNABLE_MODULES = (
     "vulnerability_alerts",
     "collector_control",
     "file_monitoring",
+    "social_monitoring",
 )
 
 _PASSWORD_SCHEME = "pbkdf2_sha256"

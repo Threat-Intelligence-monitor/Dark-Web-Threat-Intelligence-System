@@ -12,6 +12,7 @@ import PrototypeScreen from '@/views/PrototypeScreen.vue'
 import DataMigration from '@/views/DataMigration.vue'
 import AccountManagement from '@/views/AccountManagement.vue'
 import DocumentExposureScans from '@/views/DocumentExposureScans.vue'
+import SocialMonitoring from '@/views/SocialMonitoring.vue'
 
 const screen = (path, name, file, meta = {}) => ({
   path,
@@ -33,6 +34,7 @@ const routes = [
   screen('/document-exposure/netdisk', 'DocumentExposureNetdisk', 'monitoring.html', { source: 'netdisk' }),
   screen('/document-exposure/document-library', 'DocumentExposureDocumentLibrary', 'monitoring.html', { source: 'library' }),
   screen('/document-exposure/code-monitoring', 'CodeMonitoringWorkbench', 'monitoring.html', { source: 'code' }),
+  { path: '/social-monitoring', name: 'SocialMonitoring', component: SocialMonitoring, meta: { layout: 'prototype-vue' } },
   screen('/document-exposure/detail/netdisk_aggregator/:hitId', 'DocumentExposureNetdiskDetail', 'netdisk-detail.html', { source: 'netdisk' }),
   screen('/document-exposure/detail/document_library/:hitId', 'DocumentExposureLibraryDetail', 'library-detail.html', { source: 'library' }),
   screen('/document-exposure/code-monitoring/detail/:hitId', 'CodeMonitoringDetail', 'code-detail.html', { source: 'code' }),
@@ -75,6 +77,7 @@ const PATH_MODULES = [
   ['/vulnerability-alerts', MODULE_KEYS.VULNERABILITY_ALERTS],
   ['/collector-control', MODULE_KEYS.COLLECTOR_CONTROL],
   ['/document-exposure', MODULE_KEYS.FILE_MONITORING],
+  ['/social-monitoring', MODULE_KEYS.SOCIAL_MONITORING],
   ['/settings', MODULE_KEYS.FILE_MONITORING],
 ]
 

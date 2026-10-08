@@ -23,6 +23,7 @@
 - `cracked`
 - `breachforums`（BreachForums，`bf.st`）
 - `raidforums`
+- `xforums`（XForums，`xforums.st`）
 - `pwnfrm`
 - `chaos`
 - `lynx`
@@ -44,6 +45,9 @@
 - `https://cracked.st/...` 由浏览器队列执行，仍优先直连；403 时回退 Chromium，并在数据目录保存隔离的匿名站点状态
 - `https://raidforums.im/...` 使用 MyBB 通用解析逻辑，优先直连，页面校验失败时回退 Chromium
 - `https://bf.st/...` 接入 Databases、Other Leaks、Leaks Market 和 Sellers Place 四个入口，使用独立 `breachforums` 来源标识和公网浏览器队列；各入口分别保存分页游标，两个交易入口统一归入卖家交易板块，并按主题 URL 去重
+- `https://xforums.st/...` 接入 Index Database、Databases Leads、Database Crypto Leads、Other Databases、Other Leaks、Database Dumps Mail Access Leads 六个公开板块，使用独立 `xforums` 来源标识和公网浏览器队列；采集轮次完成后间隔 20 分钟再检查，每轮最多领取 10 个详情，详情并发为 1，浏览器状态保存在数据目录的 `browser-state/xforums/storage-state.json`
+
+XForums 使用 XenForo 解析器处理主题列表和首帖，通过 `collect_paginated_seed` 复用持久游标、历史回补及跨入口去重，并按 `/page-N` 路径翻页。仅留存公开可见正文、HTML、JSON 和截图；不下载附件二进制，不绕过登录限制，不接入凭证或日志交易板块及私有付费板块。
 
 `sites.yaml` 中的：
 
@@ -385,7 +389,7 @@ SQLite 默认路径：
 
 ## 数据泄露站点的持续采集
 
-`changan`、`darkforums`、`cracked`、`breachforums`、`raidforums` 和 `pwnfrm` 使用统一的分页回补与详情待抓机制；`pwnfrm` 仍按配置默认停用。
+`changan`、`darkforums`、`cracked`、`breachforums`、`raidforums`、`xforums` 和 `pwnfrm` 使用统一的分页回补与详情待抓机制；`pwnfrm` 仍按配置默认停用。
 
 - 每轮先检查各分区最新页，默认 `recent_pages_per_run=1`
 - 每站每轮共回补最多 `backfill_pages_per_run=5` 个历史页，按分区公平分配并保存游标

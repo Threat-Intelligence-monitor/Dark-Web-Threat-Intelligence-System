@@ -148,6 +148,36 @@
       "fetch_timeout_seconds": 90
     },
     {
+      "site_name": "xforums",
+      "enabled": true,
+      "seed_urls": [
+        "https://xforums.st/forums/index-database.36/?order=post_date&direction=desc",
+        "https://xforums.st/forums/databases-leads.35/?order=post_date&direction=desc",
+        "https://xforums.st/forums/database-crypto-leads.37/?order=post_date&direction=desc",
+        "https://xforums.st/forums/other-databases.39/?order=post_date&direction=desc",
+        "https://xforums.st/forums/other-leaks.72/?order=post_date&direction=desc",
+        "https://xforums.st/forums/database-dumps-mail-access-leads.67/?order=post_date&direction=desc"
+      ],
+      "seed_fetch_mode": "browser",
+      "detail_fetch_mode": "browser",
+      "browser_queue": "browser_public",
+      "profile": "hot",
+      "max_topics_per_run": 20,
+      "max_detail_pages_per_run": 10,
+      "cooldown_seconds": 1200,
+      "output_dir": "output/xforums",
+      "dedupe_window_minutes": 180,
+      "recent_pages_per_run": 1,
+      "backfill_pages_per_run": 5,
+      "frontier_max_pending": 500,
+      "max_concurrent_details": 1,
+      "display_name": "XForums（xforums.st）",
+      "browser_engine": "chromium",
+      "render_wait_seconds": 12,
+      "fetch_timeout_seconds": 90,
+      "browser_storage_state_file": "browser-state/xforums/storage-state.json"
+    },
+    {
       "site_name": "pwnfrm",
       "enabled": false,
       "seed_urls": [

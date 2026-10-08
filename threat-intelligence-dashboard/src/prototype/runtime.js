@@ -473,6 +473,9 @@ export function initializePrototype() {
       navLink('/document-exposure/document-library', '文库监测', active('monitoring.html', 'library')),
       navLink('/document-exposure/code-monitoring', '代码监测', active('monitoring.html', 'code')),
     ] : []
+    if (hasModuleAccess(MODULE_KEYS.SOCIAL_MONITORING)) {
+      exposureLinks.push(navLink('/social-monitoring', '社交平台监测', activePath('/social-monitoring')))
+    }
     const collectorLinks = hasModuleAccess(MODULE_KEYS.COLLECTOR_CONTROL) ? [
       navLink('/collector-control/sites', '站点管理', active('collector-sites.html')),
       navLink('/collector-control/sync', '同步中心', active('collector-sync.html')),

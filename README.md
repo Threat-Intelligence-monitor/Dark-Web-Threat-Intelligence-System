@@ -74,6 +74,26 @@ npm run dev
 
 默认前端端口为 `5174`，开发代理会转发到 `127.0.0.1:8000`。
 
+## Healthcheck 诊断入口
+
+直接访问 `/healthcheck` 打开后端提供的独立诊断页面，使用现有管理员账号登录后执行检查。常规前端菜单和模块中没有诊断入口；`/system-diagnostics` 页面已移除。结果可复制或下载为 JSON，无需绑定 AI 服务或安装额外客户端。
+
+页面及诊断数据接口都位于 `/healthcheck` 下：`GET /healthcheck` 返回页面，`GET /healthcheck/api` 提供检查项，`POST /healthcheck/api/run` 执行只读查询。前端开发服务器和 Windows 一键启动使用的预览服务器会将 `/healthcheck` 转发给后端。也可直接访问后端地址，例如 `http://127.0.0.1:8000/healthcheck`；使用自定义反向代理时，需将 `/healthcheck` 及子路径转发到后端。
+
+需要调用命令行时，将检查项切换为“命令行查询”，选择工作目录及相对子目录，在 PowerShell 输入框填写命令并点击“执行命令”。后台实际启动 Windows 自带的 `powershell.exe`，在选定目录执行，并返回标准输出、错误输出、退出码与超时状态。示例按钮只填写命令，不会自动执行。
+
+命令入口目前开放只读查询：`dir` / `Get-ChildItem`、`Get-Content`、`Select-String`、`Get-Process`、`Get-Service`、`Get-NetTCPConnection -State Listen`、`Get-Location`、`whoami`、`hostname` 和 `python --version`。例如 `Get-Content README.md -TotalCount 30`，或在运行日志目录执行 `Select-String -Path worker.log -Pattern 'ERROR'`。参数由后端校验并重建查询，不能执行任意脚本、管道、连接命令或修改操作。
+
+每条命令最长运行 15 秒，标准输出与错误输出合计最多保留 256 KiB；达到时间或输出上限会终止命令进程。目录、进程、服务、端口和文件内容查询默认最多返回 200 项或行，页面可调整为 1–500，结果会显示实际数量上限，不代表已展示全部记录。命令读取单个文件也限制为 256 KiB，大日志使用“日志查询”。工作目录和文件访问沿用下述目录边界，命令内容及输出不会写入诊断审计日志。
+
+文件查询使用服务端确定的项目目录、运行日志目录和采集输出目录，页面输入相对路径。日志目录对应 `darkweb_collector/.runtime/windows/logs`，采集输出目录沿用项目当前配置。目录项可点击进入，敏感文件、隐藏目录、数据库文件以及符号链接和 Windows 目录联接不会开放。
+
+源码查询读取文件开头，日志查询读取文件末尾，每次最多扫描 256 KiB、返回 500 行。关键词按普通文字匹配；目录查询匹配文件名。达到扫描或返回上限会显示截断提示，日志关键词查询不代表搜索了整个文件。密码、认证头、Cookie、令牌等常见敏感字段会过滤，诊断日志只记录操作者、检查项和结果状态，不记录查询内容。
+
+诊断接口始终要求管理员登录，即使设置 `DARKWEB_API_AUTH_DISABLED=1` 也不会开放。诊断仅执行固定只读查询，数据库检查使用只读连接，队列检查不会取出或删除任务。Worker 健康快照没有错误不等同于所有 Worker 在线。
+
+模块运行在现有后端 API 内；后端停止或网站不可访问时，仍需通过现有服务器运维通道排查。
+
 ## 一键启动
 
 ### WSL / Linux
@@ -259,6 +279,10 @@ $env:DARKWEB_GITHUB_TOKEN_FILE = "C:\ProgramData\DarkWebThreatIntel\github-token
 系统会串行发送 GitHub API 请求，读取限流响应头并进入冷却，同时在短时间内复用相同查询。GitHub 全局代码搜索仍只覆盖仓库默认分支；非默认分支不能通过全局搜索完整发现。
 
 系统不会轮换多个个人账号来规避 GitHub 限制。需要隔离不同客户授权范围时，应为不同采集实例配置各自的 GitHub App。
+
+## 社交平台监测
+
+“社交平台监测”支持为监测对象设置企业别名、风险词和搜索词，定期发现 X/Facebook 已被公开搜索引擎收录的单帖，并保留原帖补全、去重、扫描状态和人工核验记录。它不使用账号池，也不宣称覆盖平台全站。来源和运行限制见 [社交平台监测说明](darkweb_collector/SOCIAL_MONITORING.md)。
 
 ## Tor 网桥
 
