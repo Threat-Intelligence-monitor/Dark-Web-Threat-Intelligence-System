@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Healthcheck · 服务器诊断</title>
+  <style>
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: #f3f6fa; color: #243247; font: 14px/1.55 "Microsoft YaHei", system-ui, sans-serif; }
+    main { max-width: 1120px; margin: 32px auto; padding: 0 20px; }
+    h1 { margin: 4px 0 20px; font-size: 26px; } h2 { margin: 0 0 16px; font-size: 18px; }
+    .kicker, .note { color: #637287; font-size: 12px; } .note { display: block; overflow-wrap: anywhere; }
+    .panel { margin-bottom: 16px; padding: 20px; border: 1px solid #d9e2ec; border-radius: 8px; background: white; }
+    #login-panel { max-width: 440px; }
+    fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .login-fields { display: grid; gap: 16px; }
+    .wide { grid-column: 1 / -1; } label { display: block; margin-bottom: 6px; font-weight: 600; }
+    input, select, textarea, button { font: inherit; }
+    input, select, textarea { width: 100%; padding: 9px 10px; border: 1px solid #cbd6e2; border-radius: 5px; color: inherit; background: white; }
+    textarea { min-height: 100px; resize: vertical; font-family: Consolas, monospace; }
+    button { padding: 8px 14px; border: 1px solid #cbd6e2; border-radius: 5px; background: white; color: #243247; cursor: pointer; }
+    button.primary { border-color: #2576ba; background: #2576ba; color: white; }
+    button:disabled { opacity: .55; cursor: default; } :focus-visible { outline: 2px solid #2576ba; outline-offset: 2px; }
+    .actions, .heading, .examples { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .heading { justify-content: space-between; margin-bottom: 16px; } .heading h2 { margin: 0; }
+    .examples { margin: 10px 0; } .examples button { padding: 5px 9px; font-size: 12px; }
+    #message { margin: 0 0 16px; padding: 10px 12px; border-radius: 5px; background: #fff0ed; color: #ad3228; }
+    #status { margin: 0 0 14px; color: #637287; }
+    .warning { padding: 10px 12px; background: #fff7e5; color: #8b5a0b; border-radius: 5px; }
+    pre { max-height: 480px; margin: 10px 0 16px; padding: 14px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #d9e2ec; border-radius: 5px; background: #f6f8fb; font: 13px/1.65 Consolas, monospace; }
+    .error { color: #ad3228; } h3 { margin: 16px 0 4px; font-size: 14px; }
+    .table-wrap { overflow: auto; } table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 9px; text-align: left; border-bottom: 1px solid #e4eaf1; overflow-wrap: anywhere; }
+    th { color: #637287; } .file-link { padding: 0; border: 0; color: #2576ba; text-align: left; }
+    details { margin-top: 16px; } summary { cursor: pointer; color: #637287; }
+    @media (max-width: 650px) { main { margin: 20px auto; padding: 0 12px; } .panel { padding: 16px; } .fields { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="kicker">Healthcheck</span>
+    <h1>服务器诊断</h1>
+    <p id="message" role="alert" hidden></p>
+    <section id="login-panel" class="panel">
+      <h2>管理员登录</h2>
+      <form id="login-form">
+        <fieldset id="login-fields" class="login-fields">
+          <div><label for="username">账号</label><input id="username" name="username" value="admin" autocomplete="username" maxlength="64" required></div>
+          <div><label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required></div>
+          <button id="login-button" class="primary" type="submit">登录</button>
+        </fieldset>
+      </form>
+    </section>
+    <div id="diagnostics" hidden>
+      <section class="panel">
+        <div class="heading"><h2>诊断查询</h2><button id="logout" type="button">退出登录</button></div>
+        <form id="query-form">
+          <fieldset id="query-fields" class="fields">
+            <div><label for="check">检查项</label><select id="check" required></select></div>
+            <div id="root-field" hidden><label id="root-label" for="root">查询目录</label><select id="root"></select></div>
+            <div id="path-field" class="wide" hidden><label id="path-label" for="path">相对路径</label><input id="path" maxlength="512"><span id="root-path" class="note"></span></div>
+            <div id="keyword-field" hidden><label for="keyword">关键词</label><input id="keyword" maxlength="120" placeholder="筛选文件名或文件内容"></div>
+            <div id="limit-field" hidden><label id="limit-label" for="limit">返回行数上限</label><input id="limit" type="number" min="1" max="500" step="1" value="200"></div>
+            <div id="command-field" class="wide" hidden>
+              <label for="command">PowerShell 命令</label><textarea id="command" maxlength="2048" autocomplete="off" placeholder="输入诊断命令，Ctrl + Enter 执行"></textarea>
+              <div id="examples" class="examples"></div><span id="command-note" class="note"></span>
+            </div>
+            <div class="actions wide"><button id="run" class="primary" type="submit">执行检查</button><button id="refresh" type="button">刷新检查项</button><span id="query-note" class="note"></span></div>
+          </fieldset>
+        </form>
+      </section>
+      <section class="panel" aria-live="polite" id="result-panel">
+        <div class="heading"><h2>诊断结果</h2><div class="actions"><button id="copy" type="button" disabled>复制 JSON</button><button id="download" type="button" disabled>下载 JSON</button></div></div>
+        <p id="status">选择检查项后执行查询。</p>
+        <div id="result-content"></div>
+        <details id="raw-result" hidden><summary>完整 JSON</summary><pre id="result-json"></pre></details>
+      </section>
+    </div>
+  </main>
+  <script>
+    'use strict';
+    const $ = (id) => document.getElementById(id);
+    const storageKey = 'dwti-healthcheck-token';
+    let token = '', catalog = null, result = null, busy = false, activeRequest = null;
+    try { token = sessionStorage.getItem(storageKey) || ''; } catch {}
+    function node(tag, text, className = '') {
+      const element = document.createElement(tag);
+      if (text != null) element.textContent = String(text);
+      if (className) element.className = className;
+      return element;
+    }
+    function message(text = '') { $('message').textContent = text; $('message').hidden = !text; }
+    function saveToken(value) {
+      token = value;
+      try { if (value) sessionStorage.setItem(storageKey, value); else sessionStorage.removeItem(storageKey); } catch {}
+    }
+    function setBusy(value) {
+      busy = value; $('login-fields').disabled = value; $('query-fields').disabled = value; $('logout').disabled = value;
+      $('copy').disabled = value || !result; $('download').disabled = value || !result;
+      $('result-panel').setAttribute('aria-busy', String(value));
+    }
+    function clearResult() {
+      result = null; $('result-content').replaceChildren(); $('result-json').textContent = '';
+      $('raw-result').hidden = true; $('raw-result').open = false; $('status').textContent = '选择检查项后执行查询。';
+      $('copy').disabled = true; $('download').disabled = true;
+    }
+    function clearSession() {
+      activeRequest?.abort(); saveToken(''); catalog = null; clearResult();
+      $('check').replaceChildren(); $('root').replaceChildren(); $('examples').replaceChildren();
+      $('path').value = ''; $('keyword').value = ''; $('command').value = ''; $('root-path').textContent = ''; $('password').value = '';
+      $('command-note').textContent = ''; $('query-note').textContent = '';
+      $('diagnostics').hidden = true; $('login-panel').hidden = false;
+    }
+    async function request(path, options = {}) {
+      const controller = new AbortController(); activeRequest = controller;
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      const headers = { ...options.headers };
+      if (token && path !== '/api/auth/login') headers.Authorization = 'Bearer ' + token;
+      try {
+        const response = await fetch(path, { ...options, headers, signal: controller.signal });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok) {
+          if (path.startsWith('/healthcheck/api') && [401, 403].includes(response.status)) clearSession();
+          throw new Error(typeof payload?.detail === 'string' ? payload.detail : '查询失败（HTTP ' + response.status + '）');
+        }
+        if (!payload) throw new Error('接口返回格式异常，请检查服务状态');
+        return payload;
+      } catch (error) {
+        if (error.name === 'AbortError') throw new Error('查询超时或已取消，请重新查询');
+        throw error;
+      } finally { clearTimeout(timeout); if (activeRequest === controller) activeRequest = null; }
+    }
+    function jsonOptions(body) { return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }; }
+    function updateRootNote() { $('root-path').textContent = catalog?.roots.find((item) => item.id === $('root').value)?.path || ''; }
+    function updateFields() {
+      const check = $('check').value, command = check === 'command', files = ['files', 'logs'].includes(check), directory = command || files;
+      for (const id of ['root-field', 'path-field']) $(id).hidden = !directory;
+      $('keyword-field').hidden = !files; $('limit-field').hidden = !(files || command);
+      $('command-field').hidden = !command; $('command').required = command; $('root').required = directory; $('limit').required = files || command;
+      $('limit-label').textContent = command ? '返回数量上限' : '返回行数上限';
+      $('root-label').textContent = command ? '工作目录' : '查询目录'; $('path-label').textContent = command ? '相对子目录' : '相对路径';
+      $('path').placeholder = command ? '留空在所选根目录执行，或输入其中的子目录' : '留空查看目录，或输入目录内的文件路径';
+      $('run').textContent = command ? '执行命令' : (files ? '查询' : '执行检查');
+      $('query-note').textContent = check === 'logs' ? '读取日志末尾内容，关键词按文字匹配。' : '';
+      $('root').replaceChildren();
+      for (const item of catalog.roots.filter((item) => check !== 'logs' || item.id !== 'project')) {
+        const option = node('option', item.label + (item.exists ? '' : '（目录不存在）')); option.value = item.id; option.disabled = !item.exists; $('root').append(option);
+      }
+      const preferred = check === 'logs' ? 'logs' : 'project';
+      const available = [...$('root').options].filter((item) => !item.disabled);
+      $('root').value = available.find((item) => item.value === preferred)?.value || available[0]?.value || '';
+      $('limit').value = String(Math.min(200, Number($('limit').max) || 500));
+      $('path').value = ''; $('keyword').value = ''; $('command').value = ''; updateRootNote(); clearResult(); message();
+    }
+    async function loadCatalog() {
+      const payload = await request('/healthcheck/api'); catalog = payload;
+      const selected = $('check').value; $('check').replaceChildren();
+      for (const item of payload.checks) { const option = node('option', item.label); option.value = item.id; $('check').append(option); }
+      if (payload.checks.some((item) => item.id === selected)) $('check').value = selected;
+      $('limit').max = String(payload.limits.max_lines); $('limit').value = String(Math.min(Number($('limit').value) || 200, payload.limits.max_lines));
+      $('examples').replaceChildren();
+      for (const item of payload.command_examples || []) {
+        const button = node('button', item.label); button.type = 'button';
+        button.addEventListener('click', () => { $('command').value = item.command; clearResult(); $('command').focus(); }); $('examples').append(button);
+      }
+      $('command-note').textContent = '仅执行服务器允许的只读命令。单次执行上限 ' + (payload.command_timeout_seconds || 15) + ' 秒。';
+      updateFields(); $('login-panel').hidden = true; $('diagnostics').hidden = false;
+    }
+    function resultTime(value) {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value || '') : date.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    }
+    function openPath(path) { $('path').value = path || ''; runCheck(); }
+    function renderResult(payload) {
+      result = payload; const data = payload.data, content = $('result-content'); content.replaceChildren();
+      $('status').textContent = (payload.check === 'command' ? '命令已返回' : '查询完成') + ' · ' + resultTime(payload.checked_at) + ' · 耗时 ' + payload.duration_ms + ' ms';
+      if (payload.truncated) content.append(node('p', '结果达到返回上限，部分内容未展示。请缩小查询范围后重试。', 'warning'));
+      if (payload.check === 'command') {
+        content.append(node('p', '工作目录：' + data.working_directory), node('p', '退出码：' + (data.exit_code ?? '—') + (data.timed_out ? ' · 执行超时' : '')));
+        if (data.result_limit != null) content.append(node('p', '本次最多返回 ' + data.result_limit + ' 项或行，结果可能未涵盖全部记录。', 'note'));
+        content.append(node('h3', '标准输出'), node('pre', data.stdout || '无标准输出'), node('h3', '标准错误输出'));
+        content.append(data.stderr ? node('pre', data.stderr, 'error') : node('p', '无标准错误输出', 'note'));
+      } else if (Array.isArray(data.entries) || typeof data.text === 'string') {
+        const location = node('div', null, 'actions'); location.append(node('span', '当前路径：' + (data.path || '根目录')));
+        if (data.path) {
+          const parent = node('button', Array.isArray(data.entries) ? '返回上级目录' : '返回所在目录'); parent.type = 'button';
+          parent.addEventListener('click', () => openPath(String(data.path).replace(/\\/g, '/').split('/').slice(0, -1).join('/'))); location.append(parent);
+        }
+        content.append(location);
+        if (Array.isArray(data.entries)) {
+          const wrap = node('div', null, 'table-wrap'), table = node('table'), head = node('thead'), titles = node('tr'), body = node('tbody');
+          for (const title of ['名称', '类型', '大小', '相对路径']) titles.append(node('th', title)); head.append(titles); table.append(head, body);
+          for (const item of data.entries) {
+            const row = node('tr'), name = node('td'), button = node('button', item.name, 'file-link'); button.type = 'button';
+            button.addEventListener('click', () => openPath(item.path)); name.append(button);
+            row.append(name, node('td', item.type === 'directory' ? '目录' : '文件'), node('td', item.size == null ? '—' : item.size + ' 字节'), node('td', item.path)); body.append(row);
+          }
+          if (!data.entries.length) content.append(node('p', '当前目录没有可查看的文件。', 'note'));
+          wrap.append(table); content.append(wrap);
+        } else content.append(node('pre', data.text || '文件内容为空，或当前查询范围内没有匹配行。'));
+      } else content.append(node('pre', JSON.stringify(data, null, 2)));
+      $('result-json').textContent = JSON.stringify(payload, null, 2); $('raw-result').hidden = false;
+    }
+    async function runCheck() {
+      if (busy || !catalog || !$('query-form').reportValidity()) return;
+      const check = $('check').value, directory = ['files', 'logs', 'command'].includes(check);
+      if (directory && !catalog.roots.some((item) => item.id === $('root').value && item.exists)) { message('请选择现有的工作目录'); return; }
+      if (check === 'command' && !$('command').value.trim()) { message('请输入查询命令'); return; }
+      const body = { check, root: $('root').value || 'project', path: $('path').value.trim(), keyword: $('keyword').value, limit: Number($('limit').value) || 200 };
+      if (check === 'command') body.command = $('command').value;
+      clearResult(); message(); setBusy(true); $('status').textContent = '正在查询，请稍候…';
+      try { renderResult(await request('/healthcheck/api/run', jsonOptions(body))); }
+      catch (error) { $('status').textContent = '查询未完成。'; message(error.message || '查询失败'); }
+      finally { setBusy(false); }
+    }
+    $('login-form').addEventListener('submit', async (event) => {
+      event.preventDefault(); if (busy) return; message(); setBusy(true); $('login-button').textContent = '正在登录…';
+      try {
+        const payload = await request('/api/auth/login', jsonOptions({ username: $('username').value.trim(), password: $('password').value }));
+        if (!payload.access_token) throw new Error('登录响应缺少会话，请重试');
+        saveToken(payload.access_token); $('password').value = '';
+        if (payload.user?.role !== 'admin' && !payload.user?.is_admin) {
+          await request('/api/auth/logout', { method: 'POST' }).catch(() => {}); clearSession(); throw new Error('仅管理员可以访问服务器诊断');
+        }
+        await loadCatalog();
+      } catch (error) { clearSession(); message(error.message || '登录失败'); }
+      finally { $('password').value = ''; $('login-button').textContent = '登录'; setBusy(false); }
+    });
+    $('query-form').addEventListener('submit', (event) => { event.preventDefault(); runCheck(); });
+    $('check').addEventListener('change', updateFields);
+    $('root').addEventListener('change', () => { $('path').value = ''; updateRootNote(); clearResult(); message(); });
+    $('command').addEventListener('keydown', (event) => { if (event.ctrlKey && event.key === 'Enter') { event.preventDefault(); runCheck(); } });
+    $('refresh').addEventListener('click', async () => {
+      if (busy) return; message(); setBusy(true);
+      try { await loadCatalog(); } catch (error) { message(error.message || '加载检查项失败'); } finally { setBusy(false); }
+    });
+    $('logout').addEventListener('click', async () => {
+      if (busy) return; setBusy(true);
+      try { await request('/api/auth/logout', { method: 'POST' }); } catch {} finally { clearSession(); message(); setBusy(false); }
+    });
+    $('copy').addEventListener('click', async () => {
+      if (busy || !result) return;
+      try { await navigator.clipboard.writeText(JSON.stringify(result, null, 2)); message(); } catch { message('复制失败，请使用下载 JSON 保存结果'); }
+    });
+    $('download').addEventListener('click', () => {
+      if (busy || !result) return;
+      const url = URL.createObjectURL(new Blob([JSON.stringify(result, null, 2)], { type: 'application/json;charset=utf-8' }));
+      const link = node('a'); link.href = url; link.download = 'healthcheck-' + Date.now() + '.json'; link.click(); URL.revokeObjectURL(url);
+    });
+    window.addEventListener('pagehide', () => activeRequest?.abort());
+    if (token) {
+      setBusy(true);
+      loadCatalog().catch((error) => { clearSession(); message(error.message || '会话已失效，请重新登录'); }).finally(() => setBusy(false));
+    }
+  </script>
+</body>
+</html>

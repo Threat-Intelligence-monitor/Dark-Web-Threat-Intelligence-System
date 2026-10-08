@@ -6,6 +6,10 @@ const apiTarget = process.env.VITE_API_TARGET || process.env.DARKWEB_API_TARGET 
 const frontendPort = Number(process.env.VITE_FRONTEND_PORT || process.env.DARKWEB_FRONTEND_PORT || 5174)
 const allowedHosts = ['darkweb-monitor.threatbook-inc.cn']
 const proxy = {
+  '/healthcheck': {
+    target: apiTarget,
+    changeOrigin: true,
+  },
   '/api': {
     target: apiTarget,
     changeOrigin: true,

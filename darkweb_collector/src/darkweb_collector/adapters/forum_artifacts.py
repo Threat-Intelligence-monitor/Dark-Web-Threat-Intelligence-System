@@ -13,6 +13,7 @@ def restore_detail_artifacts(
     detail_task: DetailTask,
     config: SiteConfig,
     *,
+    screenshot_selector: str | None = None,
     screenshot_selectors: tuple[str, ...] = (),
     hide_selectors: tuple[str, ...] = (),
     fallback_html=None,
@@ -42,6 +43,7 @@ def restore_detail_artifacts(
         wait_seconds=config.render_wait_seconds, timeout_seconds=config.fetch_timeout_seconds,
         proxy_server=browser_proxy_server_for_url(detail_task.target_url),
         browser_engine=str(config.extras.get("browser_engine") or "firefox"),
+        screenshot_selector=screenshot_selector,
         screenshot_selectors=screenshot_selectors, hide_selectors=hide_selectors,
     )
     return DetailResult(

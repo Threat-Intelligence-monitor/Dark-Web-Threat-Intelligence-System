@@ -43,6 +43,7 @@ from darkweb_collector.sites.breachforums import normalize_breachforums_timestam
 from darkweb_collector.sites.cracked import normalize_cracked_timestamp
 from darkweb_collector.sites.darkforums import clean_extracted_attackers, normalize_darkforums_timestamp
 from darkweb_collector.sites.pwnfrm import normalize_pwnfrm_timestamp
+from darkweb_collector.sites.xforums import normalize_xforums_timestamp
 from darkweb_collector.utils import safe_stem
 from darkweb_collector.vulnerability_i18n import (
     build_affected_version_items,
@@ -74,6 +75,7 @@ SOURCE_LABELS = {
     "lynx": "Lynx",
     "pwnfrm": "PwnedForums",
     "raidforums": "RaidForums",
+    "xforums": "XForums（xforums.st）",
     "baidu_wenku": "百度文库",
     "docin": "豆丁",
     "doc88": "道客巴巴",
@@ -418,6 +420,7 @@ SOURCE_HOSTNAME_KEYWORDS = {
     "lynx",
     "pwnfrm",
     "raidforums",
+    "xforums",
     "blogspot",
     "wordpress",
     "onion",
@@ -430,6 +433,7 @@ _FORUM_TIMESTAMP_NORMALIZERS = {
     "darkforums": normalize_darkforums_timestamp,
     "pwnfrm": normalize_pwnfrm_timestamp,
     "raidforums": normalize_pwnfrm_timestamp,
+    "xforums": normalize_xforums_timestamp,
 }
 
 
