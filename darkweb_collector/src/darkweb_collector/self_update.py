@@ -21,8 +21,6 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, TextIO
 
-import psutil
-
 from darkweb_collector.version_check import (
     _is_newer_version,
     _open_update_request,
@@ -162,6 +160,8 @@ def _write_update_status(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _process_running(pid: object, created_at: object = None) -> bool | None:
+    import psutil
+
     try:
         process_id = int(pid or 0)
     except (TypeError, ValueError):
@@ -252,6 +252,8 @@ def _launcher_command(project_root: Path, action: str) -> list[str]:
 
 
 def _run_logged(command: list[str], project_root: Path, log: TextIO, timeout: int = 1800) -> None:
+    import psutil
+
     log.write(f"\n[{_now_iso()}] $ {' '.join(command)}\n")
     log.flush()
     started = time.monotonic()
@@ -813,6 +815,8 @@ def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dic
 
 
 def run_self_update(job_id: str, wait_seconds: float = 1.0) -> None:
+    import psutil
+
     if wait_seconds > 0:
         time.sleep(wait_seconds)
 
