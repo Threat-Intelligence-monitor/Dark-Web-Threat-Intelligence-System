@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path, PureWindowsPath
@@ -19,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from darkweb_collector.diagnostic_commands import COMMAND_TIMEOUT_SECONDS, run_powershell
 from darkweb_collector.runtime import configured_database_url, default_db_path, output_root, project_root, user_data_root
+from darkweb_collector.storage_paths import update_state_root
 from darkweb_collector.version_check import current_version_payload
 
 
@@ -30,6 +32,7 @@ _checks = {
     "processes": "项目进程",
     "ports": "监听端口",
     "dependencies": "数据库与队列",
+    "update": "在线更新状态与日志",
     "files": "项目文件",
     "logs": "日志查询",
     "command": "命令行查询",
@@ -65,7 +68,7 @@ class DiagnosticBusyError(RuntimeError):
 
 class DiagnosticRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    check: Literal["runtime", "processes", "ports", "dependencies", "files", "logs", "command"]
+    check: Literal["runtime", "processes", "ports", "dependencies", "update", "files", "logs", "command"]
     root: Literal["project", "logs", "output"] = "project"
     path: str = Field(default="", max_length=512)
     keyword: str = Field(default="", max_length=120)
@@ -78,6 +81,8 @@ class DiagnosticRequest(BaseModel):
             raise ValueError("命令文本只能用于命令行查询")
         if self.check == "command" and not self.command.strip():
             raise ValueError("请输入查询命令")
+        if self.check == "update" and self.path:
+            raise ValueError("更新诊断仅读取固定更新状态和日志，不接受文件路径")
         return self
 
 
@@ -342,6 +347,74 @@ def _runtime() -> dict:
     }
 
 
+def _update_diagnostics(request: DiagnosticRequest) -> tuple[dict, bool]:
+    try:
+        expected_root = update_state_root()
+    except ValueError as exc:
+        raise DiagnosticError("更新状态目录无效") from exc
+    configured = os.environ.get("DARKWEB_UPDATE_STATE_DIR", "").strip()
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    root = Path(configured).expanduser() if configured else (Path(local) / "DarkWebThreatIntel" if local else update_state_root())
+    for directory in (root, *root.parents):
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise DiagnosticError("不支持通过符号链接或目录联接读取更新日志")
+    if root.resolve() != expected_root:
+        raise DiagnosticError("更新状态目录无效")
+    root = root.resolve()
+
+    def read_fixed(name: str, maximum: int, tail: bool) -> tuple[str, int, bool]:
+        try:
+            path = _resolve_path(root, name)
+        except FileNotFoundError:
+            return "", 0, False
+        before = path.lstat()
+        with path.open("rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino):
+                raise DiagnosticError("更新诊断文件类型或身份发生变化")
+            if not tail and info.st_size > maximum:
+                raise DiagnosticError("更新状态文件过大")
+            prefix = handle.read(3)
+            encoding = "utf-16" if prefix.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+            offset = max(0, info.st_size - maximum) if tail else 0
+            if offset and encoding == "utf-16":
+                encoding = "utf-16-le" if prefix.startswith(b"\xff\xfe") else "utf-16-be"
+                offset += offset % 2
+            handle.seek(offset)
+            text = handle.read(maximum).decode(encoding, errors="replace")
+        if offset:
+            text = text.split("\n", 1)[1] if "\n" in text else ""
+            end = re.search(r"-----END [^-]*PRIVATE KEY-----", text)
+            begin = re.search(r"-----BEGIN [^-]*PRIVATE KEY-----", text)
+            if end and (begin is None or end.start() < begin.start()):
+                text = "[REDACTED PRIVATE KEY]\n" + text[end.end():]
+            elif begin is None:
+                leading = re.match(r"(?:[A-Za-z0-9+/=]{40,}\r?\n)+", text)
+                if leading:
+                    text = "[REDACTED PRIVATE KEY FRAGMENT]\n" + text[leading.end():]
+        return text, min(info.st_size, maximum), info.st_size > maximum
+
+    status_text, _, _ = read_fixed("update-status.json", 16384, False)
+    try:
+        status = json.loads(status_text) if status_text else {"status": "idle"}
+    except (ValueError, TypeError) as exc:
+        raise DiagnosticError("更新状态文件无效") from exc
+    if not isinstance(status, dict):
+        raise DiagnosticError("更新状态文件无效")
+    fields = {"status", "stage", "last_stage", "message", "error", "pid", "pid_created_at", "started_at", "updated_at", "finished_at", "job_id", "target_version", "before_version", "after_version", "rollback_status"}
+    text, scanned, truncated = read_fixed("update.log", MAX_BYTES, True)
+    lines = redact_text(text).splitlines()
+    if request.keyword:
+        lines = [line for line in lines if request.keyword.casefold() in line.casefold()]
+    selected = lines[-request.limit:]
+    return {"status": {key: value for key, value in status.items() if key in fields},
+            "log": {"path": "update.log", "text": "\n".join(selected), "lines": len(selected), "scanned_bytes": scanned}}, truncated or len(lines) > request.limit
+
+
 def _processes() -> list[dict]:
     related = []
     collector = str(project_root()).casefold().replace("\\", "/")
@@ -437,6 +510,8 @@ def run_check(request: DiagnosticRequest, username: str) -> dict:
             data = _runtime()
         elif request.check == "dependencies":
             data = _dependencies()
+        elif request.check == "update":
+            data, truncated = _update_diagnostics(request)
         else:
             rows = _processes() if request.check == "processes" else _ports()
             if request.keyword:

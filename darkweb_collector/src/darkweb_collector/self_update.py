@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, TextIO
 
+import psutil
+
 from darkweb_collector.version_check import (
     _is_newer_version,
     _open_update_request,
@@ -121,12 +123,16 @@ def _queued_within_start_grace(payload: dict[str, Any]) -> bool:
 
 def read_update_status() -> dict[str, Any]:
     payload = _read_update_status_raw()
-    if payload.get("status") in ACTIVE_STATUSES and not _process_running(payload.get("pid")):
+    if payload.get("status") in ACTIVE_STATUSES and _process_running(payload.get("pid"), payload.get("pid_created_at")) is False:
         if _queued_within_start_grace(payload):
             return payload
+        recorded = _read_update_status_raw()
+        if recorded != payload:
+            return recorded
         payload.update(
             status="failed",
             stage="failed",
+            last_stage=payload.get("last_stage") or payload.get("stage"),
             message="更新进程已中止",
             error="更新进程意外退出",
             updated=False,
@@ -155,32 +161,22 @@ def _write_update_status(payload: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def _process_running(pid: object) -> bool:
+def _process_running(pid: object, created_at: object = None) -> bool | None:
     try:
         process_id = int(pid or 0)
     except (TypeError, ValueError):
         return False
     if process_id <= 0:
         return False
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, process_id)
-        if not handle:
-            return False
-        try:
-            exit_code = wintypes.DWORD()
-            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return False
-            return exit_code.value == 259
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
     try:
-        os.kill(process_id, 0)
-    except OSError:
+        process = psutil.Process(process_id)
+        if created_at is not None and abs(process.create_time() - float(created_at)) >= 1:
+            return False
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
         return False
-    return True
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return None
 
 
 @contextmanager
@@ -251,15 +247,18 @@ def _launcher_command(project_root: Path, action: str) -> list[str]:
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
         if not powershell or not script.exists():
             raise SelfUpdateError("找不到 Windows 服务启动脚本或 PowerShell")
-        return [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), action]
+        return [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-DataRoot", str(data_root()), action]
     raise SelfUpdateError("当前无 Git 更新器暂仅支持 Windows")
 
 
 def _run_logged(command: list[str], project_root: Path, log: TextIO, timeout: int = 1800) -> None:
     log.write(f"\n[{_now_iso()}] $ {' '.join(command)}\n")
     log.flush()
+    started = time.monotonic()
     try:
         environment = os.environ.copy()
+        environment["DARKWEB_UPDATE_CONTROLLER_PID"] = str(os.getpid())
+        environment["DARKWEB_UPDATE_CONTROLLER_CREATE_TIME"] = str(psutil.Process(os.getpid()).create_time())
         if os.name == "nt" and Path(command[0]).name.casefold() == "powershell.exe":
             for name in list(environment):
                 if name.casefold() == "psmodulepath":
@@ -275,10 +274,15 @@ def _run_logged(command: list[str], project_root: Path, log: TextIO, timeout: in
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, psutil.Error) as exc:
+        log.write(f"\n[{_now_iso()}] Command failed: {type(exc).__name__}: {exc}\n")
+        log.flush()
         raise SelfUpdateError(f"更新命令执行失败：{exc}") from exc
+    native_code = f"0x{result.returncode & 0xffffffff:08X}"
+    log.write(f"\n[{_now_iso()}] Command exited: exit_code={result.returncode} native_code={native_code} duration_ms={round((time.monotonic() - started) * 1000)}\n")
+    log.flush()
     if result.returncode != 0:
-        raise SelfUpdateError(f"更新命令退出码为 {result.returncode}，请查看自动更新日志")
+        raise SelfUpdateError(f"更新命令退出码为 {result.returncode} ({native_code})，请查看自动更新日志")
 
 
 def _signature_payload(manifest: dict[str, Any]) -> bytes:
@@ -781,6 +785,7 @@ def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dic
             "release_root": str(new_root),
         }
     except Exception as exc:
+        state["last_stage"] = state.get("stage")
         if stop_attempted:
             state.update(stage="rolling_back", message="更新失败，正在恢复旧版本")
             _write_update_status(state)
@@ -794,6 +799,7 @@ def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dic
                 database_backup=database_backup,
                 log=log,
             )
+            state["rollback_status"] = rollback_status
             preserve_backup = rollback_status.startswith("failed:")
             if isinstance(exc, SelfUpdateError):
                 exc.args = (f"{exc}; 回滚状态：{rollback_status}",)
@@ -818,6 +824,7 @@ def run_self_update(job_id: str, wait_seconds: float = 1.0) -> None:
                 return
             state.update(
                 pid=os.getpid(),
+                pid_created_at=psutil.Process(os.getpid()).create_time(),
                 status="running",
                 stage="checking",
                 message="正在检查更新清单",
@@ -851,6 +858,7 @@ def run_self_update(job_id: str, wait_seconds: float = 1.0) -> None:
             state.update(
                 status="failed",
                 stage="failed",
+                last_stage=state.get("last_stage") or state.get("stage"),
                 message="自动更新失败",
                 error=str(exc),
                 updated=False,
