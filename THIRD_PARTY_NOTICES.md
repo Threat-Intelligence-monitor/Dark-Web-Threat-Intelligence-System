@@ -7,7 +7,7 @@ The Windows launcher downloads Microsoft Garnet from the official
 this repository.
 
 - Project: https://github.com/microsoft/garnet
-- Version: 2.1.4
+- Version: 2.2.1
 - License: MIT
 - Copyright: Microsoft Corporation
 
