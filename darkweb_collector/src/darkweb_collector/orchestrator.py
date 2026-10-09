@@ -65,7 +65,8 @@ def mark_job_enqueued(
     job_type: str,
     queue_name: str,
     target: str,
-) -> None:
+) -> str:
+    enqueued_at = utc_now_iso()
     with get_db_connection() as connection:
         upsert_crawl_job(
             connection,
@@ -75,9 +76,41 @@ def mark_job_enqueued(
             queue_name=queue_name,
             target=target,
             status="enqueued",
-            enqueued_at=utc_now_iso(),
+            enqueued_at=enqueued_at,
         )
         connection.commit()
+    return enqueued_at
+
+
+def mark_seed_dispatch_failed(job_id: str, *, enqueued_at: str | None = None) -> None:
+    statement = """
+        UPDATE crawl_jobs
+        SET status = 'failed', finished_at = ?, duration_ms = 0,
+            error_message = '种子任务提交失败，请检查消息服务或本地运行环境'
+        WHERE job_id = ? AND job_type = 'seed' AND status = 'enqueued'
+            AND started_at IS NULL AND finished_at IS NULL
+    """
+    parameters = [utc_now_iso(), job_id]
+    if enqueued_at is not None:
+        statement += " AND enqueued_at = ?"
+        parameters.append(enqueued_at)
+    with get_db_connection() as connection:
+        connection.execute(statement, parameters)
+        connection.commit()
+
+
+def dispatch_seed_job(config: SiteConfig, publisher: Callable[[str], object]) -> str:
+    job_id = str(uuid.uuid4())
+    enqueued_at = mark_job_enqueued(job_id, config.site_name, "seed", queue_for_seed(config), config.site_name)
+    try:
+        publisher(job_id)
+    except Exception:
+        try:
+            mark_seed_dispatch_failed(job_id, enqueued_at=enqueued_at)
+        except Exception:
+            logger.warning("Could not record failed seed submission for %s", config.site_name)
+        raise
+    return job_id
 
 
 def mark_job_finished(
@@ -389,6 +422,7 @@ def run_site_once(
     config_path: Path | None = None,
     state_store: StateStore | None = None,
     job_id: str | None = None,
+    force: bool = True,
 ) -> dict[str, object]:
     from darkweb_collector.state_store import InMemoryStateStore
 
@@ -412,7 +446,7 @@ def run_site_once(
         result = execute_seed_job(
             site_name=site_name,
             queue_name=seed_queue,
-            force=True,
+            force=force,
             state_store=selected_state_store,
             detail_dispatcher=inline_dispatcher,
             job_id=selected_job_id,
@@ -483,6 +517,7 @@ def enqueue_due_sites(
 
     with get_db_connection() as connection:
         reconcile_stale_crawl_jobs(connection)
+        connection.commit()
         for config in configs:
             if not config.enabled:
                 continue
@@ -515,16 +550,7 @@ def enqueue_due_sites(
             job_id = seed_dispatcher(config)
             if not job_id:
                 continue
-            upsert_crawl_job(
-                connection,
-                job_id=job_id,
-                site_name=config.site_name,
-                job_type="seed",
-                queue_name=queue_name,
-                target=config.site_name,
-                status="enqueued",
-                enqueued_at=utc_now_iso(),
-            )
+            # The dispatcher commits its enqueue row before publishing the task.
             dispatched.append({"site_name": config.site_name, "job_id": job_id, "queue_name": queue_name})
         connection.commit()
     return dispatched

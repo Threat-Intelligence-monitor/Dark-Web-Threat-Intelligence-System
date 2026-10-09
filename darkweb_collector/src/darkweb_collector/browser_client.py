@@ -65,6 +65,7 @@ def _cookie_rows(cookie_header: str | None, url: str) -> list[dict[str, object]]
 class BrowserClient:
     def __init__(self, proxy: BrowserProxyConfig) -> None:
         self._proxy = proxy
+        self._playwright_context = None
         self._playwright = None
         self._browser = None
         self._created_monotonic = 0.0
@@ -75,18 +76,26 @@ class BrowserClient:
 
         if self._proxy.engine not in {"chromium", "firefox"}:
             raise ValueError(f"unsupported browser engine: {self._proxy.engine}")
-        self._playwright = sync_playwright().start()
-        launch_kwargs = {
-            "headless": True,
-        }
-        if self._proxy.engine == "chromium":
-            launch_kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
-        if self._proxy.server:
-            launch_kwargs["proxy"] = {"server": self._proxy.server}
-        browser_type = getattr(self._playwright, self._proxy.engine)
-        self._browser = browser_type.launch(**launch_kwargs)
-        self._created_monotonic = time.monotonic()
-        self._task_count = 0
+        self._playwright_context = sync_playwright()
+        try:
+            self._playwright = self._playwright_context.start()
+            launch_kwargs = {
+                "headless": True,
+            }
+            if self._proxy.engine == "chromium":
+                launch_kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
+            if self._proxy.server:
+                launch_kwargs["proxy"] = {"server": self._proxy.server}
+            browser_type = getattr(self._playwright, self._proxy.engine)
+            self._browser = browser_type.launch(**launch_kwargs)
+            self._created_monotonic = time.monotonic()
+            self._task_count = 0
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def _should_rotate(self) -> bool:
         if self._browser is None:
@@ -338,12 +347,16 @@ class BrowserClient:
             context.close()
 
     def close(self) -> None:
-        if self._browser is not None:
-            self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            self._playwright.stop()
-            self._playwright = None
+        browser, playwright, context = self._browser, self._playwright, self._playwright_context
+        self._browser = self._playwright = self._playwright_context = None
+        try:
+            if browser is not None:
+                browser.close()
+        finally:
+            if playwright is not None:
+                playwright.stop()
+            elif context is not None:
+                context.__exit__()
 
 
 _GLOBAL_CLIENTS: dict[object, tuple[BrowserProxyConfig, BrowserClient]] = {}
