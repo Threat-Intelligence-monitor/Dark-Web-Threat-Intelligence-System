@@ -21,12 +21,11 @@ from darkweb_collector.db import (
     get_ransomware_live_sync_state,
     get_site_connectivity_probe_map,
     upsert_site_connectivity_probe,
-    upsert_crawl_job,
 )
 from darkweb_collector.document_exposure import list_watchlists_payload, scan_watchlist_once
 from darkweb_collector.changan_auto_login import changan_auto_login_available
 from darkweb_collector.job_diagnostics import consecutive_failures, failure_cooldown_until
-from darkweb_collector.orchestrator import new_job_id, run_site_once
+from darkweb_collector.orchestrator import dispatch_seed_job, is_site_due, mark_seed_dispatch_failed, run_site_once
 from darkweb_collector.public_vulnerabilities import sync_public_vulnerability_feed
 from darkweb_collector.queueing import (
     BROWSER_ACTIVE_QUEUES,
@@ -314,33 +313,15 @@ def _mark_stale_active_job(site_name: str, active_job: dict[str, Any] | None) ->
         return
 
     with get_db_connection() as connection:
-        upsert_crawl_job(
-            connection,
-            job_id=str(active_job["job_id"]),
-            site_name=site_name,
-            job_type="seed",
-            queue_name=str(active_job.get("queue_name") or ""),
-            target=str(active_job.get("target") or site_name),
-            status="stale",
-            enqueued_at=active_job.get("enqueued_at"),
-            started_at=active_job.get("started_at"),
-            finished_at=utc_now_iso(),
-            error_message="stale seed task auto-cleared",
-        )
-        connection.commit()
-
-
-def _enqueue_job_row(job_id: str, site_name: str, queue_name: str) -> None:
-    with get_db_connection() as connection:
-        upsert_crawl_job(
-            connection,
-            job_id=job_id,
-            site_name=site_name,
-            job_type="seed",
-            queue_name=queue_name,
-            target=site_name,
-            status="enqueued",
-            enqueued_at=utc_now_iso(),
+        connection.execute(
+            """
+            UPDATE crawl_jobs
+            SET status = 'stale', finished_at = ?, error_message = 'stale seed task auto-cleared'
+            WHERE job_id = ? AND site_name = ? AND job_type = 'seed' AND status = ?
+                AND COALESCE(started_at, '') = ? AND COALESCE(enqueued_at, '') = ?
+            """,
+            (utc_now_iso(), str(active_job["job_id"]), site_name, active_job["status"],
+             active_job.get("started_at") or "", active_job.get("enqueued_at") or ""),
         )
         connection.commit()
 
@@ -411,24 +392,15 @@ def _has_queue_worker(queue_name: str) -> bool:
         return queue_name in _worker_queue_cache
 
 
-def _run_site_in_thread(site_name: str) -> None:
+def _run_site_in_thread(site_name: str, job_id: str, force: bool) -> None:
     try:
-        run_site_once(site_name)
+        run_site_once(site_name, job_id=job_id, force=force)
     except Exception:
-        # run_site_once already records failed jobs in crawl_jobs.
+        try:
+            mark_seed_dispatch_failed(job_id)
+        except Exception:
+            logger.warning("Could not record local seed startup failure for %s", site_name)
         return
-
-
-def _dispatch_browser_process(site_name: str, queue_name: str, message: str) -> dict[str, Any]:
-    job_id = new_job_id("seed", site_name)
-    _enqueue_job_row(job_id=job_id, site_name=site_name, queue_name=queue_name)
-    submit_browser_site(site_name=site_name, job_id=job_id)
-    return {
-        "site_name": site_name,
-        "dispatch_mode": "process",
-        "message": message,
-        "job_id": job_id,
-    }
 
 
 def dispatch_run_site(site_name: str, force: bool = True) -> dict[str, Any]:
@@ -446,6 +418,7 @@ def dispatch_run_site(site_name: str, force: bool = True) -> dict[str, Any]:
         }
     with get_db_connection() as connection:
         active_job = get_active_crawl_job(connection, site_name=site_name, job_type="seed")
+        last_success = get_last_successful_crawl_job(connection, site_name=site_name, job_type="seed")
         queue_has_recent_running = _has_recent_running_job_in_queue(
             connection,
             str((active_job or {}).get("queue_name") or ""),
@@ -482,55 +455,56 @@ def dispatch_run_site(site_name: str, force: bool = True) -> dict[str, Any]:
             "consecutive_failures": consecutive_failures(seed_rows),
             "failure_cooldown_until": cooldown_until.isoformat(),
         }
+    if not force and not is_site_due(config, last_success["finished_at"] if last_success else None):
+        return {
+            "site_name": site_name,
+            "dispatch_mode": "skipped",
+            "message": "尚未到该站点的采集时间",
+            "job_id": "",
+            "reason": "interval_wait",
+        }
 
     _mark_stale_active_job(site_name, active_job)
 
     queue_name = queue_for_seed(config)
     if not _has_queue_worker(queue_name):
         if config.uses_browser:
-            return _dispatch_browser_process(
-                site_name=site_name,
-                queue_name=queue_name,
-                message="未检测到可消费浏览器队列的 worker，已提交到本地浏览器进程池",
+            job_id = dispatch_seed_job(
+                config,
+                lambda selected_id: submit_browser_site(site_name, selected_id, force=force),
             )
-        thread = Thread(target=_run_site_in_thread, args=(site_name,), daemon=True)
-        thread.start()
+            return {
+                "site_name": site_name,
+                "dispatch_mode": "process",
+                "message": "未检测到可消费浏览器队列的 worker，已提交到本地浏览器进程池",
+                "job_id": job_id,
+            }
+        job_id = dispatch_seed_job(
+            config,
+            lambda selected_id: Thread(target=_run_site_in_thread, args=(site_name, selected_id, force), daemon=True).start(),
+        )
         return {
             "site_name": site_name,
             "dispatch_mode": "thread",
             "message": "未检测到可消费该队列的 worker，已在本地线程触发单次运行",
-            "job_id": "",
-        }
-    try:
-        from darkweb_collector.tasks import crawl_seed
-
-        async_result = crawl_seed.apply_async(
-            kwargs={"site_name": site_name, "force": force},
-            queue=queue_name,
-        )
-        job_id = str(async_result.id)
-        _enqueue_job_row(job_id=job_id, site_name=site_name, queue_name=queue_name)
-        return {
-            "site_name": site_name,
-            "dispatch_mode": "queue",
-            "message": "已提交到任务队列",
             "job_id": job_id,
         }
-    except Exception:
-        if config.uses_browser:
-            return _dispatch_browser_process(
-                site_name=site_name,
-                queue_name=queue_name,
-                message="队列不可用，已提交到本地浏览器进程池",
-            )
-        thread = Thread(target=_run_site_in_thread, args=(site_name,), daemon=True)
-        thread.start()
-        return {
-            "site_name": site_name,
-            "dispatch_mode": "thread",
-            "message": "队列不可用，已在本地线程触发单次运行",
-            "job_id": "",
-        }
+    from darkweb_collector.tasks import crawl_seed
+
+    job_id = dispatch_seed_job(
+        config,
+        lambda selected_id: crawl_seed.apply_async(
+            kwargs={"site_name": site_name, "force": force},
+            queue=queue_name,
+            task_id=selected_id,
+        ),
+    )
+    return {
+        "site_name": site_name,
+        "dispatch_mode": "queue",
+        "message": "已提交到任务队列",
+        "job_id": job_id,
+    }
 
 
 def dispatch_run_all_enabled_sites(force: bool = True) -> dict[str, Any]:
@@ -553,7 +527,18 @@ def _continuous_loop(stop_event: Event) -> None:
     global _continuous_last_tick_at, _continuous_enabled
     while not stop_event.is_set():
         _continuous_last_tick_at = utc_now_iso()
-        dispatch_run_all_enabled_sites(force=False)
+        try:
+            configs = load_site_configs()
+        except Exception:
+            logger.warning("Could not load continuous crawl schedule; retrying next tick")
+            configs = []
+        for config in configs:
+            if not config.enabled:
+                continue
+            try:
+                dispatch_run_site(config.site_name, force=False)
+            except Exception:
+                logger.warning("Continuous seed dispatch failed for %s; retrying next tick", config.site_name)
         if stop_event.wait(CONTINUOUS_INTERVAL_SECONDS):
             break
     _continuous_enabled = False

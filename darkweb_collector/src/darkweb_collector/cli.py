@@ -15,7 +15,7 @@ from darkweb_collector.bot_assistant import (
 )
 from darkweb_collector.config import get_site_config, load_site_configs
 from darkweb_collector.api_data import build_intelligence_payload
-from darkweb_collector.orchestrator import enqueue_due_sites, run_site_once, show_runs
+from darkweb_collector.orchestrator import dispatch_seed_job, enqueue_due_sites, run_site_once, show_runs
 from darkweb_collector.public_vulnerabilities import sync_public_vulnerability_feed
 from darkweb_collector.queueing import build_worker_command, queue_for_seed
 from darkweb_collector.ransomware_live import sync_ransomware_live_victims
@@ -116,11 +116,14 @@ def _enqueue_due() -> int:
 
     def seed_dispatcher(config) -> str | None:
         queue_name = queue_for_seed(config)
-        async_result = crawl_seed.apply_async(
-            kwargs={"site_name": config.site_name, "force": False},
-            queue=queue_name,
+        return dispatch_seed_job(
+            config,
+            lambda job_id: crawl_seed.apply_async(
+                kwargs={"site_name": config.site_name, "force": False},
+                queue=queue_name,
+                task_id=job_id,
+            ),
         )
-        return str(async_result.id)
 
     dispatched = enqueue_due_sites(seed_dispatcher=seed_dispatcher, state_store=get_state_store(prefer_redis=True))
     ransomware_job_id = enqueue_ransomware_live_sync()

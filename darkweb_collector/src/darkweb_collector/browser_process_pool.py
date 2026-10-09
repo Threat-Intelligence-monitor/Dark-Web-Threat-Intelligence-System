@@ -14,11 +14,11 @@ _POOL_SIZE = 0
 _FUTURES: dict[str, Future] = {}
 
 
-def _run_browser_site_once(site_name: str, job_id: str) -> dict[str, object]:
+def _run_browser_site_once(site_name: str, job_id: str, force: bool = True) -> dict[str, object]:
     try:
         from darkweb_collector.orchestrator import run_site_once
 
-        return run_site_once(site_name=site_name, job_id=job_id)
+        return run_site_once(site_name=site_name, job_id=job_id, force=force)
     finally:
         try:
             from darkweb_collector.browser_client import close_browser_client
@@ -38,9 +38,13 @@ def _future_done(job_id: str, future: Future) -> None:
     try:
         future.result()
     except Exception:
-        # run_site_once records task failure in crawl_jobs. The callback only
-        # consumes the exception so the executor does not retain traceback state.
-        pass
+        # Startup failures can occur before run_site_once records any result.
+        try:
+            from darkweb_collector.orchestrator import mark_seed_dispatch_failed
+
+            mark_seed_dispatch_failed(job_id)
+        except Exception:
+            pass
     with _POOL_LOCK:
         _FUTURES.pop(job_id, None)
 
@@ -56,11 +60,11 @@ def _get_pool_locked() -> ProcessPoolExecutor:
     return _POOL
 
 
-def submit_browser_site(site_name: str, job_id: str) -> None:
+def submit_browser_site(site_name: str, job_id: str, *, force: bool = True) -> None:
     with _POOL_LOCK:
         _prune_locked()
         pool = _get_pool_locked()
-        future = pool.submit(_run_browser_site_once, site_name, job_id)
+        future = pool.submit(_run_browser_site_once, site_name, job_id, force)
         _FUTURES[job_id] = future
     future.add_done_callback(lambda completed: _future_done(job_id, completed))
 
