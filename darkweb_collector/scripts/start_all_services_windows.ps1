@@ -1729,12 +1729,12 @@ function Get-ManagedGarnetProcesses {
 }
 
 function Stop-ManagedGarnetProcesses {
+    $processRows = @(Get-ProcessRows)
+    $processRowMap = New-ProcessRowMap -ProcessRows $processRows
     foreach ($process in @(Get-ManagedGarnetProcesses)) {
-        if ($process.Id -eq $PID) {
-            continue
+        if ($processRowMap.ContainsKey($process.Id)) {
+            Stop-ProcessTree -ProcessId $process.Id -ProcessRows $processRows -ProcessRowMap $processRowMap -Label "managed Garnet"
         }
-        Write-Info "Stopping managed Garnet child pid $($process.Id)"
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1749,8 +1749,7 @@ function Stop-ManagedProjectPythonProcesses {
     })) {
         if ($processRowMap.ContainsKey($process.Id) -and
             (Test-ProjectManagedProcess -ProcessRow $processRowMap[$process.Id] -ProcessRowMap $processRowMap)) {
-            Write-Info "Stopping project Python child pid $($process.Id)"
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Stop-ProcessTree -ProcessId $process.Id -ProcessRows $processRows -ProcessRowMap $processRowMap -Label "project Python"
         }
     }
 }
@@ -1780,8 +1779,7 @@ function Stop-ManagedDashboardProcesses {
     })) {
         if ($processRowMap.ContainsKey($process.Id) -and
             (Test-ProjectManagedProcess -ProcessRow $processRowMap[$process.Id] -ProcessRowMap $processRowMap)) {
-            Write-Info "Stopping dashboard child pid $($process.Id)"
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Stop-ProcessTree -ProcessId $process.Id -ProcessRows $processRows -ProcessRowMap $processRowMap -Label "dashboard"
         }
     }
 }
@@ -1791,7 +1789,7 @@ function Get-ProcessRows {
         return @(Get-CimInstance Win32_Process -ErrorAction Stop)
     }
     catch {
-        return @(Get-WmiObject Win32_Process -ErrorAction SilentlyContinue)
+        return @(Get-WmiObject Win32_Process -ErrorAction Stop)
     }
 }
 
@@ -1850,22 +1848,103 @@ function Test-ServiceRecordOwnsProcess {
     return (Test-ProjectManagedProcess -ProcessRow $ProcessRowMap[$processId] -ProcessRowMap $ProcessRowMap)
 }
 
-function Invoke-TaskKill {
-    param(
-        [int]$ProcessId,
-        [switch]$Tree
-    )
-    $arguments = @("/PID", "$ProcessId", "/F")
-    if ($Tree) {
-        $arguments += "/T"
+function Get-ProcessRowCreatedAt {
+    param([object]$ProcessRow)
+    if ($null -eq $ProcessRow -or -not $ProcessRow.CreationDate) {
+        throw "Cannot verify process creation time."
     }
-    $oldErrorActionPreference = $ErrorActionPreference
     try {
-        $ErrorActionPreference = "Continue"
-        & taskkill.exe @arguments 2>$null | Out-Null
+        if ($ProcessRow.CreationDate -is [DateTime]) {
+            return $ProcessRow.CreationDate.ToUniversalTime()
+        }
+        return [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$ProcessRow.CreationDate).ToUniversalTime()
     }
-    finally {
-        $ErrorActionPreference = $oldErrorActionPreference
+    catch {
+        throw "Cannot verify process creation time for pid $($ProcessRow.ProcessId)."
+    }
+}
+
+function Get-ProtectedUpdateProcessIds {
+    param([object[]]$ProcessRows, [hashtable]$ProcessRowMap)
+    $protected = New-Object "System.Collections.Generic.HashSet[int]"
+    $null = $protected.Add($PID)
+    foreach ($row in $ProcessRows) {
+        if ($row.CommandLine -like "*run_self_update.py*") {
+            $null = $protected.Add([int]$row.ProcessId)
+        }
+    }
+    if ($env:DARKWEB_UPDATE_CONTROLLER_PID -or $env:DARKWEB_UPDATE_CONTROLLER_CREATE_TIME) {
+        $controllerId = 0
+        $controllerBirth = 0.0
+        if (-not [int]::TryParse($env:DARKWEB_UPDATE_CONTROLLER_PID, [ref]$controllerId) -or
+            -not [double]::TryParse($env:DARKWEB_UPDATE_CONTROLLER_CREATE_TIME, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$controllerBirth)) {
+            throw "Invalid update controller identity."
+        }
+        if ($ProcessRowMap.ContainsKey($controllerId)) {
+            $epoch = [DateTime]::SpecifyKind([DateTime]'1970-01-01', [DateTimeKind]::Utc)
+            $created = Get-ProcessRowCreatedAt -ProcessRow $ProcessRowMap[$controllerId]
+            if ([Math]::Abs(($created - $epoch).TotalSeconds - $controllerBirth) -le 0.001) {
+                $null = $protected.Add($controllerId)
+            }
+        }
+    }
+    # A venv redirector owns its real Python child; preserve both, not worker descendants.
+    foreach ($controllerId in @($protected)) {
+        if ($controllerId -eq $PID -or -not $ProcessRowMap.ContainsKey($controllerId)) { continue }
+        $row = $ProcessRowMap[$controllerId]
+        $parentId = [int]$row.ParentProcessId
+        if ($ProcessRowMap.ContainsKey($parentId)) {
+            $parent = $ProcessRowMap[$parentId]
+            if ($parent.ExecutablePath -match '\\venv\\Scripts\\pythonw?\.exe$' -and
+                (Get-ProcessRowCreatedAt $parent) -le (Get-ProcessRowCreatedAt $row)) {
+                $null = $protected.Add($parentId)
+            }
+        }
+        if ($row.ExecutablePath -match '\\venv\\Scripts\\pythonw?\.exe$') {
+            foreach ($child in $ProcessRows) {
+                if ([int]$child.ParentProcessId -eq $controllerId -and $child.ExecutablePath -match '\\pythonw?\.exe$' -and
+                    (Get-ProcessRowCreatedAt $child) -ge (Get-ProcessRowCreatedAt $row)) {
+                    $null = $protected.Add([int]$child.ProcessId)
+                }
+            }
+        }
+    }
+    # Keep the calling stop/forwarding chain, stopping before the managed API ancestor.
+    $seen = New-Object "System.Collections.Generic.HashSet[int]"
+    $caller = if ($ProcessRowMap.ContainsKey($PID)) { $ProcessRowMap[$PID] } else { $null }
+    $parentId = if ($caller) { [int]$caller.ParentProcessId } else { 0 }
+    while ($parentId -gt 0 -and $seen.Add($parentId) -and $ProcessRowMap.ContainsKey($parentId)) {
+        $parent = $ProcessRowMap[$parentId]
+        if ((Get-ProcessRowCreatedAt $parent) -gt (Get-ProcessRowCreatedAt $caller)) { break }
+        if ((Test-ProjectManagedCommandLine $parent.CommandLine) -and -not $protected.Contains($parentId)) { break }
+        $null = $protected.Add($parentId)
+        $caller = $parent
+        $parentId = [int]$parent.ParentProcessId
+    }
+    return ,$protected
+}
+
+function Get-CurrentProcessForRow {
+    param([object]$ProcessRow)
+    $created = Get-ProcessRowCreatedAt -ProcessRow $ProcessRow
+    try {
+        $process = Get-Process -Id ([int]$ProcessRow.ProcessId) -ErrorAction Stop
+    }
+    catch {
+        if ($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound) { return $null }
+        throw "Cannot inspect process pid $($ProcessRow.ProcessId)."
+    }
+    try {
+        $null = $process.Handle
+        if ($process.HasExited -or [Math]::Abs(($process.StartTime.ToUniversalTime() - $created).TotalMilliseconds) -gt 1) {
+            $process.Dispose()
+            return $null
+        }
+        return $process
+    }
+    catch {
+        $process.Dispose()
+        throw "Cannot verify process identity for pid $($ProcessRow.ProcessId)."
     }
 }
 
@@ -1874,7 +1953,8 @@ function Stop-ProcessTree {
         [int]$ProcessId,
         [object[]]$ProcessRows = $null,
         [hashtable]$ProcessRowMap = $null,
-        [string]$Label = "process"
+        [string]$Label = "process",
+        [System.Collections.Generic.HashSet[int]]$ProtectedProcessIds = $null
     )
     if (-not $ProcessId -or $ProcessId -eq $PID) {
         return
@@ -1885,24 +1965,33 @@ function Stop-ProcessTree {
     if ($null -eq $ProcessRowMap) {
         $ProcessRowMap = New-ProcessRowMap -ProcessRows $ProcessRows
     }
-
-    $children = @($ProcessRows | Where-Object { [int]$_.ParentProcessId -eq $ProcessId })
+    if ($null -eq $ProtectedProcessIds) {
+        $ProtectedProcessIds = Get-ProtectedUpdateProcessIds -ProcessRows $ProcessRows -ProcessRowMap $ProcessRowMap
+    }
+    if ($ProtectedProcessIds.Contains($ProcessId)) {
+        Write-Info "Preserving active update controller pid $ProcessId"
+        return
+    }
+    if (-not $ProcessRowMap.ContainsKey($ProcessId)) { return }
+    $row = $ProcessRowMap[$ProcessId]
+    $created = Get-ProcessRowCreatedAt -ProcessRow $row
+    $children = @($ProcessRows | Where-Object {
+        [int]$_.ParentProcessId -eq $ProcessId -and (Get-ProcessRowCreatedAt $_) -ge $created
+    })
     foreach ($child in $children) {
-        if ($child.CommandLine -like "*run_self_update.py*") {
-            Write-Info "Preserving active update controller pid $($child.ProcessId)"
-            continue
-        }
-        Stop-ProcessTree -ProcessId ([int]$child.ProcessId) -ProcessRows $ProcessRows -ProcessRowMap $ProcessRowMap -Label "child process"
+        Stop-ProcessTree -ProcessId ([int]$child.ProcessId) -ProcessRows $ProcessRows -ProcessRowMap $ProcessRowMap -Label "child process" -ProtectedProcessIds $ProtectedProcessIds
     }
-
-    if (Test-ProcessRunning -ProcessId $ProcessId) {
+    $process = Get-CurrentProcessForRow -ProcessRow $row
+    if ($null -eq $process) { return }
+    try {
         Write-Info "Stopping $Label pid $ProcessId"
-        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 150
-        if (Test-ProcessRunning -ProcessId $ProcessId) {
-            Invoke-TaskKill -ProcessId $ProcessId -Tree
+        try { $process.Kill() }
+        catch { if (-not $process.HasExited) { throw } }
+        if (-not $process.WaitForExit(1000)) {
+            throw "Process pid $ProcessId did not exit after targeted stop."
         }
     }
+    finally { $process.Dispose() }
 }
 
 function Test-ProjectManagedCommandLine {
@@ -1944,7 +2033,11 @@ function Test-ProjectManagedProcess {
     if ($null -eq $ProcessRow) {
         return $false
     }
-    if ($ProcessRow.CommandLine -like "*run_self_update.py*") {
+    if ($null -eq $ProcessRowMap) {
+        $ProcessRowMap = New-ProcessRowMap -ProcessRows @($ProcessRow)
+    }
+    $protected = Get-ProtectedUpdateProcessIds -ProcessRows @($ProcessRowMap.Values) -ProcessRowMap $ProcessRowMap
+    if ($protected.Contains([int]$ProcessRow.ProcessId)) {
         return $false
     }
     if (Test-ProjectManagedCommandLine -CommandLine $ProcessRow.CommandLine) {
@@ -1952,6 +2045,7 @@ function Test-ProjectManagedProcess {
     }
 
     $seen = New-Object "System.Collections.Generic.HashSet[int]"
+    $child = $ProcessRow
     $parentId = [int]$ProcessRow.ParentProcessId
     while ($parentId -gt 0 -and $seen.Add($parentId)) {
         if ($null -eq $ProcessRowMap -or -not $ProcessRowMap.ContainsKey($parentId)) {
@@ -1961,9 +2055,13 @@ function Test-ProjectManagedProcess {
         if ($null -eq $parent) {
             break
         }
+        if ((Get-ProcessRowCreatedAt $parent) -gt (Get-ProcessRowCreatedAt $child)) {
+            break
+        }
         if (Test-ProjectManagedCommandLine -CommandLine $parent.CommandLine) {
             return $true
         }
+        $child = $parent
         $parentId = [int]$parent.ParentProcessId
     }
 
@@ -1976,11 +2074,13 @@ function Get-ProjectManagedProcessRows {
         [hashtable]$ProcessRowMap
     )
     $candidateIds = New-Object "System.Collections.Generic.HashSet[int]"
+    $protected = Get-ProtectedUpdateProcessIds -ProcessRows $ProcessRows -ProcessRowMap $ProcessRowMap
     foreach ($row in $ProcessRows) {
-        if ($row -and (Test-ProjectManagedCommandLine -CommandLine $row.CommandLine)) {
+        if ($row -and -not $protected.Contains([int]$row.ProcessId) -and (Test-ProjectManagedCommandLine -CommandLine $row.CommandLine)) {
             $null = $candidateIds.Add([int]$row.ProcessId)
             $parentId = [int]$row.ParentProcessId
-            if ($parentId -gt 0) {
+            if ($parentId -gt 0 -and $ProcessRowMap.ContainsKey($parentId) -and -not $protected.Contains($parentId) -and
+                (Get-ProcessRowCreatedAt $ProcessRowMap[$parentId]) -le (Get-ProcessRowCreatedAt $row)) {
                 $null = $candidateIds.Add($parentId)
             }
         }
@@ -2024,6 +2124,7 @@ function New-ServiceCommand {
     $postgresqlDataDirectory = Get-PostgreSqlDataDirectory
     return @"
 `$ErrorActionPreference = 'Continue'
+Remove-Item Env:DARKWEB_UPDATE_CONTROLLER_PID, Env:DARKWEB_UPDATE_CONTROLLER_CREATE_TIME -ErrorAction SilentlyContinue
 Set-Location -LiteralPath $quotedWorkDir
 `$env:Path = $(Quote-PS $env:Path)
 `$env:REDIS_URL = $(Quote-PS $RedisUrl)
