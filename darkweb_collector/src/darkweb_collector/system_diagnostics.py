@@ -98,7 +98,8 @@ def redact_text(text: str) -> str:
     text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|\Z)", "[REDACTED PRIVATE KEY]", text)
     text = re.sub(r"(?im)([\"']?(?:authorization|cookie|set-cookie)[\"']?\s*[:=]\s*)[^\r\n]+", r"\1[REDACTED]", text)
     text = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9+/=._-]+", r"\1 [REDACTED]", text)
-    text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"(?i)([?&](?:sig|signature|x-amz-signature|x-goog-signature)=)[^&#\s]+", r"\1[REDACTED]", text)
     text = _assignment.sub(r"\1[REDACTED]", text)
     for key, value in os.environ.items():
         if _secret_name.search(key) and len(value) >= 4:
