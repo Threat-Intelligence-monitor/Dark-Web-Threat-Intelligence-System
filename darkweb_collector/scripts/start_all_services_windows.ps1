@@ -241,10 +241,10 @@ $DefaultTorBridgeRuntimeDir = Join-Path $DefaultUserDataDir "tor_bridge_runtime"
 $DefaultTorBridgeAutoRuntimeDir = Join-Path $DefaultUserDataDir "tor_bridge_runtime_auto"
 $DefaultNpmCacheDir = Join-Path $DefaultUserDataDir "npm-cache"
 $DefaultRuntimeRoot = Join-Path $DefaultUserDataDir "runtimes"
-$GarnetVersion = "2.1.4"
-$GarnetArchiveUrl = "https://github.com/microsoft/garnet/releases/download/v2.1.4/win-x64-based-readytorun.zip"
-$GarnetArchiveSha256 = "2c429b145638224823cd55bf900dc932dcddebda690728665051dcc17901c412"
-$GarnetServerSha256 = "794d03476f1d9da43c7997987fa2d1fb1296e7dd9e1008449c47edd2d4e6b5a9"
+$GarnetVersion = "2.2.1"
+$GarnetArchiveUrl = "https://github.com/microsoft/garnet/releases/download/v2.2.1/win-x64-based-readytorun.zip"
+$GarnetArchiveSha256 = "93f0026d305585cd249a91dda6fd44c46bcaa56304115b039f74f23fe630c64a"
+$GarnetServerSha256 = "4aae95813ff41810d866708d617fd7c2efe8ff631d5c8a25fe743fa08e0f1bac"
 $GarnetRuntimeRoot = Join-Path $DefaultRuntimeRoot "garnet\$GarnetVersion"
 $GarnetServerExecutable = Join-Path $GarnetRuntimeRoot "net10.0\GarnetServer.exe"
 $GarnetDotnetVersion = "10.0.11"
@@ -2120,6 +2120,7 @@ function Start-ManagedGarnetProcess {
         "--aof-commit-wait",
         "--checkpointdir", ('"{0}"' -f [string]$Runtime.CheckpointDir),
         "--recover",
+        "--fail-on-recovery-error",
         "--lua",
         "--logger-level", "Information"
     )
