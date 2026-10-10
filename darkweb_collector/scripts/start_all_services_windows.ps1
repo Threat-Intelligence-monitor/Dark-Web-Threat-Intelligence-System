@@ -165,6 +165,10 @@ $env:PLAYWRIGHT_BROWSERS_PATH = $PlaywrightBrowsersRoot
 $VenvDir = Join-Path $CollectorRoot "venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $RuntimeDir = Join-Path $CollectorRoot ".runtime\windows"
+$PythonEnvironmentState = Join-Path $RuntimeDir "python-environment.json"
+$PythonEnvironmentsRoot = Join-Path $DefaultUserDataDir "runtimes\python-envs"
+$DependencyHelper = Join-Path $ScriptDir "runtime_dependencies.py"
+$NewCollectorEnvironment = $false
 $DashboardNodeModulesDir = Join-Path $DashboardRoot "node_modules"
 $DashboardDistDir = Join-Path $DashboardRoot "dist"
 $LogDir = Join-Path $RuntimeDir "logs"
@@ -268,8 +272,6 @@ $ProjectCollectorDbPath = Join-Path $CollectorRoot "data\collector.db"
 $AuthPasswordFile = Resolve-MigratedDataPath $env:DARKWEB_AUTH_PASSWORD_FILE (Join-Path $DefaultUserDataDir "auth-password.txt")
 $NodeExePath = ""
 $NodeBinDir = ""
-$RequirementsStamp = Join-Path $VenvDir ".requirements.sha256"
-$PlaywrightStamp = Join-Path $VenvDir ".playwright.browsers.ready"
 $PackageLockStamp = Join-Path $DashboardRoot "node_modules\.package-lock.sha256"
 $RedisUrl = if ($env:REDIS_URL) { $env:REDIS_URL } else { $ManagedGarnetRedisUrl }
 $CollectorDbPath = Resolve-MigratedDataPath $env:DARKWEB_COLLECTOR_DB_PATH (Join-Path $DefaultUserDataDir "collector.db")
@@ -1895,12 +1897,12 @@ function Get-ProtectedUpdateProcessIds {
         $parentId = [int]$row.ParentProcessId
         if ($ProcessRowMap.ContainsKey($parentId)) {
             $parent = $ProcessRowMap[$parentId]
-            if ($parent.ExecutablePath -match '\\venv\\Scripts\\pythonw?\.exe$' -and
+            if ($parent.ExecutablePath -match '\\Scripts\\pythonw?\.exe$' -and
                 (Get-ProcessRowCreatedAt $parent) -le (Get-ProcessRowCreatedAt $row)) {
                 $null = $protected.Add($parentId)
             }
         }
-        if ($row.ExecutablePath -match '\\venv\\Scripts\\pythonw?\.exe$') {
+        if ($row.ExecutablePath -match '\\Scripts\\pythonw?\.exe$') {
             foreach ($child in $ProcessRows) {
                 if ([int]$child.ParentProcessId -eq $controllerId -and $child.ExecutablePath -match '\\pythonw?\.exe$' -and
                     (Get-ProcessRowCreatedAt $child) -ge (Get-ProcessRowCreatedAt $row)) {
@@ -2196,6 +2198,95 @@ function Start-ManagedProcess {
     }
 }
 
+function Get-GarnetLimitedCpuMask {
+    param([long]$OriginalMask)
+    $bits = @()
+    for ($index = 0; $index -lt 64; $index++) {
+        $bit = [long]1 -shl $index
+        if (($OriginalMask -band $bit) -ne 0) { $bits += $bit }
+    }
+    if ($bits.Count -eq 0) { throw "Garnet has no processors available in its affinity mask." }
+    $count = [int][Math]::Max(1, [Math]::Floor($bits.Count / 2.0))
+    $mask = [long]0
+    foreach ($bit in @($bits | Select-Object -Last $count)) { $mask = $mask -bor $bit }
+    return [pscustomobject]@{ Mask = $mask; OriginalCount = $bits.Count; SelectedCount = $count }
+}
+
+function Set-ManagedGarnetCpuLimit {
+    param([Diagnostics.Process]$Process, [string]$ExpectedExecutable)
+    if ([IntPtr]::Size -ne 8) { throw "Garnet CPU scheduling requires 64-bit PowerShell." }
+    if (-not ("DarkwebGarnetCpuTopology" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class DarkwebGarnetCpuTopology {
+    [DllImport("kernel32.dll")] public static extern ushort GetActiveProcessorGroupCount();
+}
+'@
+    }
+    $processorGroups = [DarkwebGarnetCpuTopology]::GetActiveProcessorGroupCount()
+    if ($processorGroups -eq 0) { throw "Could not determine active processor groups for Garnet CPU scheduling." }
+    if ($processorGroups -ne 1) {
+        throw "Garnet CPU scheduling supports one active processor group with 1-64 logical processors. Multiple processor groups require an explicit group-aware policy."
+    }
+    $null = $Process.Handle
+    $identityWait = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $Process.Refresh()
+        if ($Process.HasExited) { throw "Garnet exited before CPU scheduling could be applied." }
+        $processPath = [string]$Process.Path
+        if ($processPath) { break }
+        if ($identityWait.ElapsedMilliseconds -ge 1000) { throw "Could not verify the newly started Garnet executable." }
+        Start-Sleep -Milliseconds 10
+    } while ($true)
+    if (-not $processPath.Equals($ExpectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The process is not the running project-owned Garnet executable."
+    }
+    $startTicks = $Process.StartTime.ToUniversalTime().Ticks.ToString()
+    $previousMask = $Process.ProcessorAffinity.ToInt64()
+    $previousPriority = $Process.PriorityClass
+    $stateRoot = Join-Path $DefaultUserDataDir "diagnostics\garnet-cpu"
+    $statePath = Join-Path $stateRoot "garnet-$($Process.Id)-$startTicks.json"
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ([int]$state.process_id -ne $Process.Id -or [string]$state.start_ticks -ne $startTicks -or
+            -not ([string]$state.executable_path).Equals($ExpectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Saved CPU settings do not belong to this Garnet process."
+        }
+    }
+    else {
+        $state = [pscustomobject]@{
+            process_id = $Process.Id; start_ticks = $startTicks; executable_path = $ExpectedExecutable
+            original_affinity = $previousMask.ToString(); original_priority = [string]$previousPriority
+        }
+        Ensure-Directory $stateRoot
+        $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8 -ErrorAction Stop
+    }
+    # Reuse the original mask for this process, including settings saved by control-garnet-cpu.ps1.
+    $limit = Get-GarnetLimitedCpuMask ([long]$state.original_affinity)
+    try {
+        $Process.ProcessorAffinity = [IntPtr]$limit.Mask
+        $Process.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal
+        $Process.Refresh()
+        if ($Process.HasExited -or $Process.StartTime.ToUniversalTime().Ticks.ToString() -ne $startTicks -or
+            $Process.ProcessorAffinity.ToInt64() -ne $limit.Mask -or
+            $Process.PriorityClass -ne [Diagnostics.ProcessPriorityClass]::BelowNormal) {
+            throw "Windows did not apply the requested Garnet CPU settings."
+        }
+    }
+    catch {
+        try {
+            if (-not $Process.HasExited -and $Process.StartTime.ToUniversalTime().Ticks.ToString() -eq $startTicks) {
+                $Process.ProcessorAffinity = [IntPtr]$previousMask
+                $Process.PriorityClass = $previousPriority
+            }
+        }
+        catch { Write-Warn "Could not restore Garnet scheduling after a failed CPU limit operation." }
+        throw
+    }
+    Write-Info "Garnet CPU scheduling: $($limit.OriginalCount) -> $($limit.SelectedCount) allowed logical processors; priority BelowNormal."
+    if ($limit.OriginalCount -eq 1) { Write-Warn "Only one logical processor is available; affinity cannot reduce CPU capacity further." }
+}
+
 function Start-ManagedGarnetProcess {
     param(
         [object]$Runtime,
@@ -2229,6 +2320,7 @@ function Start-ManagedGarnetProcess {
     $previousDotnetRoot = [Environment]::GetEnvironmentVariable("DOTNET_ROOT", "Process")
     $previousDotnetRootX64 = [Environment]::GetEnvironmentVariable("DOTNET_ROOT_X64", "Process")
     $previousPath = $env:Path
+    $process = $null
     try {
         Set-Item -Path "Env:DOTNET_ROOT" -Value $GarnetDotnetRoot
         Set-Item -Path "Env:DOTNET_ROOT_X64" -Value $GarnetDotnetRoot
@@ -2241,6 +2333,14 @@ function Start-ManagedGarnetProcess {
             -RedirectStandardError $errorLogPath `
             -WindowStyle Hidden `
             -PassThru
+        Set-ManagedGarnetCpuLimit -Process $process -ExpectedExecutable $Runtime.ServerExecutable
+    }
+    catch {
+        if ($process -and -not $process.HasExited) {
+            $process.Kill()
+            if (-not $process.WaitForExit(5000)) { throw "Garnet CPU scheduling failed and its new process did not stop." }
+        }
+        throw
     }
     finally {
         $env:Path = $previousPath
@@ -2483,11 +2583,12 @@ if "%~1"=="" (
 }
 
 function Test-CollectorVenv {
-    if (-not (Test-Path -LiteralPath $VenvPython)) {
+    param([string]$Python = $VenvPython)
+    if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
         return $false
     }
     try {
-        & $VenvPython -c "import sys, pathlib, pip; raise SystemExit(0 if pathlib.Path(sys.executable).exists() and pathlib.Path(sys.prefix).exists() else 1)" *> $null
+        & $Python -B -c "import sys, pathlib, pip; raise SystemExit(0 if sys.prefix != sys.base_prefix and pathlib.Path(sys.executable).exists() and pathlib.Path(sys.prefix).exists() else 1)" *> $null
         return ($LASTEXITCODE -eq 0)
     }
     catch {
@@ -2495,24 +2596,149 @@ function Test-CollectorVenv {
     }
 }
 
-function Ensure-CollectorVenv {
-    $python = Ensure-PythonRuntime
-    if ((Test-Path -LiteralPath $VenvDir) -and -not (Test-CollectorVenv)) {
-        Write-Warn "Existing collector virtual environment is not usable on this machine; rebuilding it"
-        Remove-GeneratedDirectory -Path $VenvDir -AllowedRoot $CollectorRoot
+function Set-CollectorEnvironment {
+    param([string]$Root)
+    $script:VenvDir = $Root
+    $script:VenvPython = Join-Path $Root "Scripts\python.exe"
+}
+
+function Test-LocalDependencyPath {
+    param([string]$Path)
+    if (-not $Path -or $Path -notmatch '^[A-Za-z]:\\') { return $false }
+    foreach ($part in $Path.Substring(3).TrimEnd('\').Split('\')) {
+        if ($part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ') -or $part.Contains(':')) { return $false }
     }
-    if (-not (Test-CollectorVenv)) {
-        Write-Info "Creating Python virtual environment"
-        & $python -m venv $VenvDir
-        if ($LASTEXITCODE -ne 0) {
-            Stop-WithError "Failed to create Python virtual environment."
+    $cursor = [IO.Path]::GetFullPath($Path)
+    while ($cursor) {
+        if ((Test-Path -LiteralPath $cursor) -and ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    return $true
+}
+
+function Test-PythonEnvironmentPath {
+    param([string]$Root)
+    return (Test-LocalDependencyPath $Root) -and ((Test-SamePath $Root (Join-Path $CollectorRoot "venv")) -or
+        (Test-PathUnderRoot $Root $PythonEnvironmentsRoot) -or
+        ((Test-PathUnderRoot $Root $AppRoot) -and $Root.EndsWith('\darkweb_collector\venv', [StringComparison]::OrdinalIgnoreCase)))
+}
+
+function Read-PythonEnvironmentProfile {
+    param([string]$Path)
+    try {
+        if (-not (Test-LocalDependencyPath $Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+        $profile = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($profile.format -ne 1 -or -not (Test-PythonEnvironmentPath ([string]$profile.root))) { return $null }
+        foreach ($name in @("identity", "requirements", "packages", "key")) {
+            if ([string]$profile.$name -notmatch '^[a-f0-9]{64}$') { return $null }
         }
+        return $profile
+    }
+    catch { return $null }
+}
+
+function Get-PythonDependencyProfile {
+    param([string]$Python, [string]$Requirements = (Join-Path $CollectorRoot "requirements.txt"))
+    try {
+        $output = & $Python -B $DependencyHelper python-profile --requirements $Requirements 2>$null
+        if ($LASTEXITCODE -eq 0) { return ($output | ConvertFrom-Json) }
+    }
+    catch { }
+    return $null
+}
+
+function Save-PythonEnvironmentProfile {
+    $profile = Get-PythonDependencyProfile $VenvPython
+    if (-not $profile) { Stop-WithError "Cannot verify the prepared Python environment." }
+    $record = [ordered]@{ format = 1; root = $VenvDir; identity = $profile.identity; requirements = $profile.requirements; packages = $profile.packages; key = $profile.key }
+    $paths = @($PythonEnvironmentState, (Join-Path $PythonEnvironmentsRoot ($profile.key + ".json")))
+    foreach ($path in $paths) {
+        if (-not (Test-LocalDependencyPath $path)) { Stop-WithError "Linked or unsafe Python dependency metadata directory." }
+    }
+    foreach ($path in $paths) {
+        Ensure-Directory (Split-Path -Parent $path)
+        $temporary = "$path.$PID.tmp"
+        $record | ConvertTo-Json | Set-Content -LiteralPath $temporary -Encoding UTF8
+        Move-Item -LiteralPath $temporary -Destination $path -Force
     }
 }
 
+function Ensure-CollectorVenv {
+    if (-not (Test-LocalDependencyPath $PythonEnvironmentsRoot) -or -not (Test-LocalDependencyPath $PythonEnvironmentState)) {
+        Stop-WithError "Linked or unsafe Python dependency cache directory."
+    }
+    $python = Ensure-PythonRuntime
+    $expected = Get-PythonDependencyProfile $python
+    if (-not $expected) { Stop-WithError "Cannot identify the base Python runtime and requirements." }
+    $indexPath = Join-Path $PythonEnvironmentsRoot ($expected.key + ".json")
+    if (-not (Test-LocalDependencyPath $indexPath)) { Stop-WithError "Linked or unsafe Python dependency index." }
+    $candidates = @((Read-PythonEnvironmentProfile $PythonEnvironmentState),
+        (Read-PythonEnvironmentProfile $indexPath))
+    $projects = @($ProjectRoot)
+    if (Test-Path -LiteralPath $InstallationStatePath -PathType Leaf) {
+        try {
+            $installation = Get-Content -LiteralPath $InstallationStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($installation.format -eq 1 -and $installation.current_root) { $projects += [string]$installation.current_root }
+        }
+        catch { Write-Warn "Ignoring an unreadable dependency source installation." }
+    }
+    foreach ($project in ($projects | Select-Object -Unique)) {
+        $collector = Join-Path $project "darkweb_collector"
+        $saved = Read-PythonEnvironmentProfile (Join-Path $collector ".runtime\windows\python-environment.json")
+        if ($saved) { $candidates += $saved; continue }
+        $legacy = Join-Path $collector "venv"
+        if (@($candidates | Where-Object { $_ -and (Test-SamePath $_.root $legacy) }).Count -gt 0) { continue }
+        $requirements = Join-Path $collector "requirements.txt"
+        $stamp = Join-Path $legacy ".requirements.sha256"
+        if ((Test-PythonEnvironmentPath $legacy) -and (Test-Path -LiteralPath $requirements -PathType Leaf) -and
+            (Test-Path -LiteralPath $stamp -PathType Leaf) -and (Get-Content -LiteralPath $stamp -Raw).Trim() -eq (Get-FileHashText $requirements)) {
+            $profile = Get-PythonDependencyProfile (Join-Path $legacy "Scripts\python.exe") $requirements
+            if ($profile) { $profile | Add-Member NoteProperty root $legacy; $candidates += $profile }
+        }
+    }
+    foreach ($candidate in $candidates) {
+        if (-not $candidate -or $candidate.key -ne $expected.key -or -not (Test-PythonEnvironmentPath $candidate.root)) { continue }
+        $candidatePython = Join-Path $candidate.root "Scripts\python.exe"
+        $actual = Get-PythonDependencyProfile $candidatePython
+        if ($actual -and $actual.key -eq $expected.key -and $actual.packages -eq $candidate.packages -and
+            (Test-CollectorVenv $candidatePython) -and (Test-CollectorDependencies $candidatePython)) {
+            Set-CollectorEnvironment $candidate.root
+            $script:NewCollectorEnvironment = $false
+            Save-PythonEnvironmentProfile
+            Write-Info "Reusing verified Python dependencies: $VenvDir"
+            return
+        }
+    }
+    $root = Join-Path $PythonEnvironmentsRoot ($expected.key.Substring(0,16) + "-" + [Guid]::NewGuid().ToString("N").Substring(0,8))
+    if (-not (Test-PythonEnvironmentPath $root) -or (Test-Path -LiteralPath $root)) { Stop-WithError "Unsafe or already existing Python environment directory." }
+    Ensure-Directory $PythonEnvironmentsRoot
+    Set-CollectorEnvironment $root
+    $script:NewCollectorEnvironment = $true
+    Write-Info "Creating isolated Python environment for changed or missing dependencies: $VenvDir"
+    & $python -m venv $VenvDir
+    if ($LASTEXITCODE -ne 0) { Stop-WithError "Failed to create Python virtual environment." }
+}
+
 function Test-CollectorDependencies {
+    param([string]$Python = $VenvPython)
     try {
-        & $VenvPython -c "import celery, redis, playwright, fastapi, uvicorn, pycountry, babel" *> $null
+        $code = @"
+from importlib.metadata import version
+from pathlib import Path
+import sys
+from pip._vendor.packaging.requirements import Requirement
+import celery, redis, playwright, fastapi, uvicorn, pycountry, babel, psutil, psycopg2, jwt, wecom_aibot_sdk
+for line in Path(sys.argv[1]).read_text(encoding='utf-8-sig').splitlines():
+    if not line.strip() or line.lstrip().startswith('#'):
+        continue
+    requirement = Requirement(line)
+    if requirement.marker is None or requirement.marker.evaluate():
+        if not requirement.specifier.contains(version(requirement.name)):
+            raise SystemExit(1)
+"@
+        & $Python -B -c $code (Join-Path $CollectorRoot "requirements.txt") *> $null
+        if ($LASTEXITCODE -ne 0) { return $false }
+        & $Python -B -m pip check *> $null
         return ($LASTEXITCODE -eq 0)
     }
     catch {
@@ -2521,39 +2747,42 @@ function Test-CollectorDependencies {
 }
 
 function Ensure-CollectorDependencies {
-    $requirementsPath = Join-Path $CollectorRoot "requirements.txt"
-    $expectedHash = Get-FileHashText $requirementsPath
-    $currentHash = if (Test-Path -LiteralPath $RequirementsStamp) { (Get-Content -LiteralPath $RequirementsStamp -Raw).Trim() } else { "" }
-    if ($expectedHash -eq $currentHash -and (Test-CollectorDependencies)) {
+    $saved = Read-PythonEnvironmentProfile $PythonEnvironmentState
+    $actual = Get-PythonDependencyProfile $VenvPython
+    if ($saved -and $actual -and $actual.key -eq $saved.key -and $actual.packages -eq $saved.packages -and
+        (Test-SamePath $saved.root $VenvDir) -and (Test-CollectorDependencies)) {
         return
     }
-
-    Write-Info "Installing collector Python dependencies"
-    & $VenvPython -m pip install --upgrade pip
-    if ($LASTEXITCODE -ne 0) {
-        Stop-WithError "Failed to upgrade pip."
+    if (-not $NewCollectorEnvironment -or -not (Test-PathUnderRoot $VenvDir $PythonEnvironmentsRoot)) {
+        Stop-WithError "An existing Python environment failed verification; preserving it without modification."
     }
-    & $VenvPython -m pip install -r $requirementsPath
+    Write-Info "Installing collector Python dependencies"
+    & $VenvPython -m pip install -r (Join-Path $CollectorRoot "requirements.txt")
     if ($LASTEXITCODE -ne 0) {
         Stop-WithError "Failed to install Python requirements."
     }
-    Set-Content -LiteralPath $RequirementsStamp -Value $expectedHash -Encoding ASCII
+    if (-not (Test-CollectorDependencies)) { Stop-WithError "Prepared Python dependencies failed validation." }
+    Save-PythonEnvironmentProfile
+    $script:NewCollectorEnvironment = $false
 }
 
 function Test-PlaywrightBrowsers {
+    param([switch]$FilesOnly)
     try {
         $code = @"
 from pathlib import Path
+import sys
 from playwright.sync_api import sync_playwright
 
 with sync_playwright() as playwright:
     for browser_type in (playwright.chromium, playwright.firefox):
         if not Path(browser_type.executable_path).exists():
             raise SystemExit(1)
-        browser = browser_type.launch(headless=True)
-        browser.close()
+        if sys.argv[1] != 'files':
+            browser = browser_type.launch(headless=True)
+            browser.close()
 "@
-        & $VenvPython -c $code *> $null
+        & $VenvPython -B -c $code $(if ($FilesOnly) { "files" } else { "launch" }) *> $null
         return ($LASTEXITCODE -eq 0)
     }
     catch {
@@ -2562,28 +2791,65 @@ with sync_playwright() as playwright:
 }
 
 function Ensure-PlaywrightRuntime {
-    if ((Test-Path -LiteralPath $PlaywrightStamp) -and (Test-PlaywrightBrowsers)) {
+    if (Test-PlaywrightBrowsers) {
+        Write-Info "Reusing verified shared Playwright browsers"
         return
     }
+    if (Test-PlaywrightBrowsers -FilesOnly) {
+        Stop-WithError "Existing Playwright browser files cannot launch; preserving them without downloading replacements."
+    }
     Write-Info "Installing Playwright browser runtimes"
-    & $VenvPython -m playwright install chromium firefox
-    if ($LASTEXITCODE -ne 0) {
-        Stop-WithError "Failed to install Playwright browser runtimes."
+    $previousGc = [Environment]::GetEnvironmentVariable("PLAYWRIGHT_SKIP_BROWSER_GC", "Process")
+    try {
+        $env:PLAYWRIGHT_SKIP_BROWSER_GC = "1"
+        & $VenvPython -B -m playwright install chromium firefox
+        if ($LASTEXITCODE -ne 0) { Stop-WithError "Failed to install Playwright browser runtimes." }
+    }
+    finally {
+        if ($null -eq $previousGc) { Remove-Item Env:PLAYWRIGHT_SKIP_BROWSER_GC -ErrorAction SilentlyContinue }
+        else { $env:PLAYWRIGHT_SKIP_BROWSER_GC = $previousGc }
     }
     if (-not (Test-PlaywrightBrowsers)) {
         Stop-WithError "Playwright browsers were installed but cannot launch. Check the local browser runtime dependencies."
     }
-    New-Item -ItemType File -Path $PlaywrightStamp -Force | Out-Null
 }
 
 function Ensure-DashboardDependencies {
+    & $VenvPython -B $DependencyHelper check-node-paths --dashboard $DashboardRoot
+    if ($LASTEXITCODE -ne 0) { Stop-WithError "Linked or unsafe dashboard dependency directory; no dependencies were removed or installed." }
     $npm = Ensure-NodeRuntime
     $packageLockPath = Join-Path $DashboardRoot "package-lock.json"
     $expectedHash = Get-FileHashText $packageLockPath
-    $currentHash = if (Test-Path -LiteralPath $PackageLockStamp) { (Get-Content -LiteralPath $PackageLockStamp -Raw).Trim() } else { "" }
-    $viteBin = Join-Path $DashboardRoot "node_modules\.bin\vite.cmd"
-    if ((Test-Path -LiteralPath $viteBin) -and $expectedHash -eq $currentHash) {
+    $expected = Get-DashboardDependencyProfile $DashboardRoot
+    $nodeIdentity = & $script:NodeExePath -p "JSON.stringify([process.version,process.versions.modules,process.platform,process.arch])"
+    if ($LASTEXITCODE -ne 0 -or -not $expected) { Stop-WithError "Cannot identify the dashboard dependencies and Node runtime." }
+    if (Test-DashboardDependencies $DashboardRoot $expected.fingerprint $nodeIdentity) {
+        Save-DashboardDependencyProfile $expected.fingerprint $nodeIdentity $expectedHash
         return
+    }
+    if (Test-Path -LiteralPath $InstallationStatePath -PathType Leaf) {
+        try {
+            $installation = Get-Content -LiteralPath $InstallationStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($installation.format -eq 1 -and -not (Test-SamePath ([string]$installation.current_root) $ProjectRoot)) {
+                $source = Join-Path ([string]$installation.current_root) "threat-intelligence-dashboard"
+                $sourceProfile = Get-DashboardDependencyProfile $source
+                if ($sourceProfile -and $sourceProfile.fingerprint -eq $expected.fingerprint -and
+                    (Test-DashboardDependencies $source $expected.fingerprint $nodeIdentity)) {
+                    if (Test-Path -LiteralPath $DashboardNodeModulesDir) {
+                        Remove-GeneratedDirectory -Path $DashboardNodeModulesDir -AllowedRoot $DashboardRoot
+                    }
+                    & "$env:SystemRoot\System32\robocopy.exe" (Join-Path $source "node_modules") $DashboardNodeModulesDir /E /COPY:DAT /DCOPY:DAT /R:0 /W:0 /XJ /NFL /NDL /NJH /NJS /NP | Out-Null
+                    if ($LASTEXITCODE -ge 8) { throw "Dashboard dependency copy failed." }
+                    if (-not (Test-DashboardDependencies $DashboardRoot $expected.fingerprint $nodeIdentity)) { throw "Copied dashboard dependencies failed validation." }
+                    Save-DashboardDependencyProfile $expected.fingerprint $nodeIdentity $expectedHash
+                    Write-Info "Reused verified dashboard dependencies from the previous release"
+                    return
+                }
+            }
+        }
+        catch {
+            Write-Warn "Dashboard dependency reuse failed; installing an isolated local copy."
+        }
     }
     Write-Info "Installing dashboard dependencies"
     $npmCache = Join-Path $DefaultUserDataDir "npm-cache"
@@ -2594,12 +2860,7 @@ function Ensure-DashboardDependencies {
     }
     Push-Location $DashboardRoot
     try {
-        if (Test-Path -LiteralPath $packageLockPath) {
-            & $npm ci
-        }
-        else {
-            & $npm install
-        }
+        & $npm ci --prefer-offline --no-audit --no-fund
         if ($LASTEXITCODE -ne 0) {
             Stop-WithError "Failed to install dashboard dependencies."
         }
@@ -2607,14 +2868,66 @@ function Ensure-DashboardDependencies {
     finally {
         Pop-Location
     }
-    Ensure-Directory (Split-Path -Parent $PackageLockStamp)
-    Set-Content -LiteralPath $PackageLockStamp -Value $expectedHash -Encoding ASCII
+    if (-not (Test-DashboardDependencies $DashboardRoot $expected.fingerprint $nodeIdentity)) {
+        Stop-WithError "Installed dashboard dependencies failed validation."
+    }
+    Save-DashboardDependencyProfile $expected.fingerprint $nodeIdentity $expectedHash
+}
+
+function Get-DashboardDependencyProfile {
+    param([string]$Root)
+    try {
+        $output = & $VenvPython -B $DependencyHelper node-profile --dashboard $Root 2>$null
+        if ($LASTEXITCODE -eq 0) { return ($output | ConvertFrom-Json) }
+    }
+    catch { }
+    return $null
+}
+
+function Test-DashboardDependencies {
+    param([string]$Root, [string]$Fingerprint, [string]$NodeIdentity)
+    try {
+        $modules = Join-Path $Root "node_modules"
+        $stamp = Join-Path $modules ".darkweb-runtime.json"
+        if (Test-Path -LiteralPath $stamp -PathType Leaf) {
+            $saved = Get-Content -LiteralPath $stamp -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($saved.format -ne 1 -or $saved.fingerprint -ne $Fingerprint -or $saved.node -ne $NodeIdentity) { return $false }
+        }
+        & $VenvPython -B $DependencyHelper check-node --dashboard $Root *> $null
+        if ($LASTEXITCODE -ne 0) { return $false }
+        & $script:NodeExePath -e "require(require('node:path').join(process.argv[1],'esbuild')).transformSync('let ready = true')" $modules *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch { return $false }
+}
+
+function Save-DashboardDependencyProfile {
+    param([string]$Fingerprint, [string]$NodeIdentity, [string]$LockHash)
+    @{ format = 1; fingerprint = $Fingerprint; node = $NodeIdentity } | ConvertTo-Json |
+        Set-Content -LiteralPath (Join-Path $DashboardNodeModulesDir ".darkweb-runtime.json") -Encoding UTF8
+    Set-Content -LiteralPath $PackageLockStamp -Value $LockHash -Encoding ASCII
 }
 
 function Build-Dashboard {
     $null = Ensure-NodeRuntime
     $node = $script:NodeExePath
     $viteCli = Join-Path $DashboardRoot "node_modules\vite\bin\vite.js"
+    $nodeIdentity = & $node -p "JSON.stringify([process.version,process.versions.modules,process.platform,process.arch])"
+    if ($LASTEXITCODE -ne 0) { Stop-WithError "Cannot identify the dashboard build runtime." }
+    $buildStamp = Join-Path $RuntimeDir "dashboard-build.json"
+    $profile = & $VenvPython -B $DependencyHelper dashboard-profile --dashboard $DashboardRoot --node-identity $nodeIdentity
+    if ($LASTEXITCODE -ne 0) { Stop-WithError "Cannot verify dashboard build inputs." }
+    $profile = $profile | ConvertFrom-Json
+    if (Test-Path -LiteralPath $buildStamp -PathType Leaf) {
+        try {
+            $saved = Get-Content -LiteralPath $buildStamp -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($saved.fingerprint -eq $profile.fingerprint -and $profile.dist -and $saved.dist -eq $profile.dist) {
+                Write-Info "Reusing verified dashboard build for unchanged source and runtime"
+                return
+            }
+        }
+        catch { Write-Warn "Ignoring an invalid dashboard build record." }
+    }
     Write-Info "Building optimized dashboard assets"
     Push-Location $DashboardRoot
     try {
@@ -2630,6 +2943,13 @@ function Build-Dashboard {
     if (-not (Test-Path -LiteralPath $distIndex -PathType Leaf)) {
         Stop-WithError "Dashboard build did not produce dist/index.html."
     }
+    $built = & $VenvPython -B $DependencyHelper dashboard-profile --dashboard $DashboardRoot --node-identity $nodeIdentity
+    if ($LASTEXITCODE -ne 0) { Stop-WithError "Cannot verify dashboard build output." }
+    $built = $built | ConvertFrom-Json
+    if ($built.fingerprint -ne $profile.fingerprint -or -not $built.dist) { Stop-WithError "Dashboard build inputs changed or output is incomplete." }
+    Ensure-Directory $RuntimeDir
+    $built | ConvertTo-Json | Set-Content -LiteralPath "$buildStamp.$PID.tmp" -Encoding UTF8
+    Move-Item -LiteralPath "$buildStamp.$PID.tmp" -Destination $buildStamp -Force
 }
 
 function Ensure-RuntimeDatabase {
@@ -2717,6 +3037,7 @@ function Ensure-Redis {
         Write-Info "Redis is already running"
         $managedGarnet = @(Get-ManagedGarnetProcesses) | Select-Object -First 1
         if ($managedGarnet) {
+            Set-ManagedGarnetCpuLimit -Process $managedGarnet -ExpectedExecutable $GarnetServerExecutable
             $script:RedisProvider = "garnet"
             return [pscustomobject]@{
                 name = "garnet"
@@ -2882,6 +3203,7 @@ function Prepare-UpdateEnvironment {
     Invoke-TimedStep "Ensure-CollectorDependencies" { Ensure-CollectorDependencies }
     Invoke-TimedStep "Ensure-PlaywrightRuntime" { Ensure-PlaywrightRuntime }
     Invoke-TimedStep "Ensure-DashboardDependencies" { Ensure-DashboardDependencies }
+    Invoke-TimedStep "Build-Dashboard" { Build-Dashboard }
     Write-Info "Update environment is ready"
 }
 
@@ -2945,13 +3267,14 @@ function Start-Services {
     }
 
     $records += Start-ManagedProcess -Name "frontend" -WorkingDirectory $DashboardRoot -Body "& $node $viteCli preview --host 0.0.0.0 --port $FrontendPort --strictPort"
-    $records += Start-ManagedProcess -Name "worker-seed" -WorkingDirectory $CollectorRoot -Body "& $python -m darkweb_collector.worker_supervisor --name worker-seed --queues seed_http --hostname `"seed-http-$PID@%h`""
-    $records += Start-ManagedProcess -Name "worker-detail" -WorkingDirectory $CollectorRoot -Body "& $python -m darkweb_collector.worker_supervisor --name worker-detail --queues detail_http --hostname `"detail-http-$PID@%h`""
+    $collectorWorkdir = Quote-PS $CollectorRoot
+    $records += Start-ManagedProcess -Name "worker-seed" -WorkingDirectory $CollectorRoot -Body "& $python -m darkweb_collector.worker_supervisor --workdir $collectorWorkdir --name worker-seed --queues seed_http --hostname `"seed-http-$PID@%h`""
+    $records += Start-ManagedProcess -Name "worker-detail" -WorkingDirectory $CollectorRoot -Body "& $python -m darkweb_collector.worker_supervisor --workdir $collectorWorkdir --name worker-detail --queues detail_http --hostname `"detail-http-$PID@%h`""
     for ($index = 1; $index -le $BrowserPublicConcurrency; $index++) {
-        $records += Start-ManagedProcess -Name "worker-browser-public-$index" -WorkingDirectory $CollectorRoot -Body "& $python -m darkweb_collector.worker_supervisor --name worker-browser-public-$index --queues browser_public,browser_render --hostname `"browser-public-$index-$PID@%h`""
+        $records += Start-ManagedProcess -Name "worker-browser-public-$index" -WorkingDirectory $CollectorRoot -Body "& $python -m darkweb_collector.worker_supervisor --workdir $collectorWorkdir --name worker-browser-public-$index --queues browser_public,browser_render --hostname `"browser-public-$index-$PID@%h`""
     }
     for ($index = 1; $index -le $BrowserOnionConcurrency; $index++) {
-        $records += Start-ManagedProcess -Name "worker-browser-onion-$index" -WorkingDirectory $CollectorRoot -Body "& $python -m darkweb_collector.worker_supervisor --name worker-browser-onion-$index --queues browser_onion --hostname `"browser-onion-$index-$PID@%h`""
+        $records += Start-ManagedProcess -Name "worker-browser-onion-$index" -WorkingDirectory $CollectorRoot -Body "& $python -m darkweb_collector.worker_supervisor --workdir $collectorWorkdir --name worker-browser-onion-$index --queues browser_onion --hostname `"browser-onion-$index-$PID@%h`""
     }
     $records += Start-ManagedProcess -Name "scheduler" -WorkingDirectory $CollectorRoot -Body "while (`$true) { Write-Host `"[`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] enqueue-due`"; & $python $crawler enqueue-due; Start-Sleep -Seconds $SchedulerIntervalSeconds }"
     $records += Start-ManagedProcess -Name "vuln-sync" -WorkingDirectory $CollectorRoot -Body "while (`$true) { Write-Host `"[`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] sync-public-vulns --limit $VulnSyncLimit`"; & $python $crawler sync-public-vulns --limit $VulnSyncLimit; Start-Sleep -Seconds $VulnSyncIntervalSeconds }"
@@ -3135,7 +3458,9 @@ function Uninstall-Darkweb {
 
     Remove-DarkwebRegistration -WhatIf:$WhatIfPreference -Confirm:$false
     Remove-ManagedPath -Path $InstallationStatePath -ExpectedPath (Join-Path $UpdateStateRoot "installation.json") -Label "managed installation pointer" -WhatIf:$WhatIfPreference -Confirm:$false
-    Remove-ManagedPath -Path $VenvDir -ExpectedPath (Join-Path $CollectorRoot "venv") -Label "Python virtual environment" -WhatIf:$WhatIfPreference -Confirm:$false
+    if (Test-SamePath $VenvDir (Join-Path $CollectorRoot "venv")) {
+        Remove-ManagedPath -Path $VenvDir -ExpectedPath (Join-Path $CollectorRoot "venv") -Label "Python virtual environment" -WhatIf:$WhatIfPreference -Confirm:$false
+    }
     Remove-ManagedPath -Path $DashboardNodeModulesDir -ExpectedPath (Join-Path $DashboardRoot "node_modules") -Label "dashboard dependencies" -WhatIf:$WhatIfPreference -Confirm:$false
     Remove-ManagedPath -Path $DashboardDistDir -ExpectedPath (Join-Path $DashboardRoot "dist") -Label "dashboard build output" -WhatIf:$WhatIfPreference -Confirm:$false
     Remove-ManagedPath -Path $RuntimeDir -ExpectedPath (Join-Path $CollectorRoot ".runtime\windows") -Label "Windows runtime files" -WhatIf:$WhatIfPreference -Confirm:$false
@@ -3322,6 +3647,9 @@ function Invoke-WithProjectRuntimeLock {
         }
     }
 }
+
+$pythonBinding = Read-PythonEnvironmentProfile $PythonEnvironmentState
+if ($pythonBinding) { Set-CollectorEnvironment $pythonBinding.root }
 
 switch ($Action) {
     "start" { Invoke-WithProjectRuntimeLock { Start-Services } }

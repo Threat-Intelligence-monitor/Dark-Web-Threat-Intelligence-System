@@ -170,6 +170,8 @@ darkweb stop
 
 Windows 脚本会优先复用可达的显式 `REDIS_URL`。未配置服务时，脚本自动下载并校验 Microsoft Garnet 2.2.1 与项目私有 .NET 10.0.11，监听 `127.0.0.1:6380` 并固定使用 DB 0，不再要求通过 `winget` 安装 Memurai Developer。新安装环境的 Garnet 检查点、AOF、SQLite、迁移批次、证据镜像和缓存均使用已配置的数据根目录，默认每 6 小时执行一次后台检查点；完整第三方许可见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。
 
+每次启动或接管项目托管的 Garnet 时，Windows 启动器会自动应用 CPU 亲和性与 `BelowNormal` 优先级：选择原可用逻辑 CPU 的后半约一半，进程重启后重新设置，重复启动不会继续减半。该策略沿用原限 CPU 脚本及其按 PID/启动时间保存的原始设置；要求 64 位 PowerShell、单个处理器组且有 1–64 个逻辑 CPU，只有一个 CPU 时仅能降低优先级。CPU 限制不设置内存上限。
+
 Windows 一键启动的采集 Worker 由后台守护进程管理，每 15 秒检查进程与队列类型，意外退出后按 15 秒至 5 分钟退避重试。Celery 就绪后才标记运行；守护进程离线、Worker 未就绪或队列类型异常会在依赖该队列的站点上显示异常原因。队列类型异常时不自动删除数据，需保留现场并定点处理后恢复。守护状态位于当前 release 的 `darkweb_collector/.runtime/windows/worker-health/`，日志沿用各 Worker 日志。该机制不替代 Garnet 底层修复，也不保证卡住但仍存活的任务已恢复。
 
 Windows 在线更新会保护更新器及停服执行链，按进程身份逐个停止旧服务。Healthcheck 的“系统更新”检查可读取受限、脱敏的更新日志。若旧版更新在停止 API 时中断，请使用 Release 附带的一次性恢复工具，从管理员 PowerShell 独立启动升级；工具保留队列持久化备份并验证克隆，不自动清空数据。
@@ -220,6 +222,10 @@ darkweb uninstall purge-data --yes
 5. 新版健康检查失败时自动恢复旧版本；成功后页面自动跳转到登录页。
 
 更新完成后需要重新登录。Windows 在线更新不读取 `.git`、不执行 Git 命令，也不会覆盖数据库、采集输出、Cookie、账号配置、Tor 或 Garnet 数据。首次安装包含该更新器的过渡版本后，后续版本即可完全通过按钮更新；原安装目录的 `darkweb.cmd` 会自动转发到当前活动版本。
+
+Windows 更新按 Python 基础解释器身份、规范化后的 `requirements.txt` 及已安装包版本摘要复用通过检查的虚拟环境；旧环境保留原绝对路径，新依赖创建在 `<数据根目录>\runtimes\python-envs` 的独立目录中。当前版本的环境绑定位于 `darkweb_collector/.runtime/windows/python-environment.json`，仍被绑定的旧虚拟环境目录需要保留。复用时检查依赖版本范围、导入和 `pip check`，不会在旧环境执行安装或升级；缺失、依赖变化或校验失败时才创建新环境，首次准备或新增依赖仍可能需要联网。
+
+前端依赖比较忽略项目自身发布版本号，保留依赖版本、下载地址、完整性及安装配置等变化；兼容且完整的 `node_modules` 会复制到新版本本地，npm 补装优先使用已有缓存。共享 Playwright 浏览器按文件和实际启动检查复用，补装时保留旧浏览器版本供回滚使用。新前端在停止旧服务前构建，启动时只在源码、构建环境或产物发生变化后重新构建；目录联接、符号链接及无效依赖记录会被拒绝或停止复用。
 
 首次从普通源码目录切换到托管版本目录时，为避免复制体量较大的历史镜像，`installation.json` 会继续引用原来的 `darkweb_collector\output`。在通过数据迁移功能把镜像转入新的共享数据位置前，不要删除或移动最初的源码目录。
 
