@@ -141,7 +141,8 @@ def _ready_worker(path: Path, worker) -> psutil.Process | None:
     return None
 
 
-def supervise(name: str, queues: list[str], hostname: str) -> None:
+def supervise(name: str, queues: list[str], hostname: str, workdir: str | None = None) -> None:
+    workdir = str(Path(workdir or Path(__file__).resolve().parents[2]).resolve())
     path = _health_directory() / f"{name}.json"
     ready_path = path.with_suffix(".ready")
     if path.exists():
@@ -199,7 +200,7 @@ def supervise(name: str, queues: list[str], hostname: str) -> None:
                     elif worker is None and now >= next_start:
                         ready_path.unlink(missing_ok=True)
                         env = {**os.environ, "DARKWEB_WORKER_READY_FILE": str(ready_path)}
-                        command = [sys.executable, "-m", "celery", "-A", "darkweb_collector.celery_app:app",
+                        command = [sys.executable, "-m", "celery", "--workdir", workdir, "-A", "darkweb_collector.celery_app:app",
                                    "worker", "-Q", ",".join(queues), "--concurrency", "1", "--prefetch-multiplier", "1",
                                    "--pool", "solo", "--loglevel", "info", "--hostname", hostname]
                         try:
@@ -263,9 +264,10 @@ if __name__ == "__main__":
     parser.add_argument("--name", required=True)
     parser.add_argument("--queues", required=True)
     parser.add_argument("--hostname", required=True)
+    parser.add_argument("--workdir", default=str(Path(__file__).resolve().parents[2]))
     args = parser.parse_args()
     queues = args.queues.split(",")
     if not re.fullmatch(r"worker-[a-z0-9-]+", args.name) or any(q not in QUEUE_CONCURRENCY for q in queues):
         parser.error("invalid worker name or queues")
     logging.basicConfig(level=logging.INFO)
-    supervise(args.name, queues, args.hostname)
+    supervise(args.name, queues, args.hostname, args.workdir)

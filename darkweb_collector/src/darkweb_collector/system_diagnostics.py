@@ -35,16 +35,16 @@ _checks = {
     "update": "在线更新状态与日志",
     "files": "项目文件",
     "logs": "日志查询",
-    "command": "命令行查询",
+    "command": "PowerShell 命令执行",
 }
 _command_examples = [
     {"label": "查看目录", "command": "dir"},
     {"label": "当前目录", "command": "Get-Location"},
-    {"label": "Python 进程", "command": "Get-Process -Name python*"},
+    {"label": "CPU 排序", "command": "Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 Id,ProcessName,CPU"},
     {"label": "监听端口", "command": "Get-NetTCPConnection -State Listen"},
     {"label": "查看服务", "command": "Get-Service"},
     {"label": "读取文件", "command": "Get-Content README.md -TotalCount 30"},
-    {"label": "筛选日志", "command": "Select-String -Path worker.log -Pattern 'ERROR'"},
+    {"label": "多行脚本", "command": "$here = Get-Location\nWrite-Output ('启动目录：' + $here.Path)\nGet-Date"},
     {"label": "Python 版本", "command": "python --version"},
 ]
 _slots = BoundedSemaphore(2)
@@ -54,8 +54,8 @@ _blocked_parts = {
 }
 _source_suffixes = {".py", ".ps1", ".cmd", ".bat", ".js", ".vue", ".html", ".css", ".scss", ".md", ".toml"}
 _secret_name = re.compile(r"password|passwd|pass2|pwd|credential|cookie|storage[_-]?state|secret|token|(?:private|api|access)[_-]?key", re.I)
-_secret_key = r"[\w-]*(?:password|passwd|pass2|pwd|secret|token|api[_-]?key|access[_-]?key|cookie|credential|authorization)[\w-]*"
-_assignment = re.compile(rf"(?i)([\"']?{_secret_key}[\"']?\s*[:=]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;}}\]]+)")
+_secret_key = r"password|passwd|pass2|pwd|secret|token|api[_-]?key|access[_-]?key|cookie|credential|authorization"
+_assignment = re.compile(rf"(?i)(?<![\w-])([\"']?(?=[\w-]*(?:{_secret_key}))[\w-]+[\"']?\s*[:=]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;}}\]]+)")
 
 
 class DiagnosticError(ValueError):
@@ -69,18 +69,25 @@ class DiagnosticBusyError(RuntimeError):
 class DiagnosticRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     check: Literal["runtime", "processes", "ports", "dependencies", "update", "files", "logs", "command"]
-    root: Literal["project", "logs", "output"] = "project"
+    root: Literal["project", "logs", "output", "data", "update"] = "project"
     path: str = Field(default="", max_length=512)
     keyword: str = Field(default="", max_length=120)
     limit: int = Field(default=200, ge=1, le=MAX_LINES)
-    command: str = Field(default="", max_length=2048)
+    command: str = Field(default="", max_length=16384)
 
     @model_validator(mode="after")
     def validate_command(self):
         if self.command and self.check != "command":
-            raise ValueError("命令文本只能用于命令行查询")
+            raise ValueError("命令文本只能用于命令执行")
         if self.check == "command" and not self.command.strip():
-            raise ValueError("请输入查询命令")
+            raise ValueError("请输入 PowerShell 命令或脚本")
+        if self.command:
+            try:
+                self.command.encode("utf-8")
+            except UnicodeError as exc:
+                raise ValueError("命令文本包含无效字符编码") from exc
+        if self.check != "command" and self.root not in {"project", "logs", "output"}:
+            raise ValueError("此目录仅用于命令执行的启动位置")
         if self.check == "update" and self.path:
             raise ValueError("更新诊断仅读取固定更新状态和日志，不接受文件路径")
         return self
@@ -94,11 +101,21 @@ def _roots() -> dict[str, Path]:
     }
 
 
+def _command_roots() -> dict[str, Path]:
+    return {
+        "project": project_root().parent,
+        "logs": project_root() / ".runtime" / "windows" / "logs",
+        "output": output_root(),
+        "data": user_data_root(),
+        "update": update_state_root(),
+    }
+
+
 def redact_text(text: str) -> str:
     text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|\Z)", "[REDACTED PRIVATE KEY]", text)
     text = re.sub(r"(?im)([\"']?(?:authorization|cookie|set-cookie)[\"']?\s*[:=]\s*)[^\r\n]+", r"\1[REDACTED]", text)
     text = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9+/=._-]+", r"\1 [REDACTED]", text)
-    text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*://)[^/\s]+@", r"\1[REDACTED]@", text)
     text = re.sub(r"(?i)([?&](?:sig|signature|x-amz-signature|x-goog-signature)=)[^&#\s]+", r"\1[REDACTED]", text)
     text = _assignment.sub(r"\1[REDACTED]", text)
     for key, value in os.environ.items():
@@ -118,13 +135,17 @@ def _redact(value):
 
 
 def catalog() -> dict:
-    labels = {"project": "项目目录", "logs": "运行日志", "output": "采集输出"}
+    labels = {"project": "项目目录", "logs": "运行日志", "output": "采集输出", "data": "项目数据目录", "update": "更新状态目录"}
     return {
         "roots": [{"id": key, "label": labels[key], "path": str(path), "exists": path.is_dir()} for key, path in _roots().items()],
+        "command_roots": [{"id": key, "label": labels[key], "path": str(path), "exists": path.is_dir()} for key, path in _command_roots().items()],
         "checks": [{"id": key, "label": label} for key, label in _checks.items()],
         "limits": {"max_lines": MAX_LINES, "max_bytes": MAX_BYTES},
-        "read_only": True,
-        "command_mode": "read_only",
+        "read_only": False,
+        "checks_read_only": True,
+        "command_mode": "powershell",
+        "command_scope": "working_directory",
+        "command_max_length": 16384,
         "command_examples": _command_examples,
         "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
     }
@@ -166,122 +187,35 @@ def _readable_file(path: Path, root_id: str) -> bool:
     return path.suffix.lower() in _source_suffixes or path.name in {"version.json", "package.json", "requirements.txt"}
 
 
-def _command_tokens(command: str) -> list[str]:
-    tokens = []
-    remaining = command.strip()
-    while remaining:
-        match = re.match(r"(?:'((?:''|[^'])*)'|\"([^\"]*)\"|([^\s'\"]+))(?:\s+|$)", remaining)
-        if not match:
-            raise DiagnosticError("命令引号不完整，路径和关键词可使用单引号或双引号")
-        tokens.append(match[1].replace("''", "'") if match[1] is not None else (match[2] if match[2] is not None else match[3]))
-        remaining = remaining[match.end():]
-    return tokens
+def _command_directory(root: Path, value: str) -> Path:
+    value = value.replace("\\", "/")
+    supplied = PureWindowsPath(value)
+    if "\x00" in value or value.startswith("//") or supplied.anchor and not supplied.is_absolute():
+        raise DiagnosticError("工作目录必须是所选范围内的本地目录")
+    for part in supplied.parts[1:] if supplied.is_absolute() else supplied.parts:
+        if part == ".." or part.endswith((".", " ")) or ":" in part:
+            raise DiagnosticError("工作目录包含无效路径")
+    root = Path(os.path.abspath(root))
+    target = Path(os.path.abspath(value)) if supplied.is_absolute() else root.joinpath(*supplied.parts)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise DiagnosticError("启动工作目录必须位于所选目录范围内") from exc
+    for candidate in (target, *target.parents):
+        info = candidate.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise DiagnosticError("工作目录不支持符号链接或目录联接")
+    if not target.is_dir():
+        raise DiagnosticError("工作目录必须是现有目录")
+    return target
 
 
 def _command_query(request: DiagnosticRequest) -> tuple[dict, bool]:
-    root = _roots()[request.root]
-    directory = _resolve_path(root, request.path)
-    if not directory.is_dir():
-        raise DiagnosticError("工作目录必须是所选根目录内的现有目录")
-    tokens = _command_tokens(request.command)
-    head = tokens.pop(0).casefold()
-    quote = lambda value: "'" + str(value).replace("'", "''") + "'"
-    aliases = {"dir": "get-childitem", "ls": "get-childitem", "cat": "get-content", "type": "get-content", "pwd": "get-location"}
-    head = aliases.get(head, head)
-    count = request.limit
-    allowed = {
-        "get-childitem": {"-path", "-literalpath"},
-        "get-content": {"-path", "-literalpath", "-tail", "-totalcount"},
-        "select-string": {"-path", "-literalpath", "-pattern"},
-        "get-process": {"-name"}, "get-service": {"-name"},
-        "get-nettcpconnection": {"-state"},
-        "get-location": set(), "whoami": set(), "hostname": set(), "python": set(),
-    }
-    if head == "python" and tokens == ["--version"]:
-        script = f"& {quote(sys.executable)} --version"
-    else:
-        if head not in allowed:
-            raise DiagnosticError("当前只开放只读查询命令：dir、Get-Content、Select-String、Get-Process、Get-Service、Get-NetTCPConnection、Get-Location、whoami、hostname、python --version")
-        options = {}
-        positional = []
-        while tokens:
-            token = tokens.pop(0)
-            if token.startswith("-"):
-                key = token.casefold()
-                if key not in allowed[head] or not tokens or key in options:
-                    raise DiagnosticError("不支持此命令参数，请参考页面中的命令示例")
-                options[key] = tokens.pop(0)
-            else:
-                positional.append(token)
-        if len(positional) > 1 or (positional and ("-name" in options or "-path" in options or "-literalpath" in options)):
-            raise DiagnosticError("只支持一条查询命令，不支持脚本、管道和命令连接符")
-        if "-path" in options and "-literalpath" in options:
-            raise DiagnosticError("Path 和 LiteralPath 不能同时使用")
-        for key in ("-tail", "-totalcount"):
-            if key in options:
-                if not options[key].isdigit() or not 1 <= int(options[key]) <= MAX_LINES:
-                    raise DiagnosticError(f"返回行数必须在 1 到 {MAX_LINES} 之间")
-                count = min(count, int(options[key]))
-        if "-tail" in options and "-totalcount" in options:
-            raise DiagnosticError("Tail 和 TotalCount 不能同时使用")
-        if head in {"get-childitem", "get-content", "select-string"}:
-            argument = options.get("-literalpath", options.get("-path", positional[0] if positional else ""))
-            argument = argument.replace("\\", "/")
-            if argument == ".":
-                argument = ""
-            elif argument.startswith("./"):
-                argument = argument[2:]
-            relative = "/".join(part for part in (request.path, argument) if part)
-            target = _resolve_path(root, relative)
-            if head == "get-childitem":
-                if not target.is_dir():
-                    raise DiagnosticError("目录查询需要指定一个目录")
-                denied = ",".join(quote(part) for part in sorted(_blocked_parts))
-                suffixes = _source_suffixes if request.root == "project" else {".log", ".txt"}
-                extensions = ",".join(quote(suffix) for suffix in sorted(suffixes))
-                script = (
-                    f"Get-ChildItem -LiteralPath {quote(target)} | Where-Object {{ "
-                    f"$_.Name -notmatch {quote(_secret_name.pattern)} -and !$_.Name.StartsWith('.') -and "
-                    f"$_.Name -notin @({denied}) -and ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and "
-                    f"($_.PSIsContainer -or $_.Extension -in @({extensions}) -or $_.Name -in @('version.json','package.json','requirements.txt')) "
-                    f"}} | Select-Object -First {count} Name,Mode,Length,LastWriteTime | Format-Table -AutoSize | Out-String -Width 200"
-                )
-            else:
-                if not target.is_file() or not _readable_file(target, request.root):
-                    raise DiagnosticError("只允许读取获准的源码和日志文件")
-                if target.stat().st_size > MAX_BYTES:
-                    raise DiagnosticError("命令查询文件最多 256 KiB，大日志请使用日志查询功能")
-                with target.open("rb") as handle:
-                    prefix = handle.read(2)
-                encoding = {b"\xff\xfe": "Unicode", b"\xfe\xff": "BigEndianUnicode"}.get(prefix, "UTF8")
-                if head == "get-content":
-                    mode = "Tail" if "-tail" in options else "TotalCount"
-                    script = f"Get-Content -LiteralPath {quote(target)} -Encoding {encoding} -{mode} {count}"
-                else:
-                    if not options.get("-pattern"):
-                        raise DiagnosticError("Select-String 需要使用 -Pattern 指定普通文字关键词")
-                    script = f"Select-String -LiteralPath {quote(target)} -Encoding {encoding} -SimpleMatch -Pattern {quote(options['-pattern'])} | Select-Object -First {count} LineNumber,Line | Format-Table -AutoSize | Out-String -Width 200"
-        elif head in {"get-process", "get-service"}:
-            name = options.get("-name", positional[0] if positional else "")
-            if any(char in name for char in "|;&<>`$(){}"):
-                raise DiagnosticError("名称参数仅用于按进程或服务名称查询")
-            suffix = f" -Name {quote(name)}" if name else ""
-            fields = "Id,ProcessName,CPU,WorkingSet" if head == "get-process" else "Name,Status,DisplayName"
-            script = f"{head}{suffix} | Select-Object -First {count} {fields} | Format-Table -AutoSize | Out-String -Width 200"
-        elif head == "get-nettcpconnection":
-            if positional or options.get("-state", "Listen").casefold() != "listen":
-                raise DiagnosticError("当前端口命令仅支持 -State Listen")
-            script = f"Get-NetTCPConnection -State Listen | Select-Object -First {count} LocalAddress,LocalPort,OwningProcess | Format-Table -AutoSize | Out-String -Width 200"
-        elif positional or options or head == "python":
-            raise DiagnosticError("此查询命令不支持额外参数")
-        elif head == "get-location":
-            script = "Get-Location | Select-Object Path | Format-List | Out-String"
-        else:
-            executable = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / f"{head}.exe"
-            script = f"& {quote(executable)}"
-    data, truncated = run_powershell(script, directory, MAX_BYTES)
+    directory = _command_directory(_command_roots()[request.root], request.path)
+    data, truncated = run_powershell(request.command, directory, MAX_BYTES)
     data["command"] = request.command
-    data["result_limit"] = count if head not in {"get-location", "whoami", "hostname", "python"} else None
+    data["command_mode"] = "powershell"
+    data["command_scope"] = "working_directory"
     return data, truncated
 
 

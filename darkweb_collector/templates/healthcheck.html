@@ -20,13 +20,16 @@
     .wide { grid-column: 1 / -1; } label { display: block; margin-bottom: 6px; font-weight: 600; }
     input, select, textarea, button { font: inherit; }
     input, select, textarea { width: 100%; padding: 9px 10px; border: 1px solid #cbd6e2; border-radius: 5px; color: inherit; background: white; }
-    textarea { min-height: 100px; resize: vertical; font-family: Consolas, monospace; }
+    textarea { min-height: 170px; resize: vertical; font-family: Consolas, monospace; }
     button { padding: 8px 14px; border: 1px solid #cbd6e2; border-radius: 5px; background: white; color: #243247; cursor: pointer; }
     button.primary { border-color: #2576ba; background: #2576ba; color: white; }
     button:disabled { opacity: .55; cursor: default; } :focus-visible { outline: 2px solid #2576ba; outline-offset: 2px; }
     .actions, .heading, .examples { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
     .heading { justify-content: space-between; margin-bottom: 16px; } .heading h2 { margin: 0; }
     .examples { margin: 10px 0; } .examples button { padding: 5px 9px; font-size: 12px; }
+    .mode-switch button[aria-pressed="true"] { border-color: #2576ba; background: #eaf3fb; color: #16588e; font-weight: 600; }
+    .working-directory { padding: 10px 12px; border: 1px solid #d9e2ec; border-radius: 5px; background: #f6f8fb; }
+    .working-directory output { display: block; overflow-wrap: anywhere; font: 13px/1.65 Consolas, monospace; }
     #message { margin: 0 0 16px; padding: 10px 12px; border-radius: 5px; background: #fff0ed; color: #ad3228; }
     #status { margin: 0 0 14px; color: #637287; }
     .warning { padding: 10px 12px; background: #fff7e5; color: #8b5a0b; border-radius: 5px; }
@@ -56,17 +59,20 @@
     </section>
     <div id="diagnostics" hidden>
       <section class="panel">
-        <div class="heading"><h2>诊断查询</h2><button id="logout" type="button">退出登录</button></div>
+        <div class="heading"><h2 id="query-heading">命令执行</h2><button id="logout" type="button">退出登录</button></div>
         <form id="query-form">
           <fieldset id="query-fields" class="fields">
-            <div><label for="check">检查项</label><select id="check" required></select></div>
+            <div class="actions mode-switch wide" role="group" aria-label="诊断模式"><button id="command-mode" type="button" aria-pressed="true">命令执行</button><button id="checks-mode" type="button" aria-pressed="false">快捷检查</button></div>
+            <div id="check-field" hidden><label for="check">检查项</label><select id="check"></select></div>
             <div id="root-field" hidden><label id="root-label" for="root">查询目录</label><select id="root"></select></div>
-            <div id="path-field" class="wide" hidden><label id="path-label" for="path">相对路径</label><input id="path" maxlength="512"><span id="root-path" class="note"></span></div>
+            <div id="path-field" class="wide" hidden><label id="path-label" for="path">相对路径</label><input id="path" maxlength="512"></div>
+            <div id="directory-note" class="working-directory wide" hidden><span id="root-note-label" class="note">完整启动工作目录</span><output id="root-path" for="root path"></output></div>
             <div id="keyword-field" hidden><label for="keyword">关键词</label><input id="keyword" maxlength="120" placeholder="筛选文件名或文件内容"></div>
             <div id="limit-field" hidden><label id="limit-label" for="limit">返回行数上限</label><input id="limit" type="number" min="1" max="500" step="1" value="200"></div>
             <div id="command-field" class="wide" hidden>
-              <label for="command">PowerShell 命令</label><textarea id="command" maxlength="2048" autocomplete="off" placeholder="输入诊断命令，Ctrl + Enter 执行"></textarea>
-              <div id="examples" class="examples"></div><span id="command-note" class="note"></span>
+              <label for="command">PowerShell 命令或脚本</label><textarea id="command" maxlength="16384" rows="6" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="支持自由命令、管道、多行脚本和外部程序。Ctrl + Enter 执行"></textarea>
+              <span id="permission-note" class="note">命令使用后端服务账号现有的 Windows 权限，不会因网页管理员登录而自动提权。所选目录是启动位置，不是文件访问沙箱。</span>
+              <div id="examples" class="examples" aria-label="命令示例"></div><span id="command-note" class="note"></span>
             </div>
             <div class="actions wide"><button id="run" class="primary" type="submit">执行检查</button><button id="refresh" type="button">刷新检查项</button><span id="query-note" class="note"></span></div>
           </fieldset>
@@ -74,7 +80,7 @@
       </section>
       <section class="panel" aria-live="polite" id="result-panel">
         <div class="heading"><h2>诊断结果</h2><div class="actions"><button id="copy" type="button" disabled>复制 JSON</button><button id="download" type="button" disabled>下载 JSON</button></div></div>
-        <p id="status">选择检查项后执行查询。</p>
+        <p id="status">输入命令并选择工作目录后执行。</p>
         <div id="result-content"></div>
         <details id="raw-result" hidden><summary>完整 JSON</summary><pre id="result-json"></pre></details>
       </section>
@@ -84,7 +90,7 @@
     'use strict';
     const $ = (id) => document.getElementById(id);
     const storageKey = 'dwti-healthcheck-token';
-    let token = '', catalog = null, result = null, busy = false, activeRequest = null;
+    let token = '', catalog = null, result = null, busy = false, activeRequest = null, mode = 'command';
     try { token = sessionStorage.getItem(storageKey) || ''; } catch {}
     function node(tag, text, className = '') {
       const element = document.createElement(tag);
@@ -104,11 +110,11 @@
     }
     function clearResult() {
       result = null; $('result-content').replaceChildren(); $('result-json').textContent = '';
-      $('raw-result').hidden = true; $('raw-result').open = false; $('status').textContent = '选择检查项后执行查询。';
+      $('raw-result').hidden = true; $('raw-result').open = false; $('status').textContent = mode === 'command' ? '输入命令并选择工作目录后执行。' : '选择检查项后执行查询。';
       $('copy').disabled = true; $('download').disabled = true;
     }
     function clearSession() {
-      activeRequest?.abort(); saveToken(''); catalog = null; clearResult();
+      activeRequest?.abort(); saveToken(''); catalog = null; mode = 'command'; clearResult();
       $('check').replaceChildren(); $('root').replaceChildren(); $('examples').replaceChildren();
       $('path').value = ''; $('keyword').value = ''; $('command').value = ''; $('root-path').textContent = ''; $('password').value = '';
       $('command-note').textContent = ''; $('query-note').textContent = '';
@@ -134,19 +140,29 @@
       } finally { clearTimeout(timeout); if (activeRequest === controller) activeRequest = null; }
     }
     function jsonOptions(body) { return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }; }
-    function updateRootNote() { $('root-path').textContent = catalog?.roots.find((item) => item.id === $('root').value)?.path || ''; }
+    function selectedCheck() { return mode === 'command' ? 'command' : $('check').value; }
+    function availableRoots(check = selectedCheck()) { return (check === 'command' ? catalog?.command_roots : catalog?.roots) || []; }
+    function updateRootNote() {
+      const root = availableRoots().find((item) => item.id === $('root').value)?.path || '';
+      const path = $('path').value.trim().replace(/^\.[\\/]+/, ''), separator = root.includes('\\') ? '\\' : '/';
+      $('root-path').textContent = mode === 'command' && /^[A-Za-z]:[\\/]/.test(path) ? path : mode === 'command' && root && path && path !== '.' ? root.replace(/[\\/]+$/, '') + separator + path.replace(/[\\/]+/g, separator) : root;
+    }
     function updateFields() {
-      const check = $('check').value, command = check === 'command', files = ['files', 'logs'].includes(check), directory = command || files;
+      const check = selectedCheck(), command = mode === 'command', files = ['files', 'logs'].includes(check), directory = command || files;
+      $('command-mode').setAttribute('aria-pressed', String(command)); $('checks-mode').setAttribute('aria-pressed', String(!command));
+      $('query-heading').textContent = command ? '命令执行' : '快捷检查'; $('check-field').hidden = command; $('check').required = !command;
       for (const id of ['root-field', 'path-field']) $(id).hidden = !directory;
-      $('keyword-field').hidden = !files; $('limit-field').hidden = !(files || command);
-      $('command-field').hidden = !command; $('command').required = command; $('root').required = directory; $('limit').required = files || command;
-      $('limit-label').textContent = command ? '返回数量上限' : '返回行数上限';
-      $('root-label').textContent = command ? '工作目录' : '查询目录'; $('path-label').textContent = command ? '相对子目录' : '相对路径';
-      $('path').placeholder = command ? '留空在所选根目录执行，或输入其中的子目录' : '留空查看目录，或输入目录内的文件路径';
+      $('directory-note').hidden = !directory; $('path-field').classList.toggle('wide', !command);
+      $('keyword-field').hidden = !files; $('limit-field').hidden = !files;
+      $('command-field').hidden = !command; $('command').required = command; $('root').required = directory; $('limit').required = files;
+      $('root-note-label').textContent = command ? '完整启动工作目录' : '查询根目录';
+      $('root-label').textContent = command ? '工作目录' : '查询目录'; $('path-label').textContent = command ? '子目录（相对或绝对路径）' : '相对路径';
+      $('path').placeholder = command ? '留空使用根目录，可填所选范围内的相对或绝对子目录' : '留空查看目录，或输入目录内的文件路径';
       $('run').textContent = command ? '执行命令' : (files ? '查询' : '执行检查');
+      $('refresh').textContent = command ? '刷新目录与示例' : '刷新检查项';
       $('query-note').textContent = check === 'logs' ? '读取日志末尾内容，关键词按文字匹配。' : '';
       $('root').replaceChildren();
-      for (const item of catalog.roots.filter((item) => check !== 'logs' || item.id !== 'project')) {
+      for (const item of availableRoots(check).filter((item) => check !== 'logs' || item.id !== 'project')) {
         const option = node('option', item.label + (item.exists ? '' : '（目录不存在）')); option.value = item.id; option.disabled = !item.exists; $('root').append(option);
       }
       const preferred = check === 'logs' ? 'logs' : 'project';
@@ -158,15 +174,15 @@
     async function loadCatalog() {
       const payload = await request('/healthcheck/api'); catalog = payload;
       const selected = $('check').value; $('check').replaceChildren();
-      for (const item of payload.checks) { const option = node('option', item.label); option.value = item.id; $('check').append(option); }
-      if (payload.checks.some((item) => item.id === selected)) $('check').value = selected;
+      for (const item of payload.checks.filter((item) => item.id !== 'command')) { const option = node('option', item.label); option.value = item.id; $('check').append(option); }
+      if ([...$('check').options].some((item) => item.value === selected)) $('check').value = selected;
       $('limit').max = String(payload.limits.max_lines); $('limit').value = String(Math.min(Number($('limit').value) || 200, payload.limits.max_lines));
       $('examples').replaceChildren();
       for (const item of payload.command_examples || []) {
         const button = node('button', item.label); button.type = 'button';
         button.addEventListener('click', () => { $('command').value = item.command; clearResult(); $('command').focus(); }); $('examples').append(button);
       }
-      $('command-note').textContent = '仅执行服务器允许的只读命令。单次执行上限 ' + (payload.command_timeout_seconds || 15) + ' 秒。';
+      $('command-note').textContent = '示例仅用于填写，可编辑或直接输入命令。每次独立启动 PowerShell，执行上限 ' + (payload.command_timeout_seconds || 15) + ' 秒，输出上限 ' + Math.round((payload.limits.max_bytes || 262144) / 1024) + ' KiB。';
       updateFields(); $('login-panel').hidden = true; $('diagnostics').hidden = false;
     }
     function resultTime(value) {
@@ -177,10 +193,11 @@
     function renderResult(payload) {
       result = payload; const data = payload.data, content = $('result-content'); content.replaceChildren();
       $('status').textContent = (payload.check === 'command' ? '命令已返回' : '查询完成') + ' · ' + resultTime(payload.checked_at) + ' · 耗时 ' + payload.duration_ms + ' ms';
-      if (payload.truncated) content.append(node('p', '结果达到返回上限，部分内容未展示。请缩小查询范围后重试。', 'warning'));
+      if (payload.truncated) content.append(node('p', payload.check === 'command' ? '输出达到返回字节上限，部分内容未展示。' : '结果达到返回上限，部分内容未展示。请缩小查询范围后重试。', 'warning'));
       if (payload.check === 'command') {
-        content.append(node('p', '工作目录：' + data.working_directory), node('p', '退出码：' + (data.exit_code ?? '—') + (data.timed_out ? ' · 执行超时' : '')));
-        if (data.result_limit != null) content.append(node('p', '本次最多返回 ' + data.result_limit + ' 项或行，结果可能未涵盖全部记录。', 'note'));
+        $('root-path').textContent = data.working_directory;
+        content.append(node('p', '启动工作目录：' + data.working_directory), node('p', '退出码：' + (data.exit_code ?? '—') + (data.timed_out ? ' · 执行超时' : '')));
+        if (data.output_incomplete) content.append(node('p', '主命令已退出，后台程序仍占用输出管道。本次已返回，后续后台输出不再采集。', 'note'));
         content.append(node('h3', '标准输出'), node('pre', data.stdout || '无标准输出'), node('h3', '标准错误输出'));
         content.append(data.stderr ? node('pre', data.stderr, 'error') : node('p', '无标准错误输出', 'note'));
       } else if (Array.isArray(data.entries) || typeof data.text === 'string') {
@@ -206,12 +223,13 @@
     }
     async function runCheck() {
       if (busy || !catalog || !$('query-form').reportValidity()) return;
-      const check = $('check').value, directory = ['files', 'logs', 'command'].includes(check);
-      if (directory && !catalog.roots.some((item) => item.id === $('root').value && item.exists)) { message('请选择现有的工作目录'); return; }
-      if (check === 'command' && !$('command').value.trim()) { message('请输入查询命令'); return; }
-      const body = { check, root: $('root').value || 'project', path: $('path').value.trim(), keyword: $('keyword').value, limit: Number($('limit').value) || 200 };
+      const check = selectedCheck(), directory = ['files', 'logs', 'command'].includes(check);
+      if (directory && !availableRoots(check).some((item) => item.id === $('root').value && item.exists)) { message('请选择现有的工作目录'); return; }
+      if (check === 'command' && !$('command').value.trim()) { message('请输入要执行的命令或脚本'); return; }
+      const body = { check, root: $('root').value || 'project', path: $('path').value.trim() };
+      if (['files', 'logs'].includes(check)) { body.keyword = $('keyword').value; body.limit = Number($('limit').value) || 200; }
       if (check === 'command') body.command = $('command').value;
-      clearResult(); message(); setBusy(true); $('status').textContent = '正在查询，请稍候…';
+      clearResult(); message(); setBusy(true); $('status').textContent = check === 'command' ? '正在执行命令，请稍候…' : '正在查询，请稍候…';
       try { renderResult(await request('/healthcheck/api/run', jsonOptions(body))); }
       catch (error) { $('status').textContent = '查询未完成。'; message(error.message || '查询失败'); }
       finally { setBusy(false); }
@@ -230,8 +248,10 @@
       finally { $('password').value = ''; $('login-button').textContent = '登录'; setBusy(false); }
     });
     $('query-form').addEventListener('submit', (event) => { event.preventDefault(); runCheck(); });
+    for (const name of ['command', 'checks']) $(name + '-mode').addEventListener('click', () => { if (!busy && mode !== name) { mode = name; updateFields(); } });
     $('check').addEventListener('change', updateFields);
     $('root').addEventListener('change', () => { $('path').value = ''; updateRootNote(); clearResult(); message(); });
+    $('path').addEventListener('input', updateRootNote);
     $('command').addEventListener('keydown', (event) => { if (event.ctrlKey && event.key === 'Enter') { event.preventDefault(); runCheck(); } });
     $('refresh').addEventListener('click', async () => {
       if (busy) return; message(); setBusy(true);
