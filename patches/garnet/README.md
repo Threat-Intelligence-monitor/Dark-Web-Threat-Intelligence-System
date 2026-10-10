@@ -39,4 +39,4 @@ if ($LASTEXITCODE -ne 0) { throw 'Garnet build failed' }
 - 真实 Garnet：16 种初始先后次序、8 次超时重新注册、4 组过期及活动观察者 FIFO、WRONGTYPE 与空列表恢复；64 条 FIFO 任务完成确认，3 个生产者及 4 个消费者并发完成 180 条事务 RPUSH/BRPOP 和 HSET/ZADD/HDEL/ZREM 确认操作，任务无重复、无丢失、无残留。
 - 并发期间 PING/TYPE 正常；WATCH 冲突使 EXEC 中止。提交 AOF 后终止并重启自建实例，2 条排队消息和 2 条未确认任务恢复，已被阻塞取走的消息未复活。每次停止前均核验进程路径；全部自建实例已停止。
 
-离线包仅在本地生成并验证，尚未发布远程组件资产或部署生产环境。
+组件使用独立发布标签 [garnet-2.2.1-dwti.1](https://github.com/Threat-Intelligence-monitor/Dark-Web-Threat-Intelligence-System/releases/tag/garnet-2.2.1-dwti.1)，主程序启动器按固定 SHA256 校验下载，离线安装可使用 `DARKWEB_GARNET_ARCHIVE_PATH`。组件发布不替代应用的最新版本，也不会自动部署生产环境。

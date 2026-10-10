@@ -3091,7 +3091,7 @@ function Ensure-Redis {
     if (Test-RedisReady) {
         Write-Info "Redis is already running"
         if ($managedGarnet) {
-            Set-ManagedGarnetCpuLimit -Process $managedGarnet -ExpectedExecutable $GarnetServerExecutable
+            Set-ManagedGarnetCpuLimit -Process $managedGarnet[0] -ExpectedExecutable $GarnetServerExecutable
             $script:RedisProvider = "garnet"
             return [pscustomobject]@{
                 name = "garnet"
