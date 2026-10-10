@@ -246,11 +246,15 @@ $DefaultTorBridgeAutoRuntimeDir = Join-Path $DefaultUserDataDir "tor_bridge_runt
 $DefaultNpmCacheDir = Join-Path $DefaultUserDataDir "npm-cache"
 $DefaultRuntimeRoot = Join-Path $DefaultUserDataDir "runtimes"
 $GarnetVersion = "2.2.1"
-$GarnetArchiveUrl = "https://github.com/microsoft/garnet/releases/download/v2.2.1/win-x64-based-readytorun.zip"
-$GarnetArchiveSha256 = "93f0026d305585cd249a91dda6fd44c46bcaa56304115b039f74f23fe630c64a"
-$GarnetServerSha256 = "4aae95813ff41810d866708d617fd7c2efe8ff631d5c8a25fe743fa08e0f1bac"
-$GarnetRuntimeRoot = Join-Path $DefaultRuntimeRoot "garnet\$GarnetVersion"
+$GarnetRuntimeRevision = "2.2.1-dwti.1"
+$GarnetArchiveUrl = "https://github.com/Threat-Intelligence-monitor/Dark-Web-Threat-Intelligence-System/releases/download/garnet-2.2.1-dwti.1/garnet-2.2.1-dwti.1-win-x64.zip"
+$GarnetArchiveSha256 = "94ed5e4c5d22166463727974c85c4b7db454433e37cc4078fdc9f04834f1d6e6"
+$GarnetServerSha256 = "63ac8340e4beb6860523f87d496cf95605c17ad2436de2bca231ae71d6cbdc8e"
+$GarnetServerAssemblySha256 = "4b20d7cfe248e1a26752c2bca46ec3bd35267bc95e07451cef8c23742a979e0f"
+$GarnetSourceUrl = "https://github.com/microsoft/garnet/tree/b0255a31de95b1e903ee187feb59ceb04819a639"
+$GarnetRuntimeRoot = Join-Path $DefaultRuntimeRoot "garnet\$GarnetRuntimeRevision"
 $GarnetServerExecutable = Join-Path $GarnetRuntimeRoot "net10.0\GarnetServer.exe"
+$GarnetServerAssembly = Join-Path $GarnetRuntimeRoot "net10.0\Garnet.server.dll"
 $GarnetDotnetVersion = "10.0.11"
 $GarnetDotnetArchiveUrl = "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.11/dotnet-runtime-10.0.11-win-x64.zip"
 $GarnetDotnetArchiveSha512 = "d9ab9c0d9916b8fa3585b5f403057f594ffffb8364dac09e0007dd8ac671c86754935b980d8fb5da83cb1b82ac3cd57cc407c969e6d837aaa2fae21047cb7448"
@@ -1234,8 +1238,13 @@ function Save-GarnetRuntimeManifest {
     $payload = [ordered]@{
         provider = "garnet"
         version = $GarnetVersion
+        runtime_revision = $GarnetRuntimeRevision
+        distribution = "project-patched"
+        archive_url = $GarnetArchiveUrl
+        source_url = $GarnetSourceUrl
         archive_sha256 = $GarnetArchiveSha256
         server_executable_sha256 = $GarnetServerSha256
+        server_assembly_sha256 = $GarnetServerAssemblySha256
         dotnet_version = $GarnetDotnetVersion
         dotnet_archive_sha512 = $GarnetDotnetArchiveSha512
         dotnet_executable_sha256 = $GarnetDotnetExecutableSha256
@@ -1257,6 +1266,7 @@ function Save-GarnetRuntimeManifest {
 
 function Resolve-ManagedGarnetRuntime {
     if (-not ((Test-Path -LiteralPath $GarnetServerExecutable -PathType Leaf) -and
+        (Test-Path -LiteralPath $GarnetServerAssembly -PathType Leaf) -and
         (Test-Path -LiteralPath $GarnetDotnetExecutable -PathType Leaf) -and
         (Test-Path -LiteralPath $GarnetRuntimeManifest -PathType Leaf))) {
         return $null
@@ -1266,14 +1276,20 @@ function Resolve-ManagedGarnetRuntime {
         $manifest = Get-Content -LiteralPath $GarnetRuntimeManifest -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($manifest.provider -ne "garnet" -or
             $manifest.version -ne $GarnetVersion -or
+            $manifest.runtime_revision -ne $GarnetRuntimeRevision -or
+            $manifest.distribution -ne "project-patched" -or
+            $manifest.archive_url -ne $GarnetArchiveUrl -or
+            $manifest.source_url -ne $GarnetSourceUrl -or
             $manifest.archive_sha256 -ne $GarnetArchiveSha256 -or
             $manifest.server_executable_sha256 -ne $GarnetServerSha256 -or
+            $manifest.server_assembly_sha256 -ne $GarnetServerAssemblySha256 -or
             $manifest.dotnet_version -ne $GarnetDotnetVersion -or
             $manifest.dotnet_archive_sha512 -ne $GarnetDotnetArchiveSha512 -or
             $manifest.dotnet_executable_sha256 -ne $GarnetDotnetExecutableSha256) {
             return $null
         }
         if ((Get-FileHash -LiteralPath $GarnetServerExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $GarnetServerSha256 -or
+            (Get-FileHash -LiteralPath $GarnetServerAssembly -Algorithm SHA256).Hash.ToLowerInvariant() -ne $GarnetServerAssemblySha256 -or
             (Get-FileHash -LiteralPath $GarnetDotnetExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $GarnetDotnetExecutableSha256) {
             return $null
         }
@@ -1331,7 +1347,7 @@ function Ensure-ManagedGarnetRuntime {
         -SourceArchivePath ([string]$env:DARKWEB_DOTNET_RUNTIME_ARCHIVE_PATH) `
         -ForceRepair | Out-Null
     Install-VerifiedZipRuntime `
-        -Label "Microsoft Garnet $GarnetVersion" `
+        -Label "Project-patched Garnet $GarnetRuntimeRevision" `
         -Url $GarnetArchiveUrl `
         -ExpectedHash $GarnetArchiveSha256 `
         -HashAlgorithm "SHA256" `
@@ -1343,7 +1359,7 @@ function Ensure-ManagedGarnetRuntime {
     Save-GarnetRuntimeManifest
     $runtime = Resolve-ManagedGarnetRuntime
     if (-not $runtime) {
-        Stop-WithError "Microsoft Garnet was installed but could not run with the project-private .NET runtime."
+        Stop-WithError "Project-patched Garnet was installed but failed runtime verification. Check the package and project-private .NET runtime."
     }
     Write-Info "Managed Garnet runtime ready: $GarnetServerExecutable"
     return $runtime
@@ -1715,7 +1731,7 @@ function Get-ManagedGarnetProcesses {
     $processRowMap = New-ProcessRowMap -ProcessRows $processRows
     $managed = @()
     foreach ($process in @(Get-Process -Name "GarnetServer" -ErrorAction SilentlyContinue | Where-Object {
-        $_.Path -and $_.Path.Equals($GarnetServerExecutable, [StringComparison]::OrdinalIgnoreCase)
+        Test-ManagedGarnetImagePath -Path $_.Path
     })) {
         $record = $records | Where-Object { [int]$_.pid -eq $process.Id } | Select-Object -First 1
         if ($record -and (Test-ServiceRecordOwnsProcess -Record $record -ProcessRows $processRows -ProcessRowMap $processRowMap)) {
@@ -1828,13 +1844,13 @@ function Test-ServiceRecordOwnsProcess {
     }
 
     if ($Record.name -eq "garnet") {
-        if (-not ($process.Path -and $process.Path.Equals($GarnetServerExecutable, [StringComparison]::OrdinalIgnoreCase))) {
+        if (-not (Test-ManagedGarnetImagePath -Path $process.Path)) {
             return $false
         }
         if ($ProcessRowMap.ContainsKey($processId)) {
             return (Test-ProjectManagedCommandLine -CommandLine ([string]$ProcessRowMap[$processId].CommandLine))
         }
-        return $true
+        return $false
     }
 
     if ($Record.name -eq "garnet-checkpoint") {
@@ -1996,15 +2012,31 @@ function Stop-ProcessTree {
     finally { $process.Dispose() }
 }
 
+function Test-ManagedGarnetImagePath {
+    param([string]$Path)
+    try {
+        return (Test-SamePath -Left $Path -Right $GarnetServerExecutable) -or
+            (Test-SamePath -Left $Path -Right (Join-Path $DefaultRuntimeRoot "garnet\$GarnetVersion\net10.0\GarnetServer.exe"))
+    }
+    catch {
+        return $false
+    }
+}
+
 function Test-ProjectManagedCommandLine {
     param([string]$CommandLine)
     if (-not $CommandLine) {
         return $false
     }
 
-    if ($CommandLine.IndexOf($GarnetServerExecutable, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-        $CommandLine.IndexOf($GarnetCheckpointDir, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-        return $true
+    $image = [regex]::Match($CommandLine, '^\s*(?:"([^"]+)"|([^\s"]+))')
+    $imagePath = if ($image.Groups[1].Success) { $image.Groups[1].Value } else { $image.Groups[2].Value }
+    if ([System.IO.Path]::GetFileName($imagePath) -ieq "GarnetServer.exe") {
+        if (-not (Test-ManagedGarnetImagePath -Path $imagePath)) { return $false }
+        $checkpoint = [regex]::Matches($CommandLine, '(?:^|\s)--checkpointdir(?:\s+|=)(?:"([^"]+)"|([^\s"]+))(?=\s|$)')
+        if ($checkpoint.Count -ne 1) { return $false }
+        $checkpointPath = if ($checkpoint[0].Groups[1].Success) { $checkpoint[0].Groups[1].Value } else { $checkpoint[0].Groups[2].Value }
+        return (Test-SamePath -Left $checkpointPath -Right $GarnetCheckpointDir)
     }
 
     $projectProcessPattern = [regex]::Escape($ProjectRoot)
@@ -2490,7 +2522,25 @@ function Ensure-NodeRuntime {
     return $npm
 }
 
+function Assert-ManagedGarnetRuntimeCurrent {
+    param([object[]]$Processes)
+    if (-not $Processes) { return }
+    foreach ($process in $Processes) {
+        if (-not (Test-SamePath -Left $process.Path -Right $GarnetServerExecutable)) {
+            Stop-WithError "An older project-managed Garnet runtime is running. Run darkweb stop, then darkweb start to activate $GarnetRuntimeRevision."
+        }
+    }
+    if (-not (Resolve-ManagedGarnetRuntime)) {
+        Stop-WithError "The running project-managed Garnet runtime failed verification. Run darkweb stop, then darkweb start to repair $GarnetRuntimeRevision."
+    }
+}
+
 function Ensure-RedisRuntime {
+    $managedGarnet = @()
+    if ($RedisUrl -eq $ManagedGarnetRedisUrl) {
+        $managedGarnet = @(Get-ManagedGarnetProcesses)
+        Assert-ManagedGarnetRuntimeCurrent -Processes $managedGarnet
+    }
     if (Test-RedisReady) {
         if ($RedisUrl -eq $LegacyManagedRedisUrl -and (Test-ProjectOwnedRedisEnvironment)) {
             Write-Info "Migrating the project-owned legacy Redis endpoint to managed Garnet."
@@ -2498,7 +2548,7 @@ function Ensure-RedisRuntime {
             Set-Item -Path "Env:REDIS_URL" -Value $ManagedGarnetRedisUrl
         }
         else {
-            if (@((Get-ManagedGarnetProcesses)).Count -gt 0) {
+            if ($managedGarnet.Count -gt 0) {
                 $script:RedisProvider = "garnet"
             }
             return
@@ -3033,18 +3083,22 @@ print(",".join(config.site_name for config in configs))
 }
 
 function Ensure-Redis {
+    $managedGarnet = @()
+    if ($RedisUrl -eq $ManagedGarnetRedisUrl) {
+        $managedGarnet = @(Get-ManagedGarnetProcesses)
+        Assert-ManagedGarnetRuntimeCurrent -Processes $managedGarnet
+    }
     if (Test-RedisReady) {
         Write-Info "Redis is already running"
-        $managedGarnet = @(Get-ManagedGarnetProcesses) | Select-Object -First 1
         if ($managedGarnet) {
             Set-ManagedGarnetCpuLimit -Process $managedGarnet -ExpectedExecutable $GarnetServerExecutable
             $script:RedisProvider = "garnet"
             return [pscustomobject]@{
                 name = "garnet"
-                pid = $managedGarnet.Id
+                pid = $managedGarnet[0].Id
                 log = Join-Path $LogDir "garnet.log"
                 error_log = Join-Path $LogDir "garnet-error.log"
-                started_at = $managedGarnet.StartTime.ToString("s")
+                started_at = $managedGarnet[0].StartTime.ToString("s")
             }
         }
         return $null
@@ -3062,7 +3116,7 @@ function Ensure-Redis {
     Ensure-Directory $runtime.DataRoot
     Ensure-Directory $runtime.CheckpointDir
 
-    Write-Info "Starting managed Microsoft Garnet $GarnetVersion"
+    Write-Info "Starting project-patched Garnet $GarnetRuntimeRevision"
     $record = Start-ManagedGarnetProcess -Runtime $runtime -Port $endpoint.Port
     if (-not (Wait-ForRedis -TimeoutSeconds $ServiceWaitSeconds)) {
         if (Test-ProcessRunning -ProcessId ([int]$record.pid)) {
@@ -3468,7 +3522,7 @@ function Uninstall-Darkweb {
     Remove-ManagedPath -Path $DefaultTorBridgeAutoRuntimeDir -ExpectedPath (Join-Path $DefaultUserDataDir "tor_bridge_runtime_auto") -Label "Tor bridge probe runtime files" -WhatIf:$WhatIfPreference -Confirm:$false
     Remove-ManagedPath -Path $DefaultTorExpertRoot -ExpectedPath (Join-Path $DefaultUserDataDir "tor-expert") -Label "project Tor Expert Bundle" -WhatIf:$WhatIfPreference -Confirm:$false
     Remove-ManagedPath -Path $DefaultNpmCacheDir -ExpectedPath (Join-Path $DefaultUserDataDir "npm-cache") -Label "project npm cache" -WhatIf:$WhatIfPreference -Confirm:$false
-    Remove-ManagedPath -Path $GarnetRuntimeRoot -ExpectedPath (Join-Path $DefaultRuntimeRoot "garnet\$GarnetVersion") -Label "managed Garnet runtime" -WhatIf:$WhatIfPreference -Confirm:$false
+    Remove-ManagedPath -Path $GarnetRuntimeRoot -ExpectedPath (Join-Path $DefaultRuntimeRoot "garnet\$GarnetRuntimeRevision") -Label "managed Garnet runtime" -WhatIf:$WhatIfPreference -Confirm:$false
     Remove-ManagedPath -Path $GarnetDotnetRoot -ExpectedPath (Join-Path $DefaultRuntimeRoot "dotnet\$GarnetDotnetVersion") -Label "managed Garnet .NET runtime" -WhatIf:$WhatIfPreference -Confirm:$false
     Remove-ManagedPath -Path $GarnetRuntimeManifest -ExpectedPath (Join-Path $DefaultUserDataDir "garnet-runtime.json") -Label "managed Garnet runtime manifest" -WhatIf:$WhatIfPreference -Confirm:$false
     Remove-EmptyManagedDirectory -Path (Join-Path $DefaultRuntimeRoot "garnet") -ExpectedPath (Join-Path $DefaultRuntimeRoot "garnet") -WhatIf:$WhatIfPreference -Confirm:$false
@@ -3574,9 +3628,11 @@ function Show-Status {
     }
 
     $garnetRecord = $records | Where-Object { $_.name -eq "garnet" } | Select-Object -First 1
-    $garnetRunning = @((Get-ManagedGarnetProcesses)).Count -gt 0
+    $managedGarnet = @(Get-ManagedGarnetProcesses)
+    $garnetRunning = $managedGarnet.Count -gt 0
+    $garnetRevision = if (@($managedGarnet | Where-Object { -not (Test-SamePath -Left $_.Path -Right $GarnetServerExecutable) }).Count -gt 0) { "$GarnetVersion (upgrade to $GarnetRuntimeRevision required)" } else { $GarnetRuntimeRevision }
     if (Test-RedisReady) {
-        $provider = if ($garnetRunning) { "managed Garnet $GarnetVersion" } else { "external Redis-compatible service" }
+        $provider = if ($garnetRunning) { "managed Garnet $garnetRevision" } else { "external Redis-compatible service" }
         Write-Info "redis-compatible: up ($RedisUrl; $provider)"
     }
     else {
@@ -3584,7 +3640,7 @@ function Show-Status {
     }
     if ((Test-Path -LiteralPath $GarnetServerExecutable -PathType Leaf) -or $garnetRecord) {
         $garnetState = if ($garnetRunning) { "up" } else { "down" }
-        Write-Info "garnet: $garnetState (version $GarnetVersion; checkpoints $GarnetCheckpointDir)"
+        Write-Info "garnet: $garnetState (version $garnetRevision; checkpoints $GarnetCheckpointDir)"
     }
 
     Ensure-TorBridgeRuntime

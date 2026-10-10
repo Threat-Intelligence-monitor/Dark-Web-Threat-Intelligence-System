@@ -80,6 +80,10 @@ class SiteConfig:
         return int(self.extras.get("frontier_max_pending", 500))
 
     @property
+    def frontier_dispatch_window(self) -> int:
+        return 2 * self.max_concurrent_details
+
+    @property
     def frontier_lease_seconds(self) -> int:
         return max(3600, self.detail_slot_ttl_seconds)
 

@@ -683,6 +683,7 @@ const runtimeDbStatus = computed(() => jobsData.value.runtime_db || {})
 const browserRuntime = computed(() => jobsData.value.browser_runtime || {})
 const localBrowserPool = computed(() => browserRuntime.value.local_process_pool || {})
 const browserWorkerLabel = computed(() => {
+  if (browserRuntime.value.worker_status !== 'ready') return browserRuntime.value.worker_status === 'refreshing' ? '正在检查' : '状态未知'
   const workers = Number(browserRuntime.value.browser_worker_count || 0)
   const capacity = Number(browserRuntime.value.browser_concurrency || browserRuntime.value.configured_concurrency || 2)
   return `${workers}/${capacity}`

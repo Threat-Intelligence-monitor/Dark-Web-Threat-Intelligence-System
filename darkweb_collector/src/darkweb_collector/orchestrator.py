@@ -11,11 +11,13 @@ from darkweb_collector.adapters.registry import get_adapter
 from darkweb_collector.changan_auto_login import changan_auto_login_available, recover_changan_session
 from darkweb_collector.config import get_site_config, load_site_configs
 from darkweb_collector.crawl_frontier import (
+    DISPATCH_RESERVATION_SECONDS,
     begin_persist_frontier,
     claim_frontier,
     complete_frontier,
     fail_frontier,
-    list_frontier_candidates,
+    fail_frontier_dispatch,
+    mark_frontier_queued,
     observe_frontier,
     save_page_cursor,
     start_frontier,
@@ -178,24 +180,20 @@ def _dispatch_frontier_jobs(
     config: SiteConfig,
     detail_dispatcher: Callable[[SiteConfig, DetailTask], str | None] | None,
 ) -> tuple[list[str], int]:
-    if detail_dispatcher is None or config.max_detail_pages_per_run <= 0:
+    if detail_dispatcher is None or not config.enabled or config.max_detail_pages_per_run <= 0:
         return [], 0
-    with get_db_connection() as connection:
-        candidates = list_frontier_candidates(connection, config.site_name)
     dispatched: list[str] = []
     failed = 0
-    for candidate in candidates:
-        if len(dispatched) >= config.max_detail_pages_per_run or failed >= config.max_detail_pages_per_run:
-            break
+    while len(dispatched) + failed < config.max_detail_pages_per_run:
         token = str(uuid.uuid4())
         with get_db_connection() as connection:
             task = claim_frontier(
-                connection, config.site_name, candidate.target_url, token,
-                config.frontier_lease_seconds,
+                connection, config.site_name, None, token, DISPATCH_RESERVATION_SECONDS,
+                max_active=config.frontier_dispatch_window,
             )
             connection.commit()
         if task is None:
-            continue
+            break
         try:
             job_id = detail_dispatcher(config, task)
             if not job_id:
@@ -203,12 +201,15 @@ def _dispatch_frontier_jobs(
         except Exception:
             failed += 1
             with get_db_connection() as connection:
-                fail_frontier(
+                fail_frontier_dispatch(
                     connection, config.site_name, task.target_url, token,
-                    retry_seconds=60, error_message="dispatch_failed",
+                    error_message="dispatch_failed",
                 )
                 connection.commit()
             continue
+        with get_db_connection() as connection:
+            mark_frontier_queued(connection, config.site_name, task.target_url, token)
+            connection.commit()
         dispatched.append(str(job_id))
     return dispatched, failed
 

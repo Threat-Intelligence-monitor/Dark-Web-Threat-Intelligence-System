@@ -90,10 +90,10 @@ def collect_forum_seed(adapter, config: SiteConfig, list_parser, section_name) -
         more = _forum_pagination(html, url, page, len(identifiers))
         return parsed, html, more, signature, url
 
-    return collect_paginated_seed(adapter.site_name, config, fetch_page)
+    return collect_paginated_seed(adapter.site_name, config, fetch_page, plan_details=adapter.plan_details)
 
 
-def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page) -> SeedResult:
+def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, plan_details=None) -> SeedResult:
     """Read recent pages and a bounded, fair slice of persisted backfill cursors.
 
     fetch_page returns (parsed_section, raw_page, has_more, id_signature, url).
@@ -106,6 +106,8 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page) -> Se
     with get_db_connection() as connection:
         pending = count_frontier_pending(connection, site_name)
         cursors = {url: load_page_cursor(connection, site_name, url) for url in config.seed_urls}
+    capacity = max(0, min(limit, config.frontier_dispatch_window, config.max_detail_pages_per_run) - pending)
+    budget = min(budget, capacity)
     sections: dict[str, dict] = {}
     raw_pages: dict[str, str] = {}
     updates: dict[str, dict] = {}
@@ -114,6 +116,19 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page) -> Se
     seen_topics: set[str] = set()
     signatures: dict[str, set[str]] = {url: set() for url in config.seed_urls}
     pages_scanned = 0
+
+    def result() -> SeedResult:
+        return SeedResult(
+            site_name=site_name, collected_at_utc=collected_at,
+            payload={"site_name": site_name, "source_url": site_name, "collected_at_utc": collected_at,
+                     "section_count": len(sections), "topic_count": len(seen_topics), "sections": list(sections.values())},
+            raw_html_by_url=raw_pages,
+            metadata={"cursor_updates": list(updates.values()), "pagination_errors": errors,
+                      "pages_scanned": pages_scanned, "backfill_paused": pending >= min(limit, config.frontier_dispatch_window)},
+        )
+
+    def candidate_count() -> int:
+        return len(plan_details(result(), config)) if plan_details is not None and sections else 0
 
     def record_cursor(url: str, next_page: int, signature: str, completed: bool = False):
         # Preserve last-visit order so the next run starts with the least
@@ -157,7 +172,7 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page) -> Se
         })
         if not more:
             blocked.add(url)
-            record_cursor(url, recent_pages + 1, signature, completed=True)
+            record_cursor(url, max(page + 1, int(cursors[url].get("next_page") or 2)), signature, completed=True)
         elif lane == "backfill":
             record_cursor(url, page + 1, signature)
         return True
@@ -167,34 +182,31 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page) -> Se
             if not visit(url, page, "recent") or url in blocked:
                 break
 
+    recent_candidates = candidate_count()
+    if recent_candidates:
+        budget = 0
     active = sorted(
-        (url for url in config.seed_urls if url not in blocked),
+        (url for url in config.seed_urls if url not in blocked and not cursors[url].get("completed_at")),
         key=lambda url: (float(cursors[url].get("updated_at") or 0), int(cursors[url].get("next_page") or 2)),
     )
     next_pages = {
         url: max(recent_pages + 1, int(cursors[url].get("next_page") or 2)) for url in active
     }
-    while budget and active and pending < limit:
+    discovered = recent_candidates
+    while budget and active and discovered < capacity:
         following: list[str] = []
         for url in active:
-            if not budget:
+            if not budget or discovered >= capacity:
                 break
             budget -= 1
             page = next_pages[url]
             if visit(url, page, "backfill") and url not in blocked:
                 next_pages[url] = page + 1
                 following.append(url)
+            discovered = candidate_count()
         active = following
     if not pages_scanned and errors:
         raise RuntimeError(f"{site_name}: every listing request failed")
-    payload = {
-        "site_name": site_name, "source_url": site_name, "collected_at_utc": collected_at,
-        "section_count": len(sections), "topic_count": len(seen_topics), "sections": list(sections.values()),
-    }
-    return SeedResult(
-        site_name=site_name, collected_at_utc=collected_at, payload=payload, raw_html_by_url=raw_pages,
-        metadata={
-            "cursor_updates": list(updates.values()), "pagination_errors": errors,
-            "pages_scanned": pages_scanned, "backfill_paused": pending >= limit,
-        },
-    )
+    seed_result = result()
+    seed_result.metadata["backfill_paused"] = bool(recent_candidates or pending + discovered >= min(limit, config.frontier_dispatch_window))
+    return seed_result

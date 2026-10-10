@@ -67,7 +67,7 @@ class XforumsAdapter(DarkforumsAdapter):
             signature = hashlib.sha256("\n".join(identifiers).encode("utf-8")).hexdigest()
             return parsed, html, parsed["has_more"], signature, url
 
-        return collect_paginated_seed(self.site_name, config, fetch_page)
+        return collect_paginated_seed(self.site_name, config, fetch_page, plan_details=self.plan_details)
 
     def collect_detail(self, detail_task: DetailTask, config: SiteConfig, run_ctx: RunContext) -> DetailResult:
         restored = restore_detail_artifacts(
