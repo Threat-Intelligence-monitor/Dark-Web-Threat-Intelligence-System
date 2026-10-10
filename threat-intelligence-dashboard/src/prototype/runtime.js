@@ -1319,23 +1319,43 @@ export function initializePrototype() {
     }[String(value || '').toLowerCase()] || value || '未知')
 
     async function request(url, options = {}) {
-      const settings = { ...options, headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) } }
-      const response = await fetch(url, settings)
-      if (!response.ok) {
-        let message = `请求失败：${response.status}`
-        try {
-          const payload = await response.json()
-          const detail = payload.detail || payload.message
-          message = Array.isArray(detail)
-            ? detail.map((item) => item?.msg || String(item)).join('；')
-            : String(detail || message)
-        } catch {}
-        const error = new Error(message)
-        error.status = response.status
+      const controller = new AbortController()
+      const abort = () => controller.abort(options.signal.reason)
+      if (options.signal?.aborted) abort()
+      else options.signal?.addEventListener('abort', abort, { once: true })
+      let timedOut = false
+      const timeout = setTimeout(() => {
+        if (controller.signal.aborted) return
+        timedOut = true
+        controller.abort()
+      }, 30_000)
+      try {
+        const settings = { ...options, signal: controller.signal, headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) } }
+        const response = await fetch(url, settings)
+        if (!response.ok) {
+          let message = `请求失败：${response.status}`
+          try {
+            const payload = await response.json()
+            const detail = payload.detail || payload.message
+            message = Array.isArray(detail)
+              ? detail.map((item) => item?.msg || String(item)).join('；')
+              : String(detail || message)
+          } catch (error) {
+            if (controller.signal.aborted) throw error
+          }
+          const error = new Error(message)
+          error.status = response.status
+          throw error
+        }
+        const contentType = response.headers.get('content-type') || ''
+        return contentType.includes('application/json') ? await response.json() : null
+      } catch (error) {
+        if (timedOut) throw new Error(`请求超时：${url}，请检查采集服务状态`)
         throw error
+      } finally {
+        clearTimeout(timeout)
+        options.signal?.removeEventListener('abort', abort)
       }
-      const contentType = response.headers.get('content-type') || ''
-      return contentType.includes('application/json') ? response.json() : null
     }
 
     async function startPlatformLogin(platform) {
@@ -2836,7 +2856,9 @@ export function initializePrototype() {
       bindText('stale-jobs', Number(payload.stale_jobs || 0))
       const browser = payload.browser_runtime || {}
       const pool = browser.local_process_pool || {}
-      bindText('browser-workers', `${Number(browser.browser_worker_count || 0)}/${Number(browser.browser_concurrency || browser.configured_concurrency || 2)}`)
+      bindText('browser-workers', browser.worker_status === 'ready'
+        ? `${Number(browser.browser_worker_count || 0)}/${Number(browser.browser_concurrency || browser.configured_concurrency || 2)}`
+        : browser.worker_status === 'refreshing' ? '正在检查' : '状态未知')
       bindText('browser-pool', `${Number(pool.running_or_pending || 0)}/${Number(pool.max_workers || browser.browser_concurrency || 2)}`)
       const runtime = payload.runtime_db || {}
       const postgresActive = runtime.database_engine === 'postgresql'

@@ -1,0 +1,96 @@
+diff --git a/libs/server/Objects/ItemBroker/CollectionItemBroker.cs b/libs/server/Objects/ItemBroker/CollectionItemBroker.cs
+--- a/libs/server/Objects/ItemBroker/CollectionItemBroker.cs
++++ b/libs/server/Objects/ItemBroker/CollectionItemBroker.cs
+@@ -169,48 +169,12 @@
+         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+         internal void HandleCollectionUpdate(byte[] key)
+         {
+-            if (keysToObservers is null)
++            if (Volatile.Read(ref mainLoopTaskStatus) != MAIN_LOOP_STARTED ||
++                Volatile.Read(ref keysToObservers) is null || sessionIdToObserver.IsEmpty)
+                 return;
+-            HandleCollectionUpdateWorker(key);
+-        }
+-
+-        void HandleCollectionUpdateWorker(byte[] key)
+-        {
+-            ConcurrentQueue<CollectionItemObserver> observers;
+-
+-            keysToObserversLock.ReadLock();
+-            try
+-            {
+-                if (!keysToObservers.TryGetValue(key, out observers))
+-                    return;
+-            }
+-            finally
+-            {
+-                keysToObserversLock.ReadUnlock();
+-            }
+-
+-            // If the observer queue is empty, remove the key entry
+-            if (observers.IsEmpty)
+-            {
+-                keysToObserversLock.WriteLock();
+-                try
+-                {
+-                    if (!keysToObservers.TryGetValue(key, out observers))
+-                        return;
+-
+-                    if (observers.IsEmpty)
+-                    {
+-                        keysToObservers.Remove(key);
+-                        return;
+-                    }
+-                }
+-                finally
+-                {
+-                    keysToObserversLock.WriteUnlock();
+-                }
+-            }
+-
+-            // Add collection updated event to queue
++
++            // A producer may hold transaction key locks. Do not take the observer lock here:
++            // the broker loop takes it before acquiring key locks and cleans up empty queues.
+             brokerEventsQueue.Enqueue(CollectionItemBrokerEvent.CreateCollectionUpdatedEvent(key));
+         }
+ 
+@@ -261,9 +225,16 @@
+                 // Iterate over the keys in order, set the observer's result if collection in key contains an item
+                 foreach (var key in keys)
+                 {
+-                    // If the key already has a non-empty observer queue, it does not have an item to retrieve
+-                    if (keysToObservers.ContainsKey(key) && !keysToObservers[key].IsEmpty)
+-                        continue;
++                    // Expired observers must not suppress the initial probe, including WRONGTYPE errors.
++                    if (keysToObservers.TryGetValue(key, out var existingObservers))
++                    {
++                        while (existingObservers.TryPeek(out var existingObserver) &&
++                               existingObserver.Status != ObserverStatus.WaitingForResult)
++                            existingObservers.TryDequeue(out _);
++
++                        if (!existingObservers.IsEmpty)
++                            continue;
++                    }
+ 
+                     // The key has an empty observer queue, try to retrieve next available item
+                     if (!TryGetResult(key, observer.Session.storageSession, observer.Command, observer.CommandArgs, failOnSrcTypeMismatch: true,
+@@ -293,6 +264,11 @@
+             {
+                 keysToObserversLock.WriteUnlock();
+             }
++
++            // Updates may be skipped while no sessions are active but expired observers remain.
++            // Recheck after registration, using the normal FIFO assignment and cleanup path.
++            foreach (var key in keys)
++                TryAssignItemFromKey(key);
+         }
+ 
+         /// <summary>
+@@ -777,4 +753,4 @@
+             cts.Dispose();
+         }
+     }
+-}
+\ No newline at end of file
++}

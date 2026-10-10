@@ -6,12 +6,17 @@ import logging
 import time
 import uuid
 
+from celery.exceptions import Reject
+
 from darkweb_collector.celery_app import app
 from darkweb_collector.config import get_site_config
-from darkweb_collector.crawl_frontier import fail_frontier, renew_frontier, retry_frontier
+from darkweb_collector.crawl_frontier import (
+    accept_frontier_delivery, fail_frontier, fail_frontier_dispatch, mark_frontier_queued, retry_frontier,
+)
 from darkweb_collector.db import get_active_crawl_job, get_db_connection, get_latest_crawl_job
 from darkweb_collector.models import DetailTask, SiteConfig
 from darkweb_collector.orchestrator import (
+    _dispatch_frontier_jobs,
     execute_detail_job,
     execute_seed_job,
     mark_job_enqueued,
@@ -64,20 +69,25 @@ def _enqueue_detail_task(config: SiteConfig, detail_task: DetailTask) -> str | N
             },
             queue=queue_name,
             task_id=job_id,
+            priority=_detail_priority(detail_task),
         )
     except Exception as exc:
-        mark_job_finished(
-            job_id=job_id,
-            site_name=config.site_name,
-            job_type="detail",
-            queue_name=queue_name,
-            target=detail_task.target_url,
-            status="failed",
-            duration_ms=0,
-            error_message=str(exc),
-        )
+        if detail_task.metadata.get("frontier_token"):
+            with get_db_connection() as connection:
+                fail_frontier_dispatch(connection, config.site_name, detail_task.target_url, job_id)
+                connection.commit()
+        else:
+            mark_job_finished(
+                job_id=job_id, site_name=config.site_name, job_type="detail",
+                queue_name=queue_name, target=detail_task.target_url,
+                status="failed", duration_ms=0, error_message=str(exc),
+            )
         raise
     return str(async_result.id)
+
+
+def _detail_priority(detail_task: DetailTask) -> int:
+    return 9 if detail_task.metadata.get("discovery_lane") == "backfill" else 0
 
 
 def _slot_retry_seconds(config: SiteConfig, job_id: str) -> int:
@@ -103,6 +113,40 @@ def _mark_retry_enqueued(
         )
     except Exception:
         logger.exception("failed to mark retrying %s job as enqueued", job_type)
+
+
+def _retry_detail_task(task, config, detail_task, fetch_attempt, countdown, exc=None):
+    token = str(detail_task.metadata.get("frontier_token") or "")
+    try:
+        if token:
+            with get_db_connection() as connection:
+                retrying = retry_frontier(connection, config.site_name, detail_task.target_url, token)
+                connection.commit()
+            if not retrying:
+                return {"site_name": config.site_name, "detail_job_id": task.request.id, "reason": "stale_frontier"}
+        _mark_retry_enqueued(
+            job_id=task.request.id, site_name=config.site_name, job_type="detail",
+            queue_name=_queue_name_from_request(task), target=detail_task.target_url,
+        )
+        delivery = getattr(task.request, 'delivery_info', {}) or {}
+        priority = max(_detail_priority(detail_task), int(delivery.get('priority') or 0))
+        retry = task.retry(
+            exc=exc, countdown=countdown, max_retries=None, throw=False,
+            priority=priority,
+            kwargs={"site_name": config.site_name, "detail_task_payload": detail_task.to_dict(),
+                    "fetch_attempt": fetch_attempt},
+        )
+        if token:
+            with get_db_connection() as connection:
+                mark_frontier_queued(connection, config.site_name, detail_task.target_url, token)
+                connection.commit()
+    except Exception:
+        if token:
+            with get_db_connection() as connection:
+                fail_frontier_dispatch(connection, config.site_name, detail_task.target_url, token)
+                connection.commit()
+        raise
+    raise retry
 
 
 def _save_ransomware_live_status(payload: dict[str, object]) -> None:
@@ -347,13 +391,21 @@ def crawl_detail(
     queue_name = _queue_name_from_request(self)
     frontier_token = str(detail_task.metadata.get("frontier_token") or "")
     if frontier_token:
-        with get_db_connection() as connection:
-            renewed = renew_frontier(
-                connection, site_name, detail_task.target_url, frontier_token,
-                config.frontier_lease_seconds,
-            )
-            connection.commit()
-        if not renewed:
+        try:
+            with get_db_connection() as connection:
+                admission = accept_frontier_delivery(
+                    connection, site_name, detail_task.target_url, frontier_token,
+                )
+                connection.commit()
+        except Exception as error:
+            raise Reject(error, requeue=True) from error
+        if admission == 'returned':
+            try:
+                _dispatch_frontier_jobs(config, _enqueue_detail_task)
+            except Exception:
+                logger.exception("failed to refill detail window for %s", site_name)
+            return {"site_name": site_name, "detail_job_id": self.request.id, "reason": "legacy_deferred"}
+        if admission == 'stale':
             return {"site_name": site_name, "detail_job_id": self.request.id, "reason": "stale_frontier"}
     state_store = get_state_store(prefer_redis=True)
     slot_owner = f"{self.request.id}:{getattr(self.request, 'hostname', '') or 'worker'}"
@@ -365,17 +417,15 @@ def crawl_detail(
             config.detail_slot_ttl_seconds,
         )
     except Exception as exc:
-        raise self.retry(
-            exc=exc,
-            countdown=_slot_retry_seconds(config, slot_owner),
-            max_retries=None,
+        return _retry_detail_task(
+            self, config, detail_task, fetch_attempt, _slot_retry_seconds(config, slot_owner), exc,
         )
     if not slot_acquired:
-        raise self.retry(
-            countdown=_slot_retry_seconds(config, slot_owner),
-            max_retries=None,
+        return _retry_detail_task(
+            self, config, detail_task, fetch_attempt, _slot_retry_seconds(config, slot_owner),
         )
     start_perf = time.perf_counter()
+    refill = False
     try:
         if not frontier_token:
             mark_job_running(
@@ -394,6 +444,7 @@ def crawl_detail(
         )
         if result.get("reason") == "stale_frontier":
             return result
+        refill = True
     except SiteAuthenticationRequired as exc:
         if frontier_token:
             with get_db_connection() as connection:
@@ -423,31 +474,8 @@ def crawl_detail(
     except Exception as exc:
         duration_ms = int((time.perf_counter() - start_perf) * 1000)
         if fetch_attempt < MAX_RETRIES:
-            if frontier_token:
-                with get_db_connection() as connection:
-                    retrying = retry_frontier(
-                        connection, site_name, detail_task.target_url, frontier_token,
-                        config.frontier_lease_seconds,
-                    )
-                    connection.commit()
-                if not retrying:
-                    return {"site_name": site_name, "detail_job_id": self.request.id, "reason": "stale_frontier"}
-            _mark_retry_enqueued(
-                job_id=self.request.id,
-                site_name=site_name,
-                job_type="detail",
-                queue_name=queue_name,
-                target=detail_task.target_url,
-            )
-            raise self.retry(
-                exc=exc,
-                countdown=retry_backoff_seconds(fetch_attempt),
-                kwargs={
-                    "site_name": site_name,
-                    "detail_task_payload": detail_task_payload,
-                    "fetch_attempt": fetch_attempt + 1,
-                },
-                max_retries=None,
+            return _retry_detail_task(
+                self, config, detail_task, fetch_attempt + 1, retry_backoff_seconds(fetch_attempt), exc,
             )
         if frontier_token:
             with get_db_connection() as connection:
@@ -456,6 +484,7 @@ def crawl_detail(
                     retry_seconds=max(60, config.effective_interval_seconds), error_message="detail_failed",
                 )
                 connection.commit()
+            refill = True
         mark_job_finished(
             job_id=self.request.id,
             site_name=site_name,
@@ -472,6 +501,11 @@ def crawl_detail(
             state_store.release_detail_slot(site_name, slot_owner)
         except Exception:
             logger.exception("failed to release detail slot for %s", site_name)
+        if frontier_token and refill:
+            try:
+                _dispatch_frontier_jobs(config, _enqueue_detail_task)
+            except Exception:
+                logger.exception("failed to refill detail window for %s", site_name)
     duration_ms = int((time.perf_counter() - start_perf) * 1000)
     mark_job_finished(
         job_id=self.request.id,

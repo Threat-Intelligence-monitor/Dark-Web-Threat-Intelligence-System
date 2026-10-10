@@ -58,6 +58,7 @@ DEFAULT_CODE_MONITORING_CONTINUOUS_SEARCH_PAGE_LIMIT = 2
 DEFAULT_CODE_MONITORING_CONTINUOUS_MAX_RESULTS_PER_TERM = 5
 DEFAULT_NETDISK_MONITORING_INTERVAL_SECONDS = 3600
 WORKER_QUEUE_CACHE_TTL_SECONDS = 5
+WORKER_QUEUE_REFRESH_WAIT_SECONDS = 15
 SITE_CONNECTIVITY_PROBE_INTERVAL_SECONDS = 24 * 60 * 60
 SITE_CONNECTIVITY_MONITOR_POLL_SECONDS = 10 * 60
 
@@ -114,6 +115,8 @@ _netdisk_monitoring_tasks: dict[int, dict[str, Any]] = {}
 
 _worker_queue_cache_lock = Lock()
 _worker_queue_cache_checked_at = 0.0
+_worker_queue_cache_refresh_started_at = 0.0
+_worker_queue_cache_available = False
 _worker_queue_cache: set[str] = set()
 _worker_queue_worker_counts: dict[str, int] = {}
 _worker_queue_worker_names: dict[str, list[str]] = {}
@@ -326,17 +329,16 @@ def _mark_stale_active_job(site_name: str, active_job: dict[str, Any] | None) ->
         connection.commit()
 
 
-def _refresh_worker_queue_cache() -> tuple[set[str], dict[str, int], dict[str, list[str]]]:
+def _refresh_worker_queue_cache() -> tuple[set[str], dict[str, int], dict[str, list[str]]] | None:
     try:
         from darkweb_collector.celery_app import app as celery_app
-    except Exception:
-        return set(), {}, {}
 
-    inspect = celery_app.control.inspect(timeout=0.8)
-    try:
-        active_queues = inspect.active_queues() or {}
+        inspect = celery_app.control.inspect(timeout=0.8)
+        active_queues = inspect.active_queues()
     except Exception:
-        active_queues = {}
+        return None
+    if not active_queues:
+        return None
     queue_names: set[str] = set()
     worker_counts: dict[str, int] = {}
     worker_names: dict[str, list[str]] = {}
@@ -350,45 +352,44 @@ def _refresh_worker_queue_cache() -> tuple[set[str], dict[str, int], dict[str, l
     return queue_names, worker_counts, {name: sorted(names) for name, names in worker_names.items()}
 
 
-def _refresh_worker_queue_cache_if_needed(*, force: bool = False) -> None:
-    global _worker_queue_cache_checked_at, _worker_queue_cache, _worker_queue_worker_counts, _worker_queue_worker_names
-    now = time.monotonic()
-    if force or (now - _worker_queue_cache_checked_at) > WORKER_QUEUE_CACHE_TTL_SECONDS:
-        (
-            _worker_queue_cache,
-            _worker_queue_worker_counts,
-            _worker_queue_worker_names,
-        ) = _refresh_worker_queue_cache()
-        _worker_queue_cache_checked_at = now
-
-
 def _refresh_worker_queue_cache_in_background() -> None:
     global _worker_queue_cache_checked_at, _worker_queue_cache, _worker_queue_worker_counts, _worker_queue_worker_names
-    queues, worker_counts, worker_names = _refresh_worker_queue_cache()
-    with _worker_queue_cache_lock:
-        _worker_queue_cache = queues
-        _worker_queue_worker_counts = worker_counts
-        _worker_queue_worker_names = worker_names
-        _worker_queue_cache_checked_at = time.monotonic()
+    global _worker_queue_cache_available, _worker_queue_refresh_thread, _worker_queue_cache_refresh_started_at
+    snapshot = None
+    try:
+        snapshot = _refresh_worker_queue_cache()
+    finally:
+        with _worker_queue_cache_lock:
+            if snapshot is not None:
+                _worker_queue_cache, _worker_queue_worker_counts, _worker_queue_worker_names = snapshot
+            _worker_queue_cache_available = snapshot is not None
+            _worker_queue_cache_checked_at = time.monotonic()
+            _worker_queue_cache_refresh_started_at = 0.0
+            _worker_queue_refresh_thread = None
 
 
 def _schedule_worker_queue_cache_refresh() -> None:
-    global _worker_queue_refresh_thread
+    global _worker_queue_refresh_thread, _worker_queue_cache_refresh_started_at
     with _worker_queue_cache_lock:
-        cache_is_fresh = (time.monotonic() - _worker_queue_cache_checked_at) <= WORKER_QUEUE_CACHE_TTL_SECONDS
-        if cache_is_fresh or (_worker_queue_refresh_thread and _worker_queue_refresh_thread.is_alive()):
+        now = time.monotonic()
+        cache_is_fresh = _worker_queue_cache_checked_at > 0 and (now - _worker_queue_cache_checked_at) <= WORKER_QUEUE_CACHE_TTL_SECONDS
+        if cache_is_fresh or _worker_queue_refresh_thread is not None:
             return
         _worker_queue_refresh_thread = Thread(
             target=_refresh_worker_queue_cache_in_background,
             name="worker-queue-status-refresh",
             daemon=True,
         )
+        _worker_queue_cache_refresh_started_at = now
         _worker_queue_refresh_thread.start()
 
 
 def _has_queue_worker(queue_name: str) -> bool:
+    _schedule_worker_queue_cache_refresh()
     with _worker_queue_cache_lock:
-        _refresh_worker_queue_cache_if_needed()
+        # Unknown or refreshing state must not start a second local collector.
+        if not _worker_queue_cache_available or _worker_queue_refresh_thread is not None:
+            return True
         return queue_name in _worker_queue_cache
 
 
@@ -614,6 +615,10 @@ def get_browser_runtime_status() -> dict[str, Any]:
         worker_queues = sorted(_worker_queue_cache)
         worker_counts = dict(_worker_queue_worker_counts)
         worker_names = {name: list(names) for name, names in _worker_queue_worker_names.items()}
+        worker_status = "ready" if _worker_queue_cache_available else "unknown"
+        if _worker_queue_refresh_thread is not None:
+            elapsed = time.monotonic() - _worker_queue_cache_refresh_started_at
+            worker_status = "refreshing" if elapsed < WORKER_QUEUE_REFRESH_WAIT_SECONDS else "unknown"
     browser_worker_names = sorted(
         {
             worker_name
@@ -637,6 +642,7 @@ def get_browser_runtime_status() -> dict[str, Any]:
         "local_process_pool": browser_process_pool_status(),
         "worker_queues": worker_queues,
         "worker_counts": worker_counts,
+        "worker_status": worker_status,
     }
 
 

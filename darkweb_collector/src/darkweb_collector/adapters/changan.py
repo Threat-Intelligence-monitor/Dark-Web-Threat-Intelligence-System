@@ -201,7 +201,7 @@ class ChanganAdapter(SiteAdapter):
             url = f"{base_url}/api/category/goods?{urlencode(params)}"
             return section, json.dumps(stored_raw, ensure_ascii=False, indent=2), more, signature, url
 
-        return collect_paginated_seed(self.site_name, config, fetch_page)
+        return collect_paginated_seed(self.site_name, config, fetch_page, plan_details=self.plan_details)
 
     def plan_details(self, seed_result: SeedResult, config: SiteConfig) -> list[DetailTask]:
         tasks: list[DetailTask] = []

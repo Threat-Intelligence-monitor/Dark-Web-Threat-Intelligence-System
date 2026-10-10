@@ -19,6 +19,17 @@ app = Celery(
 )
 
 app.conf.update(
+    broker_connection_timeout=3,
+    broker_transport_options={
+        "socket_connect_timeout": 3,
+        "socket_timeout": 5,
+        "retry_on_timeout": False,
+        "max_retries": 1,
+    },
+    redis_socket_connect_timeout=3,
+    redis_socket_timeout=5,
+    redis_retry_on_timeout=False,
+    result_backend_transport_options={"retry_policy": {"max_retries": 1, "interval_start": 0.2}},
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     task_serializer="json",

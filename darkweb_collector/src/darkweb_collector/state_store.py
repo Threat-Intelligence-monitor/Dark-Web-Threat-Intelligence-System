@@ -80,7 +80,13 @@ class RedisStateStore:
             import redis
         except ImportError as exc:
             raise RuntimeError("redis package is required for Redis-backed queue state") from exc
-        self._client = redis.Redis.from_url(self._redis_url, decode_responses=True)
+        self._client = redis.Redis.from_url(
+            self._redis_url,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=5,
+            retry_on_timeout=False,
+        )
 
     def _claim(self, key: str, ttl_seconds: int) -> bool:
         return bool(self._client.set(key, "1", nx=True, ex=max(ttl_seconds, 1)))
@@ -102,7 +108,7 @@ class RedisStateStore:
         max_concurrent: int,
         ttl_seconds: int,
     ) -> bool:
-        from redis.exceptions import WatchError
+        from redis.exceptions import ConnectionError, TimeoutError, WatchError
 
         key = self._detail_slot_key(site_name)
         ttl = max(ttl_seconds, 1)
@@ -125,7 +131,9 @@ class RedisStateStore:
                     pipeline.expire(key, ttl * 2)
                     pipeline.execute()
                     return True
-                except WatchError:
+                except WatchError as exc:
+                    if isinstance(exc.__cause__ or exc.__context__, (ConnectionError, TimeoutError)):
+                        raise
                     continue
 
     def release_detail_slot(self, site_name: str, owner: str) -> None:
