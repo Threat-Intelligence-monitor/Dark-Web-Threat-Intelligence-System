@@ -1338,15 +1338,6 @@ function Ensure-ManagedGarnetRuntime {
     }
 
     Install-VerifiedZipRuntime `
-        -Label "Microsoft .NET Runtime $GarnetDotnetVersion" `
-        -Url $GarnetDotnetArchiveUrl `
-        -ExpectedHash $GarnetDotnetArchiveSha512 `
-        -HashAlgorithm "SHA512" `
-        -TargetRoot $GarnetDotnetRoot `
-        -RequiredRelativePath "dotnet.exe" `
-        -SourceArchivePath ([string]$env:DARKWEB_DOTNET_RUNTIME_ARCHIVE_PATH) `
-        -ForceRepair | Out-Null
-    Install-VerifiedZipRuntime `
         -Label "Project-patched Garnet $GarnetRuntimeRevision" `
         -Url $GarnetArchiveUrl `
         -ExpectedHash $GarnetArchiveSha256 `
@@ -1358,6 +1349,19 @@ function Ensure-ManagedGarnetRuntime {
 
     Save-GarnetRuntimeManifest
     $runtime = Resolve-ManagedGarnetRuntime
+    if (-not $runtime) {
+        Install-VerifiedZipRuntime `
+            -Label "Microsoft .NET Runtime $GarnetDotnetVersion" `
+            -Url $GarnetDotnetArchiveUrl `
+            -ExpectedHash $GarnetDotnetArchiveSha512 `
+            -HashAlgorithm "SHA512" `
+            -TargetRoot $GarnetDotnetRoot `
+            -RequiredRelativePath "dotnet.exe" `
+            -SourceArchivePath ([string]$env:DARKWEB_DOTNET_RUNTIME_ARCHIVE_PATH) `
+            -ForceRepair | Out-Null
+        Save-GarnetRuntimeManifest
+        $runtime = Resolve-ManagedGarnetRuntime
+    }
     if (-not $runtime) {
         Stop-WithError "Project-patched Garnet was installed but failed runtime verification. Check the package and project-private .NET runtime."
     }
@@ -3128,6 +3132,16 @@ function Ensure-Redis {
 }
 
 function Ensure-RedisCanStart {
+    if ($Action -eq "prepare-update" -and $RedisUrl -eq $ManagedGarnetRedisUrl) {
+        $previousGarnet = @(Get-ManagedGarnetProcesses | Where-Object {
+            -not (Test-SamePath -Left $_.Path -Right $GarnetServerExecutable)
+        })
+        if ($previousGarnet.Count -gt 0) {
+            Ensure-ManagedGarnetRuntime | Out-Null
+            Write-Info "Prepared project-patched Garnet $GarnetRuntimeRevision alongside the running previous runtime."
+            return
+        }
+    }
     Ensure-RedisRuntime
 }
 

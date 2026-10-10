@@ -1,2 +1,2 @@
 *.sh text eol=lf
-patches/garnet/*.patch -whitespace
+patches/garnet/*.patch text eol=lf -whitespace
