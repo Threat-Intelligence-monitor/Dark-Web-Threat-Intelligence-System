@@ -246,17 +246,19 @@ $DefaultTorBridgeAutoRuntimeDir = Join-Path $DefaultUserDataDir "tor_bridge_runt
 $DefaultNpmCacheDir = Join-Path $DefaultUserDataDir "npm-cache"
 $DefaultRuntimeRoot = Join-Path $DefaultUserDataDir "runtimes"
 $GarnetVersion = "2.2.1"
-$GarnetRuntimeRevision = "2.2.1-dwti.2"
-$GarnetArchiveUrl = "https://github.com/Threat-Intelligence-monitor/Dark-Web-Threat-Intelligence-System/releases/download/garnet-2.2.1-dwti.2/garnet-2.2.1-dwti.2-win-x64.zip"
-$GarnetArchiveSha256 = "88e449bc00b7ab9d5ffb09abd61994a541cf70b6da620699f22a4947d3ec8c0c"
-$GarnetServerSha256 = "9c81c0beade4cbcabce9681e3c16d5dbf01c5e21eb809eb36953a1bb6fe4ae05"
-$GarnetServerAssemblySha256 = "2634c33be0e3972f0d427fb2c8c16c4cea3e4f5c48db03a7352ad8f8a5eeaef8"
-$GarnetCommonAssemblySha256 = "efb5a496f3bf73cb0d43915623b92778b1fe5773d75119c0d61e1187a497a528"
+$GarnetRuntimeRevision = "2.2.1-dwti.3"
+$GarnetArchiveUrl = "https://github.com/Threat-Intelligence-monitor/Dark-Web-Threat-Intelligence-System/releases/download/garnet-2.2.1-dwti.3/garnet-2.2.1-dwti.3-win-x64.zip"
+$GarnetArchiveSha256 = "8ec7bd6262d43d22fa9d6c58fef07ef8f53e5fd4d67b281452a71c792b198fa4"
+$GarnetServerSha256 = "d6dc88fe976cf09a23e58139855d0d1cea8ce17b17211e13fc78289fb7b237a6"
+$GarnetServerAssemblySha256 = "58a9dd9c8fc43ea37edca953810c661c802b51f3b13dfcd4716d51cabb29a77c"
+$GarnetCommonAssemblySha256 = "e2724ed09c8e78d604a365327d5025ac3823db4fef6bbc273523d25e9c55275b"
+$GarnetCoreAssemblySha256 = "9348db40a13c5361dc50bfb516094c41ff6c4b09f3f2ffed93a61f8b4bac4c17"
 $GarnetSourceUrl = "https://github.com/microsoft/garnet/tree/b0255a31de95b1e903ee187feb59ceb04819a639"
 $GarnetRuntimeRoot = Join-Path $DefaultRuntimeRoot "garnet\$GarnetRuntimeRevision"
 $GarnetServerExecutable = Join-Path $GarnetRuntimeRoot "net10.0\GarnetServer.exe"
 $GarnetServerAssembly = Join-Path $GarnetRuntimeRoot "net10.0\Garnet.server.dll"
 $GarnetCommonAssembly = Join-Path $GarnetRuntimeRoot "net10.0\Garnet.common.dll"
+$GarnetCoreAssembly = Join-Path $GarnetRuntimeRoot "net10.0\Tsavorite.core.dll"
 $GarnetDotnetVersion = "10.0.11"
 $GarnetDotnetArchiveUrl = "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.11/dotnet-runtime-10.0.11-win-x64.zip"
 $GarnetDotnetArchiveSha512 = "d9ab9c0d9916b8fa3585b5f403057f594ffffb8364dac09e0007dd8ac671c86754935b980d8fb5da83cb1b82ac3cd57cc407c969e6d837aaa2fae21047cb7448"
@@ -1248,6 +1250,7 @@ function Save-GarnetRuntimeManifest {
         server_executable_sha256 = $GarnetServerSha256
         server_assembly_sha256 = $GarnetServerAssemblySha256
         common_assembly_sha256 = $GarnetCommonAssemblySha256
+        core_assembly_sha256 = $GarnetCoreAssemblySha256
         dotnet_version = $GarnetDotnetVersion
         dotnet_archive_sha512 = $GarnetDotnetArchiveSha512
         dotnet_executable_sha256 = $GarnetDotnetExecutableSha256
@@ -1271,6 +1274,7 @@ function Resolve-ManagedGarnetRuntime {
     if (-not ((Test-Path -LiteralPath $GarnetServerExecutable -PathType Leaf) -and
         (Test-Path -LiteralPath $GarnetServerAssembly -PathType Leaf) -and
         (Test-Path -LiteralPath $GarnetCommonAssembly -PathType Leaf) -and
+        (Test-Path -LiteralPath $GarnetCoreAssembly -PathType Leaf) -and
         (Test-Path -LiteralPath $GarnetDotnetExecutable -PathType Leaf) -and
         (Test-Path -LiteralPath $GarnetRuntimeManifest -PathType Leaf))) {
         return $null
@@ -1288,6 +1292,7 @@ function Resolve-ManagedGarnetRuntime {
             $manifest.server_executable_sha256 -ne $GarnetServerSha256 -or
             $manifest.server_assembly_sha256 -ne $GarnetServerAssemblySha256 -or
             $manifest.common_assembly_sha256 -ne $GarnetCommonAssemblySha256 -or
+            $manifest.core_assembly_sha256 -ne $GarnetCoreAssemblySha256 -or
             $manifest.dotnet_version -ne $GarnetDotnetVersion -or
             $manifest.dotnet_archive_sha512 -ne $GarnetDotnetArchiveSha512 -or
             $manifest.dotnet_executable_sha256 -ne $GarnetDotnetExecutableSha256) {
@@ -1296,6 +1301,7 @@ function Resolve-ManagedGarnetRuntime {
         if ((Get-FileHash -LiteralPath $GarnetServerExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $GarnetServerSha256 -or
             (Get-FileHash -LiteralPath $GarnetServerAssembly -Algorithm SHA256).Hash.ToLowerInvariant() -ne $GarnetServerAssemblySha256 -or
             (Get-FileHash -LiteralPath $GarnetCommonAssembly -Algorithm SHA256).Hash.ToLowerInvariant() -ne $GarnetCommonAssemblySha256 -or
+            (Get-FileHash -LiteralPath $GarnetCoreAssembly -Algorithm SHA256).Hash.ToLowerInvariant() -ne $GarnetCoreAssemblySha256 -or
             (Get-FileHash -LiteralPath $GarnetDotnetExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $GarnetDotnetExecutableSha256) {
             return $null
         }
@@ -2026,6 +2032,7 @@ function Test-ManagedGarnetImagePath {
     param([string]$Path)
     try {
         return (Test-SamePath -Left $Path -Right $GarnetServerExecutable) -or
+            (Test-SamePath -Left $Path -Right (Join-Path $DefaultRuntimeRoot "garnet\2.2.1-dwti.2\net10.0\GarnetServer.exe")) -or
             (Test-SamePath -Left $Path -Right (Join-Path $DefaultRuntimeRoot "garnet\2.2.1-dwti.1\net10.0\GarnetServer.exe")) -or
             (Test-SamePath -Left $Path -Right (Join-Path $DefaultRuntimeRoot "garnet\$GarnetVersion\net10.0\GarnetServer.exe"))
     }

@@ -435,3 +435,249 @@ diff --git a/libs/server/Resp/AsyncProcessor.cs b/libs/server/Resp/AsyncProcesso
 -}
 \ No newline at end of file
 +}
+diff --git a/libs/server/AOF/ReplayCoordinator/AofReplayCoordinator.cs b/libs/server/AOF/ReplayCoordinator/AofReplayCoordinator.cs
+--- a/libs/server/AOF/ReplayCoordinator/AofReplayCoordinator.cs
++++ b/libs/server/AOF/ReplayCoordinator/AofReplayCoordinator.cs
+@@ -242,6 +242,9 @@
+                 // U
+                 void UpdateMaxSequenceNumberFromHeader()
+                 {
++                    if (!serverOptions.MultiLogEnabled)
++                        return;
++
+                     var headerType = (*(AofHeader*)ptr).HeaderType;
+                     long sequenceNumber;
+                     switch (headerType)
+@@ -707,4 +710,4 @@
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/server/AOF/Recover/AofRecover.cs b/libs/server/AOF/Recover/AofRecover.cs
+--- a/libs/server/AOF/Recover/AofRecover.cs
++++ b/libs/server/AOF/Recover/AofRecover.cs
+@@ -14,6 +14,9 @@
+ {
+     public sealed partial class AofProcessor
+     {
++        internal bool SingleLogReplayComplete { get; private set; }
++        internal int PendingSingleLogTransactionCount => aofReplayCoordinator.GetReplayContext(0).activeTxns.Count;
++
+         /// <summary>
+         /// Performs recovery of the append-only file (AOF) for the specified database up to the given address,
+         /// replaying records and logging recovery statistics.
+@@ -23,6 +26,7 @@
+         /// <returns>The address up to which the AOF has been successfully recovered.</returns>
+         public AofAddress Recover(GarnetDatabase db, AofAddress untilAddress)
+         {
++            SingleLogReplayComplete = false;
+             Stopwatch swatch = new();
+             swatch.Start();
+             var total_number_of_replayed_records = 0L;
+@@ -110,6 +114,7 @@
+                 }
+             }
+ 
++            SingleLogReplayComplete = scan.NextAddress == untilAddress[physicalSublogIdx];
+             logger?.LogInformation("Completed full AOF sublog {sublogIdx} replay of {count:N0} records (DB ID: {id})", physicalSublogIdx, count, dbId);
+             return count;
+         }
+@@ -164,4 +169,4 @@
+             return recordsReplayed;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/server/Databases/SingleDatabaseManager.cs b/libs/server/Databases/SingleDatabaseManager.cs
+--- a/libs/server/Databases/SingleDatabaseManager.cs
++++ b/libs/server/Databases/SingleDatabaseManager.cs
+@@ -286,20 +286,45 @@
+             // When replaying AOF we do not want to write record again to AOF.
+             // So initialize local AofProcessor with recordToAof: false.
+             var aofProcessor = new AofProcessor(StoreWrapper, clusterProvider: StoreWrapper.clusterProvider, recordToAof: false, logger: Logger);
++            var recoveryTail = AppendOnlyFile.Log.TailAddress;
++            var fullStandaloneRecovery = !StoreWrapper.serverOptions.EnableCluster
++                && !StoreWrapper.serverOptions.MultiLogEnabled
++                && untilAddress.Length == 1
++                && (untilAddress[0] == -1 || untilAddress[0] == recoveryTail[0]);
++            AofAddress res;
++            var pendingTransactions = 0;
+ 
+             try
+             {
+-                var res = ReplayDatabaseAOF(aofProcessor, defaultDatabase, untilAddress);
++                res = ReplayDatabaseAOF(aofProcessor, defaultDatabase, untilAddress);
+ 
+                 // Wait for Vector Sets to catch up before declaring us "recovered"
+                 defaultDatabase.VectorManager?.WaitForQuiescence();
+ 
+-                return res;
++                if (fullStandaloneRecovery && res.Length == 1 && res[0] == recoveryTail[0]
++                    && aofProcessor.SingleLogReplayComplete && AppendOnlyFile.Log.TailAddress[0] == recoveryTail[0])
++                    pendingTransactions = aofProcessor.PendingSingleLogTransactionCount;
+             }
+             finally
+             {
+                 aofProcessor.Dispose();
+             }
++
++            if (pendingTransactions > 0)
++            {
++                // A later process can reuse the session IDs of incomplete transactions. Persist the
++                // recovered committed state and retire their old log before accepting new writes.
++                // A native checkpoint also keeps this recovery boundary readable by older releases.
++                Logger?.LogWarning("Checkpointing recovered state before retiring {count} incomplete AOF transactions", pendingTransactions);
++                if (AsyncUtils.BlockingWait(TakeCheckpointAsync(background: false, dbId: 0, logger: Logger)) != CheckpointStatus.Success)
++                    throw new GarnetException("Unable to checkpoint incomplete AOF transaction recovery");
++                AsyncUtils.BlockingWait(CommitToAofAsync(logger: Logger));
++                var committedBegin = AppendOnlyFile.Log.CommittedBeginAddress;
++                if (committedBegin.Length != 1 || committedBegin[0] < recoveryTail[0])
++                    throw new GarnetException("Incomplete AOF transaction recovery was not durably checkpointed");
++            }
++
++            return res;
+         }
+ 
+         /// <inheritdoc/>
+@@ -453,4 +478,4 @@
+             Disposed = true;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/server/Storage/Session/UnifiedStore/UnifiedStoreOps.cs b/libs/server/Storage/Session/UnifiedStore/UnifiedStoreOps.cs
+--- a/libs/server/Storage/Session/UnifiedStore/UnifiedStoreOps.cs
++++ b/libs/server/Storage/Session/UnifiedStore/UnifiedStoreOps.cs
+@@ -284,8 +284,6 @@
+             var oldKey = oldKeySlice;
+             var newKey = newKeySlice;
+ 
+-            var abortTransaction = false;
+-
+             var output = new UnifiedOutput();
+             try
+             {
+@@ -301,7 +299,6 @@
+                 if (isNX && newExists)
+                 {
+                     result = 0;             // This is the "oldkey was found" return
+-                    abortTransaction = true;
+                     return GarnetStatus.OK;
+                 }
+ 
+@@ -324,7 +321,6 @@
+                 status = GET(oldKey, ref input, ref output, ref context);
+                 if (status != GarnetStatus.OK)
+                 {
+-                    abortTransaction = true;
+                     return status;
+                 }
+ 
+@@ -388,10 +384,8 @@
+             {
+                 if (createTransaction)
+                 {
+-                    if (abortTransaction)
+-                        txnManager.Reset();
+-                    else
+-                        txnManager.Commit(true);
++                    // Close the AOF transaction even when the rename made no changes.
++                    txnManager.Commit(true);
+                 }
+                 output.Dispose();
+             }
+@@ -399,4 +393,4 @@
+             return GarnetStatus.NOTFOUND;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs b/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs
+--- a/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs
++++ b/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs
+@@ -2815,6 +2815,9 @@
+ 
+         private void SerialCommitCallbackWorker(CommitInfo commitInfo)
+         {
++            if (cannedException != null)
++                return;
++
+             if (commitInfo.ErrorCode != 0)
+             {
+                 var exception = new CommitFailureException(new LinkedCommitInfo { CommitInfo = commitInfo },
+@@ -2857,7 +2860,10 @@
+                 return;
+ 
+             var latestCommit = coveredCommits[coveredCommits.Count - 1];
+-            if (fastCommitMode)
++            // Retiring log records requires the new recovery metadata before publishing the
++            // committed begin address. A flushed inline commit alone is insufficient here.
++            var deferFastCommit = fastCommitMode && allocator.BeginAddress < latestCommit.BeginAddress;
++            if (fastCommitMode && !deferFastCommit)
+             {
+                 // In fast commit mode, can safely set committed state to the latest flushed and invoke callbacks early
+                 UpdateCommittedState(latestCommit);
+@@ -2868,20 +2874,42 @@
+                 }
+             }
+ 
+-            foreach (var recoveryInfo in coveredCommits)
+-            {
+-                // Only write out commit metadata if user cares about this as a distinct recoverable point
+-                if (!recoveryInfo.FastForwardAllowed)
+-                    WriteCommitMetadata(recoveryInfo);
+-                if (!fastCommitMode)
++            try
++            {
++                foreach (var recoveryInfo in coveredCommits)
++                {
++                    // Only write out commit metadata if user cares about this as a distinct recoverable point
++                    if (!recoveryInfo.FastForwardAllowed)
++                        WriteCommitMetadata(recoveryInfo);
++                    if (!fastCommitMode)
++                    {
++                        recoveryInfo.Callback?.Invoke();
++                        commitPolicy.OnCommitFinished(recoveryInfo);
++                    }
++                }
++
++                // We fast-forwarded commits earlier, so write it out if not covered by another commit
++                if (latestCommit.FastForwardAllowed) WriteCommitMetadata(latestCommit);
++            }
++            catch (Exception ex)
++            {
++                // The work queue otherwise swallows callback exceptions, leaving waiters hanging
++                // and allowing subsequent commits to report success after a metadata failure.
++                cannedException = new CommitFailureException(new LinkedCommitInfo { CommitInfo = commitInfo },
++                    "Commit metadata or log truncation failed", ex);
++                _ = commitTcs.TrySetException(cannedException);
++                return;
++            }
++
++            if (deferFastCommit)
++            {
++                UpdateCommittedState(latestCommit);
++                foreach (var recoveryInfo in coveredCommits)
+                 {
+                     recoveryInfo.Callback?.Invoke();
+                     commitPolicy.OnCommitFinished(recoveryInfo);
+                 }
+             }
+-
+-            // We fast-forwarded commits earlier, so write it out if not covered by another commit
+-            if (latestCommit.FastForwardAllowed) WriteCommitMetadata(latestCommit);
+ 
+             // TODO: Can invoke earlier in the case of fast commit
+             var _commitTcs = commitTcs;
+@@ -3537,4 +3565,4 @@
+                     "Increase the page size (and memory size to at least 2x page size) or split the entry into smaller writes.");
+         }
+     }
+-}
+\ No newline at end of file
++}
