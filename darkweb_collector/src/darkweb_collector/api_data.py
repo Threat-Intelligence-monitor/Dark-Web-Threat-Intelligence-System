@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, OrderedDict
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from hashlib import sha1
 import json
 import os
@@ -134,7 +135,9 @@ VULNERABILITY_EVENT_LIMIT = 500
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 _PAYLOAD_CACHE_LOCK = Lock()
-_PAYLOAD_CACHE: dict[str, dict[str, Any]] = {}
+_PAYLOAD_BUILD_LOCK = Lock()
+_PAYLOAD_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_PAYLOAD_CACHE_LIMIT = 8
 PAYLOAD_CACHE_VERSION = "2026-04-11-executive-country-v2"
 
 
@@ -1432,6 +1435,7 @@ def _get_cached_payload(namespace: str, cache_key: str) -> Any | None:
     with _PAYLOAD_CACHE_LOCK:
         entry = _PAYLOAD_CACHE.get(namespace)
         if entry and entry.get("key") == cache_key:
+            _PAYLOAD_CACHE.move_to_end(namespace)
             return entry.get("payload")
     return None
 
@@ -1439,6 +1443,18 @@ def _get_cached_payload(namespace: str, cache_key: str) -> Any | None:
 def _set_cached_payload(namespace: str, cache_key: str, payload: Any) -> None:
     with _PAYLOAD_CACHE_LOCK:
         _PAYLOAD_CACHE[namespace] = {"key": cache_key, "payload": payload}
+        _PAYLOAD_CACHE.move_to_end(namespace)
+        while len(_PAYLOAD_CACHE) > _PAYLOAD_CACHE_LIMIT:
+            _PAYLOAD_CACHE.popitem(last=False)
+
+
+def _serialize_payload_build(function):
+    @wraps(function)
+    def build(*args, **kwargs):
+        with _PAYLOAD_BUILD_LOCK:
+            return function(*args, **kwargs)
+
+    return build
 
 
 def _safe_pct(current: int, previous: int) -> int:
@@ -1591,6 +1607,7 @@ def _build_executive_cards(events: list[dict[str, Any]], countries: list[dict[st
     }
 
 
+@_serialize_payload_build
 def build_intelligence_page_payload(page: str, limit: int | None = None) -> dict[str, Any]:
     page_config = {
         "ransomware": ("ransomware", "ransomwareEvents", RANSOMWARE_EVENT_LIMIT),
@@ -1738,6 +1755,7 @@ def _dashboard_priority_event(event: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+@_serialize_payload_build
 def build_dashboard_payload(days: int = 7) -> dict[str, Any]:
     safe_days = 1 if int(days) <= 1 else 30 if int(days) >= 30 else 7
     namespace = f"intelligence:dashboard:{safe_days}"
@@ -1956,6 +1974,7 @@ def build_dashboard_payload(days: int = 7) -> dict[str, Any]:
     return payload
 
 
+@_serialize_payload_build
 def build_intelligence_payload() -> dict[str, Any]:
     with get_db_connection() as connection:
         cache_key = _payload_cache_key(connection, "intelligence")
