@@ -1,7 +1,192 @@
+diff --git a/libs/common/Networking/INetworkSender.cs b/libs/common/Networking/INetworkSender.cs
+--- a/libs/common/Networking/INetworkSender.cs
++++ b/libs/common/Networking/INetworkSender.cs
+@@ -31,6 +31,11 @@
+         /// </summary>
+         /// <returns></returns>
+         bool IsLocalConnection();
++
++        /// <summary>
++        /// Whether a blocked command should keep waiting for this connection.
++        /// </summary>
++        bool IsConnected => true;
+ 
+         /// <summary>
+         /// Enter exclusive use of network sender.
+@@ -111,4 +116,4 @@
+         /// </summary>
+         bool TryClose();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/common/Networking/NetworkSenderBase.cs b/libs/common/Networking/NetworkSenderBase.cs
+--- a/libs/common/Networking/NetworkSenderBase.cs
++++ b/libs/common/Networking/NetworkSenderBase.cs
+@@ -53,6 +53,9 @@
+         public abstract bool IsLocalConnection();
+ 
+         /// <inheritdoc />
++        public virtual bool IsConnected => true;
++
++        /// <inheritdoc />
+         public abstract void Enter();
+ 
+         /// <inheritdoc />
+@@ -97,4 +100,4 @@
+         /// <inheritdoc />
+         public abstract bool TryClose();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/common/Networking/GarnetTcpNetworkSender.cs b/libs/common/Networking/GarnetTcpNetworkSender.cs
+--- a/libs/common/Networking/GarnetTcpNetworkSender.cs
++++ b/libs/common/Networking/GarnetTcpNetworkSender.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Diagnostics;
+ using System.Net;
++using System.Net.NetworkInformation;
+ using System.Net.Sockets;
+ using System.Runtime.CompilerServices;
+ using System.Threading;
+@@ -109,6 +110,40 @@
+         }
+ 
+         /// <inheritdoc />
++        public override bool IsConnected => Volatile.Read(ref closeRequested) == 0 && IsSocketConnected(socket);
++
++        internal static bool IsSocketConnected(Socket socket)
++        {
++            try
++            {
++                if (!socket.Poll(0, SelectMode.SelectRead))
++                    return true;
++                if (socket.Available == 0)
++                    return false;
++
++                // Pipelined data can remain ahead of EOF while a blocking command prevents the next receive.
++                if (socket.LocalEndPoint is IPEndPoint local && socket.RemoteEndPoint is IPEndPoint remote)
++                {
++                    foreach (var connection in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpConnections())
++                    {
++                        if (connection.LocalEndPoint.Equals(local) && connection.RemoteEndPoint.Equals(remote))
++                            return connection.State == TcpState.Established;
++                    }
++                }
++                return true;
++            }
++            catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
++            {
++                return false;
++            }
++            catch (Exception ex) when (ex is NetworkInformationException or PlatformNotSupportedException)
++            {
++                // An unavailable TCP snapshot does not establish that a live peer disconnected.
++                return true;
++            }
++        }
++
++        /// <inheritdoc />
+         public override void Enter()
+         {
+             var lockTaken = false;
+@@ -349,4 +384,4 @@
+                 throttle.Release();
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/common/Networking/TcpNetworkHandlerBase.cs b/libs/common/Networking/TcpNetworkHandlerBase.cs
+--- a/libs/common/Networking/TcpNetworkHandlerBase.cs
++++ b/libs/common/Networking/TcpNetworkHandlerBase.cs
+@@ -57,6 +57,9 @@
+         public override bool IsLocalConnection() => isLocalConnection;
+ 
+         /// <inheritdoc />
++        public override bool IsConnected => Volatile.Read(ref closeRequested) == 0 && GarnetTcpNetworkSender.IsSocketConnected(socket);
++
++        /// <inheritdoc />
+         public override void Start(SslServerAuthenticationOptions tlsOptions = null, string remoteEndpointName = null, CancellationToken token = default)
+         {
+             if (token == default && cancellationTokenSource != null) token = cancellationTokenSource.Token;
+@@ -269,4 +272,4 @@
+             networkReceiveBufferPtr = networkReceiveBufferEntry.entryPtr;
+         }
+     }
+-}
+\ No newline at end of file
++}
 diff --git a/libs/server/Objects/ItemBroker/CollectionItemBroker.cs b/libs/server/Objects/ItemBroker/CollectionItemBroker.cs
 --- a/libs/server/Objects/ItemBroker/CollectionItemBroker.cs
 +++ b/libs/server/Objects/ItemBroker/CollectionItemBroker.cs
-@@ -169,48 +169,12 @@
+@@ -140,26 +140,53 @@
+                 ? TimeSpan.FromMilliseconds(-1)
+                 : TimeSpan.FromSeconds(timeoutInSeconds);
+ 
++            var started = Stopwatch.GetTimestamp();
++            var pollInterval = TimeSpan.FromMilliseconds(100);
++
+             try
+             {
+-                // Wait for either the result found notification or the timeout to expire
+-                await observer.ResultFoundSemaphore.WaitAsync(timeout, observer.CancellationTokenSource.Token).ConfigureAwait(false);
++                // ReceiveAsync cannot observe a peer disconnect while the network thread is blocked here.
++                // Keep the requested timeout, but release abandoned blocking commands promptly.
++                while (true)
++                {
++                    var remaining = timeoutInSeconds == 0 ? pollInterval : timeout - Stopwatch.GetElapsedTime(started);
++                    if (remaining <= TimeSpan.Zero)
++                        break;
++                    if (remaining > pollInterval)
++                        remaining = pollInterval;
++
++                    if (await observer.ResultFoundSemaphore.WaitAsync(remaining, observer.CancellationTokenSource.Token).ConfigureAwait(false))
++                        break;
++                    if (!observer.Session.IsConnected)
++                    {
++                        observer.HandleSessionDisposed();
++                        break;
++                    }
++                }
+             }
+             catch (OperationCanceledException)
+             {
+                 // Session is disposed
+             }
+-
+-            sessionIdToObserver.TryRemove(observer.Session.ObjectStoreSessionID, out _);
+-
+-            // Check if observer is still waiting for result
+-            if (observer.Status == ObserverStatus.WaitingForResult)
+-            {
+-                // Try to set the observer result to an empty one
+-                observer.HandleSetResult(CollectionItemResult.Empty);
++            finally
++            {
++                if (observer.Status == ObserverStatus.WaitingForResult)
++                    observer.HandleSetResult(CollectionItemResult.Empty);
++
++                RemoveObserver(observer);
++                // Retire references in every observed key promptly, including keys that never receive writes.
++                foreach (var key in keys)
++                    brokerEventsQueue.Enqueue(CollectionItemBrokerEvent.CreateCollectionUpdatedEvent(key));
+             }
+ 
+             return observer.Result;
++        }
++
++        private void RemoveObserver(CollectionItemObserver observer)
++        {
++            // A late completion must not remove a subsequent blocking command on the same session.
++            ((ICollection<KeyValuePair<int, CollectionItemObserver>>)sessionIdToObserver)
++                .Remove(new KeyValuePair<int, CollectionItemObserver>(observer.Session.ObjectStoreSessionID, observer));
+         }
+ 
+         /// <summary>
+@@ -169,48 +196,12 @@
          [MethodImpl(MethodImplOptions.AggressiveInlining)]
          internal void HandleCollectionUpdate(byte[] key)
          {
@@ -55,7 +240,19 @@ diff --git a/libs/server/Objects/ItemBroker/CollectionItemBroker.cs b/libs/serve
              brokerEventsQueue.Enqueue(CollectionItemBrokerEvent.CreateCollectionUpdatedEvent(key));
          }
  
-@@ -261,9 +225,16 @@
+@@ -254,16 +245,28 @@
+         {
+             // This lock is for synchronization with incoming collection updated events 
+             keysToObserversLock.WriteLock();
++            observer.ObserverStatusLock.WriteLock();
+             try
+             {
++                // Timeout or disconnect may have completed this command while its event was queued.
++                if (observer.Status != ObserverStatus.WaitingForResult)
++                    return;
++
+                 keysToObservers ??= new Dictionary<byte[], ConcurrentQueue<CollectionItemObserver>>(ByteArrayComparer.Instance);
+ 
                  // Iterate over the keys in order, set the observer's result if collection in key contains an item
                  foreach (var key in keys)
                  {
@@ -75,8 +272,22 @@ diff --git a/libs/server/Objects/ItemBroker/CollectionItemBroker.cs b/libs/serve
  
                      // The key has an empty observer queue, try to retrieve next available item
                      if (!TryGetResult(key, observer.Session.storageSession, observer.Command, observer.CommandArgs, failOnSrcTypeMismatch: true,
-@@ -293,6 +264,11 @@
+@@ -271,8 +274,8 @@
+                         continue;
+ 
+                     // An item was found - set the observer result and return
+-                    sessionIdToObserver.TryRemove(observer.Session.ObjectStoreSessionID, out _);
+-                    observer.HandleSetResult(result);
++                    RemoveObserver(observer);
++                    observer.HandleSetResult(result, true);
+ 
+                     // The key still has an empty observer queue, and the current observer retrieved a result, so we can remove the key.
+                     keysToObservers.Remove(key);
+@@ -291,8 +294,14 @@
+             }
+             finally
              {
++                observer.ObserverStatusLock.WriteUnlock();
                  keysToObserversLock.WriteUnlock();
              }
 +
@@ -87,9 +298,139 @@ diff --git a/libs/server/Objects/ItemBroker/CollectionItemBroker.cs b/libs/serve
          }
  
          /// <summary>
-@@ -777,4 +753,4 @@
+@@ -303,6 +312,9 @@
+         /// <returns>True if at least one observer was assigned an item</returns>
+         private bool TryAssignItemFromKey(byte[] key)
+         {
++            if (keysToObservers is null)
++                return false;
++
+             ConcurrentQueue<CollectionItemObserver> observers;
+             var assignedAny = false;
+ 
+@@ -346,7 +358,7 @@
+                             // Dequeue the observer, and set the observer's result
+                             _ = observers.TryDequeue(out observer);
+ 
+-                            sessionIdToObserver.TryRemove(observer!.Session.ObjectStoreSessionID, out _);
++                            RemoveObserver(observer!);
+ 
+                             observer.HandleSetResult(result, true);
+ 
+@@ -777,4 +789,4 @@
              cts.Dispose();
          }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/server/Resp/RespServerSession.cs b/libs/server/Resp/RespServerSession.cs
+--- a/libs/server/Resp/RespServerSession.cs
++++ b/libs/server/Resp/RespServerSession.cs
+@@ -409,6 +409,9 @@
+         {
+             logger?.LogDebug("Disposing RespServerSession Id={id}", this.Id);
+ 
++            // A blocked observer may be using this session's storage on the broker thread.
++            storeWrapper.itemBroker?.HandleSessionDisposed(this);
++
+             if (recvBufferPtr != null)
+             {
+                 try { if (recvHandle.IsAllocated) recvHandle.Free(); } catch { }
+@@ -434,9 +437,10 @@
+                 storeWrapper.monitor.AddMetricsHistorySessionDispose(sessionMetrics, LatencyMetrics, commandStats);
+ 
+             subscribeBroker?.RemoveSubscription(this);
+-            storeWrapper.itemBroker?.HandleSessionDisposed(this);
+             sessionScriptCache?.Dispose();
+         }
++
++        internal bool IsConnected => networkSender?.IsConnected != false;
+ 
+         /// <summary>
+         /// Batches between session buffer trims. A buffer that grew for one wide command is
+@@ -629,6 +633,10 @@
+                     // The session is no longer usable, dispose it
+                     networkSender.DisposeNetworkSender(true);
+                 }
++            }
++            catch (OperationCanceledException) when (!IsConnected)
++            {
++                networkSender.TryClose();
+             }
+             catch (Exception ex)
+             {
+@@ -1526,7 +1534,7 @@
+                 // Debug.WriteLine("SEND: [" + Encoding.UTF8.GetString(new Span<byte>(d, (int)(dcurr - d))).Replace("\n", "|").Replace("\r", "!") + "]");
+                 if (waitForAofBlocking)
+                 {
+-                    var task = storeWrapper.WaitForCommitAsync();
++                    var task = WaitForAofCommitAsync();
+ 
+                     // Must block, we're on the network thread
+                     if (!task.IsCompletedSuccessfully) AsyncUtils.BlockingWait(task);
+@@ -1548,7 +1556,7 @@
+             {
+                 if (storeWrapper.serverOptions.EnableAOF && storeWrapper.serverOptions.WaitForCommit)
+                 {
+-                    var task = storeWrapper.WaitForCommitAsync();
++                    var task = WaitForAofCommitAsync();
+ 
+                     // Must block, we're on the network thread
+                     if (!task.IsCompletedSuccessfully) AsyncUtils.BlockingWait(task);
+@@ -1809,4 +1817,4 @@
+         private UnifiedOutput GetUnifiedOutput()
+             => UnifiedOutput.FromPinnedPointer(dcurr, (int)(dend - dcurr));
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/server/Resp/AsyncProcessor.cs b/libs/server/Resp/AsyncProcessor.cs
+--- a/libs/server/Resp/AsyncProcessor.cs
++++ b/libs/server/Resp/AsyncProcessor.cs
+@@ -1,6 +1,7 @@
+ ﻿// Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT license.
+ 
++using System;
+ using System.Diagnostics;
+ using System.Threading;
+ using System.Threading.Tasks;
+@@ -144,5 +145,36 @@
+                 await asyncWaiter.WaitAsync().ConfigureAwait(false);
+             }
+         }
++
++        private async Task WaitForAofCommitAsync()
++        {
++            using var cancellation = new CancellationTokenSource();
++            var pending = storeWrapper.WaitForCommitAsync(cancellation.Token);
++            if (pending.IsCompletedSuccessfully)
++                return;
++
++            var task = pending.AsTask();
++            try
++            {
++                while (!task.IsCompleted)
++                {
++                    try
++                    {
++                        await task.WaitAsync(TimeSpan.FromMilliseconds(100)).ConfigureAwait(false);
++                    }
++                    catch (TimeoutException)
++                    {
++                        if (!IsConnected)
++                            await cancellation.CancelAsync().ConfigureAwait(false);
++                    }
++                }
++                await task.ConfigureAwait(false);
++            }
++            finally
++            {
++                if (!task.IsCompleted)
++                    await cancellation.CancelAsync().ConfigureAwait(false);
++            }
++        }
      }
 -}
 \ No newline at end of file

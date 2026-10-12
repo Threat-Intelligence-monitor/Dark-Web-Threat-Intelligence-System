@@ -44,7 +44,6 @@ ASSET_PATTERNS = {
 
 _MONITORING_CACHE_LOCK = Lock()
 _MONITORING_CACHE_KEY = ""
-_MONITORING_CACHE_EVENTS: list[dict[str, Any]] = []
 _MONITORING_CACHE_PAYLOAD: dict[str, Any] = {}
 
 
@@ -117,10 +116,9 @@ def save_monitoring_keywords(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def _invalidate_monitoring_cache() -> None:
-    global _MONITORING_CACHE_KEY, _MONITORING_CACHE_EVENTS, _MONITORING_CACHE_PAYLOAD
+    global _MONITORING_CACHE_KEY, _MONITORING_CACHE_PAYLOAD
     with _MONITORING_CACHE_LOCK:
         _MONITORING_CACHE_KEY = ""
-        _MONITORING_CACHE_EVENTS = []
         _MONITORING_CACHE_PAYLOAD = {}
 
 
@@ -493,15 +491,10 @@ def _priority_alert_stream(enriched_events: list[dict[str, Any]], limit: int = 8
 
 
 def build_monitoring_payload(connection, normalized_events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    global _MONITORING_CACHE_KEY, _MONITORING_CACHE_EVENTS, _MONITORING_CACHE_PAYLOAD
+    global _MONITORING_CACHE_KEY, _MONITORING_CACHE_PAYLOAD
     keywords = _seed_keywords(connection)
     use_global_cache = _can_use_global_monitoring_cache(connection, normalized_events)
     cache_key = _monitoring_cache_key(connection, keywords) if use_global_cache else ""
-    if use_global_cache:
-        with _MONITORING_CACHE_LOCK:
-            if _MONITORING_CACHE_KEY == cache_key:
-                return list(_MONITORING_CACHE_EVENTS), dict(_MONITORING_CACHE_PAYLOAD)
-
     enriched_events = [_with_monitoring(event, keywords) for event in normalized_events]
     payload = {
         "monitoringPriorityQueue": _priority_queue(enriched_events),
@@ -518,7 +511,6 @@ def build_monitoring_payload(connection, normalized_events: list[dict[str, Any]]
     if use_global_cache:
         with _MONITORING_CACHE_LOCK:
             _MONITORING_CACHE_KEY = cache_key
-            _MONITORING_CACHE_EVENTS = list(enriched_events)
             _MONITORING_CACHE_PAYLOAD = dict(payload)
     return enriched_events, payload
 

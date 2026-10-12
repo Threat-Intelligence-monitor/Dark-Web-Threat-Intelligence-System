@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from darkweb_collector.search_schema import event_report_time
 
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 from html import unescape
-from hashlib import sha1
+from hashlib import sha1, sha256
 import json
 import logging
 from pathlib import Path
@@ -1256,7 +1256,32 @@ def _count_keyword_matches(text: str, keyword: str) -> int:
     return len(_keyword_match_pattern(keyword).findall(text))
 
 
-@lru_cache(maxsize=8192)
+def _cache_text_inference(function):
+    cache = OrderedDict()
+    lock = Lock()
+
+    @wraps(function)
+    def cached(*texts):
+        key = tuple(
+            (source, weight, sha256(str(text or "").encode("utf-8", "surrogatepass")).digest())
+            for source, weight, text in texts
+        )
+        with lock:
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+        result = function(*texts)
+        with lock:
+            cache[key] = result
+            cache.move_to_end(key)
+            if len(cache) > 8192:
+                cache.popitem(last=False)
+        return result
+
+    return cached
+
+
+@_cache_text_inference
 def _infer_industry_bundle(*texts: tuple[str, int]) -> dict[str, Any]:
     scores: dict[str, int] = defaultdict(int)
     sources: dict[str, list[str]] = defaultdict(list)
@@ -1293,7 +1318,7 @@ def _infer_industry_bundle(*texts: tuple[str, int]) -> dict[str, Any]:
     return {"industry": industry, "source": source, "score": scores[industry]}
 
 
-@lru_cache(maxsize=8192)
+@_cache_text_inference
 def _infer_country_bundle(*texts: tuple[str, int]) -> dict[str, Any]:
     scores: dict[str, int] = defaultdict(int)
     sources: dict[str, list[str]] = defaultdict(list)
