@@ -807,7 +807,7 @@ def sync_public_vulnerability_feed(
         if refresh_normalized:
             from darkweb_collector.normalized_intelligence import ensure_normalized_intelligence
 
-            ensure_normalized_intelligence(connection, force=True)
+            ensure_normalized_intelligence(connection, force=True, load_events=False)
         connection.commit()
     return {
         "ingested": len(records),

@@ -62,6 +62,32 @@ def _lock(connection):
         connection.execute("UPDATE intelligence_search_state SET id = id WHERE id = 1")
 
 
+def _source_metadata(connection):
+    # Hash the original compact JSON array without transferring every source body.
+    if _postgres(connection):
+        fields = ",".join(f"COALESCE({field}, '')" for field in FIELDS)
+        fingerprint = f"encode(sha256(convert_to(array_to_json(ARRAY[{fields}])::text, 'UTF8')), 'hex')"
+    else:
+        connection.create_function("darkweb_search_fingerprint", len(FIELDS),
+            lambda *values: _fingerprint(dict(zip(FIELDS, values))), deterministic=True)
+        fingerprint = "darkweb_search_fingerprint(" + ",".join(FIELDS) + ")"
+    after = None
+    while True:
+        where = "" if after is None else " WHERE event_id > ?"
+        cursor = connection.execute("SELECT event_id, event_type, report_time, severity, risk_score, "
+            + fingerprint + " AS fingerprint FROM normalized_intelligence_events"
+            + where + " ORDER BY event_id LIMIT 200", () if after is None else (after,))
+        try:
+            batch = cursor.fetchall()
+        finally:
+            cursor.close()
+        if not batch:
+            return
+        for row in batch:
+            yield dict(row)
+        after = batch[-1]["event_id"]
+
+
 def sync_search_documents(connection, rows=None):
     """Caller owns commit; retain unchanged postings across normalized full refreshes."""
     _lock(connection)
@@ -69,18 +95,18 @@ def sync_search_documents(connection, rows=None):
     previous = {row["event_id"]: dict(row) for row in connection.execute(
         "SELECT event_id, fingerprint, event_type, report_time, severity_rank, risk_score "
         "FROM intelligence_search_documents").fetchall()}
-    if rows is None:
-        rows = [dict(row) for row in connection.execute(
-            "SELECT event_id, event_type, disclosure_time, updated_at, severity, risk_score, "
-            + ", ".join(FIELDS) + " FROM normalized_intelligence_events").fetchall()]
+    database_rows = rows is None
+    if database_rows:
+        rows = _source_metadata(connection)
     changed = {}
     metadata = []
     current_ids = set()
     for row in rows:
         event_id = row["event_id"]
         current_ids.add(event_id)
-        fingerprint = _fingerprint(row)
-        report_time = event_report_time(row)
+        fingerprint = row["fingerprint"] if database_rows else _fingerprint(row)
+        # Normalization and the schema backfill persist the same canonical report time.
+        report_time = (row["report_time"] or "") if database_rows else event_report_time(row)
         severity = {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(str(row["severity"]).lower(), 0)
         values = (row["event_type"], report_time, severity, row["risk_score"])
         old = previous.get(event_id)
@@ -97,35 +123,32 @@ def sync_search_documents(connection, rows=None):
             connection.execute("DELETE FROM intelligence_search_fts WHERE rowid = "
                                "(SELECT rowid FROM intelligence_search_documents WHERE event_id=?)", (event_id,))
         connection.execute("DELETE FROM intelligence_search_documents WHERE event_id=?", (event_id,))
-    ids = list(changed)
-    for offset in range(0, len(ids), 200):
-        batch = ids[offset:offset + 200]
-        source = connection.execute(
-            f"SELECT event_id, {SEARCH_TEXT} AS search_text FROM normalized_intelligence_events "
-            f"WHERE event_id IN ({','.join('?' for _ in batch)})", batch).fetchall()
-        documents = []
-        gram_map = {}
-        for row in source:
-            event_id, text = row["event_id"], row["search_text"]
-            # SQLite LIKE terminates at NUL; the index represents that same haystack.
-            effective_text = text if pg else text.split("\x00", 1)[0]
-            grams = _grams(effective_text)
-            fingerprint, values = changed[event_id]
-            documents.append((event_id, fingerprint, text, *values, len(effective_text), *([grams] if pg else [])))
-            gram_map[event_id] = grams
-        columns = "event_id, fingerprint, search_text, event_type, report_time, severity_rank, risk_score, text_length"
-        if pg:
-            columns += ", grams"
-        updates = ", ".join(f"{column}=excluded.{column}" for column in columns.split(", ")[1:])
-        connection.executemany(f"INSERT INTO intelligence_search_documents ({columns}) "
-                               f"VALUES ({','.join('?' for _ in range(9 if pg else 8))}) "
-                               f"ON CONFLICT(event_id) DO UPDATE SET {updates}", documents)
+    columns = "event_id, fingerprint, search_text, event_type, report_time, severity_rank, risk_score, text_length"
+    if pg:
+        columns += ", grams"
+    updates = ", ".join(f"{column}=excluded.{column}" for column in columns.split(", ")[1:])
+    for event_id, (fingerprint, values) in changed.items():
+        cursor = connection.execute(f"SELECT {SEARCH_TEXT} AS search_text "
+            "FROM normalized_intelligence_events WHERE event_id=? LIMIT 1", (event_id,))
+        try:
+            source = cursor.fetchone()
+        finally:
+            cursor.close()
+        if source is None:
+            continue
+        text = source["search_text"]
+        # SQLite LIKE terminates at NUL; the index represents that same haystack.
+        effective_text = text if pg else text.split("\x00", 1)[0]
+        grams = _grams(effective_text)
+        document = (event_id, fingerprint, text, *values, len(effective_text), *([grams] if pg else []))
+        connection.execute(f"INSERT INTO intelligence_search_documents ({columns}) "
+                           f"VALUES ({','.join('?' for _ in document)}) "
+                           f"ON CONFLICT(event_id) DO UPDATE SET {updates}", document)
         if not pg:
-            mapped = connection.execute("SELECT rowid, event_id FROM intelligence_search_documents "
-                f"WHERE event_id IN ({','.join('?' for _ in batch)})", batch).fetchall()
-            connection.executemany("DELETE FROM intelligence_search_fts WHERE rowid=?", [(row[0],) for row in mapped])
-            connection.executemany("INSERT INTO intelligence_search_fts(rowid, grams) VALUES (?, ?)",
-                [(row[0], " ".join(gram_map[row["event_id"]])) for row in mapped])
+            rowid = connection.execute("SELECT rowid FROM intelligence_search_documents WHERE event_id=?", (event_id,)).fetchone()[0]
+            connection.execute("DELETE FROM intelligence_search_fts WHERE rowid=?", (rowid,))
+            connection.execute("INSERT INTO intelligence_search_fts(rowid, grams) VALUES (?, ?)", (rowid, " ".join(grams)))
+        del source, text, effective_text, grams, document
     if pg and len(changed) + len(removed) >= 1000:
         # New GIN indexes otherwise wait for autovacuum before useful estimates exist.
         connection.execute("ANALYZE intelligence_search_documents")

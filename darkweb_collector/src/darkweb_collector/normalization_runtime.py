@@ -71,12 +71,15 @@ def run_normalization_cycle() -> dict[str, Any]:
     converged = False
     try:
         with get_db_connection() as connection:
+            if getattr(connection, "backend_name", "") == "postgresql":
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             pending = normalized_intelligence.should_refresh_normalized_intelligence(connection)
             if pending:
                 normalized_intelligence.ensure_normalized_intelligence(
                     connection,
                     force=False,
                     enrichment_budget=0,
+                    load_events=False,
                 )
                 pending = normalized_intelligence.should_refresh_normalized_intelligence(connection)
                 converged = not pending

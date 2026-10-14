@@ -5,8 +5,10 @@ from collections.abc import Iterator, Mapping
 from decimal import Decimal
 import os
 import re
+from sys import intern
 from threading import BoundedSemaphore, Lock
 from typing import Any, Callable, Sequence
+from uuid import uuid4
 
 from darkweb_collector.crawl_frontier import ensure_frontier_schema
 from darkweb_collector.search_schema import ensure_search_indexes
@@ -204,6 +206,22 @@ class PostgresConnection:
         cursor = self.cursor()
         cursor._cursor.executemany(translate_sql(sql), parameters)
         return cursor
+
+    def iter_rows(self, sql: str, parameters: Sequence[Any] = (), *, batch_size: int = 1) -> Iterator[CompatRow]:
+        from psycopg2.extensions import TRANSACTION_STATUS_INTRANS
+
+        # fetchmany on an ordinary psycopg cursor still buffers the whole result in libpq.
+        cursor = self._raw.cursor(name="dwti_stream_" + uuid4().hex)
+        try:
+            cursor.execute(translate_sql(sql), tuple(parameters))
+            while rows := cursor.fetchmany(max(1, int(batch_size))):
+                columns = [intern(column[0]) for column in cursor.description]
+                for row in rows:
+                    yield CompatRow(columns, row)
+        finally:
+            # Commit/rollback already discards a named cursor on the server.
+            if not self._closed and self._raw.get_transaction_status() == TRANSACTION_STATUS_INTRANS:
+                cursor.close()
 
     def commit(self) -> None:
         self._raw.commit()

@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable, Sized
 from datetime import datetime, timezone
 from hashlib import sha1
 import json
 import logging
 import re
+import sys
 from threading import Lock
 from typing import Any
 
 from darkweb_collector.db import (
     get_db_connection,
     get_normalized_intelligence_cache_state,
+    iter_normalized_intelligence_events,
     list_monitoring_keywords,
     replace_monitoring_keywords,
 )
-from darkweb_collector.normalized_intelligence import load_normalized_events
+from darkweb_collector.normalized_intelligence import _hydrate_event_row, ensure_normalized_intelligence
+from darkweb_collector.search_schema import SEARCH_ORDER
 from darkweb_collector.utils import utc_now_iso
 
 
@@ -147,10 +151,13 @@ def _monitoring_cache_key(connection, keywords: list[dict[str, Any]]) -> str:
     return sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def _can_use_global_monitoring_cache(connection, normalized_events: list[dict[str, Any]]) -> bool:
+def _can_use_global_monitoring_cache(connection, normalized_events: Iterable[dict[str, Any]]) -> bool:
     cache_state = get_normalized_intelligence_cache_state(connection) or {}
     event_count = int(cache_state.get("event_count") or 0)
-    return bool(event_count > 0 and len(normalized_events) == event_count)
+    try:
+        return bool(event_count > 0 and len(normalized_events) == event_count)
+    except TypeError:
+        return False
 
 
 def _cached_monitoring_summary(connection) -> dict[str, Any] | None:
@@ -479,7 +486,7 @@ def _priority_alert_stream(enriched_events: list[dict[str, Any]], limit: int = 8
         {
             "id": event.get("event_id"),
             "title": event.get("title") or "",
-            "summary": _normalize_text(event.get("detail_text"))[:180],
+            "summary": event["_monitoring_summary"] if "_monitoring_summary" in event else _normalize_text(event.get("detail_text"))[:180],
             "riskScore": int(event.get("rule_risk_score") or 0),
             "monitoringMatches": event.get("monitoring_matches") or [],
             "hasSampleEvidence": bool(event.get("has_sample_evidence")),
@@ -490,12 +497,26 @@ def _priority_alert_stream(enriched_events: list[dict[str, Any]], limit: int = 8
     ]
 
 
-def build_monitoring_payload(connection, normalized_events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def build_monitoring_payload(connection, normalized_events: Iterable[dict[str, Any]], *,
+                             retain_detail_text: bool = True) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     global _MONITORING_CACHE_KEY, _MONITORING_CACHE_PAYLOAD
     keywords = _seed_keywords(connection)
     use_global_cache = _can_use_global_monitoring_cache(connection, normalized_events)
-    cache_key = _monitoring_cache_key(connection, keywords) if use_global_cache else ""
-    enriched_events = [_with_monitoring(event, keywords) for event in normalized_events]
+    streamed = not isinstance(normalized_events, Sized)
+    cache_key = _monitoring_cache_key(connection, keywords) if use_global_cache or streamed else ""
+    enriched_events = []
+    for event in normalized_events:
+        item = _with_monitoring(event, keywords)
+        if not retain_detail_text:
+            item["_monitoring_summary"] = _normalize_text(item.get("detail_text"))[:180]
+            item["detail_text"] = str(item.get("detail_text") or "")[:500]
+            for key in ("event_metadata_json", "mirror_resources_json", "screenshot_resources_json", "risk_reasons_json"):
+                item.pop(key, None)
+            for key in ("risk_breakdown", "rule_risk_breakdown"):
+                item.pop(key, None)
+                item["metadata"].pop(key, None)
+            item["metadata"] = {sys.intern(key): value for key, value in item["metadata"].items()}
+        enriched_events.append(item)
     payload = {
         "monitoringPriorityQueue": _priority_queue(enriched_events),
         "monitoringKeywordStats": _keyword_stats(enriched_events),
@@ -508,6 +529,9 @@ def build_monitoring_payload(connection, normalized_events: list[dict[str, Any]]
         },
         "priorityAlertStream": _priority_alert_stream(enriched_events),
     }
+    if streamed:
+        use_global_cache = (_can_use_global_monitoring_cache(connection, enriched_events)
+                            and cache_key == _monitoring_cache_key(connection, keywords))
     if use_global_cache:
         with _MONITORING_CACHE_LOCK:
             _MONITORING_CACHE_KEY = cache_key
@@ -520,7 +544,11 @@ def build_monitoring_status() -> dict[str, Any]:
         cached = _cached_monitoring_summary(connection)
         if cached is not None:
             return cached
-        enriched_events, payload = build_monitoring_payload(connection, load_normalized_events(connection))
+        if get_normalized_intelligence_cache_state(connection) is None:
+            ensure_normalized_intelligence(connection, load_events=False)
+        events = (_hydrate_event_row(row) for row in iter_normalized_intelligence_events(
+            connection, order_by=SEARCH_ORDER["latest"]))
+        enriched_events, payload = build_monitoring_payload(connection, events, retain_detail_text=False)
     summary = payload.get("monitoringConfigurationSummary") or {}
     return {
         "keywordCount": int(summary.get("keywordCount") or 0),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 import json
 import os
@@ -1321,8 +1322,11 @@ def upsert_vulnerability_record(connection: sqlite3.Connection, payload: dict) -
 
 
 def list_vulnerability_records(connection: sqlite3.Connection) -> list[dict]:
-    cursor = connection.execute(
-        """
+    return list(iter_vulnerability_records(connection))
+
+
+def iter_vulnerability_records(connection) -> Iterator[dict]:
+    query = """
         SELECT id, source_name, source_type, cve_id, title, vendor, product, vulnerability_type,
                severity, cvss, is_exploited, has_poc, patch_available, wide_impact,
                disclosure_time, affected_versions, summary, advisory_url, reference_urls_json,
@@ -1330,8 +1334,15 @@ def list_vulnerability_records(connection: sqlite3.Connection) -> list[dict]:
         FROM vulnerability_records
         ORDER BY datetime(disclosure_time) DESC, id DESC
         """
-    )
-    return [dict(row) for row in cursor.fetchall()]
+    if getattr(connection, "backend_name", "") == "postgresql":
+        cursor = connection.iter_rows(query, batch_size=1)
+    else:
+        cursor = connection.execute(query)
+    try:
+        for row in cursor:
+            yield dict(row)
+    finally:
+        cursor.close()
 
 
 def replace_vulnerability_records(connection: sqlite3.Connection, rows: list[dict]) -> None:
@@ -1575,11 +1586,10 @@ def list_crawl_jobs(connection: sqlite3.Connection, limit: int = 20) -> list[dic
 
 def replace_normalized_intelligence_events(
     connection: sqlite3.Connection,
-    rows: list[dict],
-) -> None:
+    rows: Iterable[dict],
+) -> int:
     connection.execute("DELETE FROM normalized_intelligence_events")
-    connection.executemany(
-        """
+    statement = """
         INSERT INTO normalized_intelligence_events (
             event_id, source_kind, raw_source_type, source_site_name, source_record_id,
             event_type, category, leak_type, title, attacker, victim, victim_key,
@@ -1587,40 +1597,97 @@ def replace_normalized_intelligence_events(
             detail_text, mirror_resources_json, screenshot_resources_json,
             json_preview_url, risk_reasons_json, event_metadata_json, updated_at, report_time
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                row["event_id"],
-                row["source_kind"],
-                row["raw_source_type"],
-                row["source_site_name"],
-                row["source_record_id"],
-                row["event_type"],
-                row["category"],
-                row["leak_type"],
-                row["title"],
-                row["attacker"],
-                row["victim"],
-                row["victim_key"],
-                row["industry"],
-                row["region"],
-                row.get("disclosure_time"),
-                row["severity"],
-                row["risk_score"],
-                row["source_url"],
-                row["detail_text"],
-                row["mirror_resources_json"],
-                row["screenshot_resources_json"],
-                row["json_preview_url"],
-                row["risk_reasons_json"],
-                row["event_metadata_json"],
-                row["updated_at"],
-                event_report_time(row),
-            )
-            for row in rows
-        ],
-    )
-    sync_search_documents(connection, rows)
+        """
+    batch = []
+    batch_characters = 0
+    count = 0
+    for row in rows:
+        values = (
+            row["event_id"],
+            row["source_kind"],
+            row["raw_source_type"],
+            row["source_site_name"],
+            row["source_record_id"],
+            row["event_type"],
+            row["category"],
+            row["leak_type"],
+            row["title"],
+            row["attacker"],
+            row["victim"],
+            row["victim_key"],
+            row["industry"],
+            row["region"],
+            row.get("disclosure_time"),
+            row["severity"],
+            row["risk_score"],
+            row["source_url"],
+            row["detail_text"],
+            row["mirror_resources_json"],
+            row["screenshot_resources_json"],
+            row["json_preview_url"],
+            row["risk_reasons_json"],
+            row["event_metadata_json"],
+            row["updated_at"],
+            event_report_time(row),
+        )
+        characters = sum(len(value) for value in values if isinstance(value, str))
+        if batch and batch_characters + characters > 2 * 1024 * 1024:
+            connection.executemany(statement, batch)
+            batch = []
+            batch_characters = 0
+        batch.append(values)
+        batch_characters += characters
+        count += 1
+        if len(batch) >= 50 or batch_characters >= 2 * 1024 * 1024:
+            connection.executemany(statement, batch)
+            batch = []
+            batch_characters = 0
+    if batch:
+        connection.executemany(statement, batch)
+    sync_search_documents(connection)
+    return count
+
+
+def iter_normalized_intelligence_events(connection, *, preview_characters: int | None = None,
+                                       event_type: str = "", limit: int | None = None,
+                                       order_by: str = "disclosure_time DESC, event_id DESC") -> Iterator[dict]:
+    """Stream aggregate inputs; PostgreSQL must use a server-side cursor."""
+    body = "detail_text" if preview_characters is None else "SUBSTR(detail_text, 1, ?) AS detail_text"
+    parameters = [] if preview_characters is None else [max(0, int(preview_characters))]
+    where = " WHERE event_type = ?" if event_type else ""
+    if event_type:
+        parameters.append(event_type)
+    limit_sql = " LIMIT ?" if limit is not None else ""
+    if limit is not None:
+        parameters.append(max(0, int(limit)))
+    query = f"""SELECT event_id, source_kind, raw_source_type, source_site_name, source_record_id,
+        event_type, category, leak_type, title, attacker, victim, victim_key,
+        industry, region, disclosure_time, severity, risk_score, source_url,
+        {body}, mirror_resources_json, screenshot_resources_json,
+        json_preview_url, risk_reasons_json, event_metadata_json, updated_at
+        FROM normalized_intelligence_events{where} ORDER BY {order_by}{limit_sql}"""
+    if getattr(connection, "backend_name", "") == "postgresql":
+        cursor = connection.iter_rows(query, parameters, batch_size=1)
+    else:
+        cursor = connection.execute(query, parameters)
+    try:
+        for source in cursor:
+            row = dict(source)
+            # Raw payloads often contain a second full body. Aggregate callers
+            # need the promoted metadata; the detail loader retains the original.
+            try:
+                metadata = json.loads(row.get("event_metadata_json") or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            if isinstance(metadata, dict):
+                metadata.pop("raw_json", None)
+                metadata.pop("original_summary", None)
+                if metadata.get("summary"):
+                    metadata["summary"] = str(metadata["summary"])[:500]
+            row["event_metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+            yield row
+    finally:
+        cursor.close()
 
 
 _NORMALIZED_INTELLIGENCE_SEARCH_EXPRESSION = SEARCH_EXPRESSION

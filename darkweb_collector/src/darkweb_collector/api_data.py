@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter, OrderedDict
+from collections.abc import Iterator
+from contextlib import closing
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -9,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import sys
 from threading import Lock
 from time import monotonic
 from typing import Any
@@ -28,7 +31,8 @@ from darkweb_collector.db import (
     get_db_connection,
     get_normalized_intelligence_cache_state,
     get_site_connectivity_probe_map,
-    list_vulnerability_records,
+    iter_normalized_intelligence_events,
+    iter_vulnerability_records,
     search_normalized_intelligence_events,
 )
 from darkweb_collector.job_diagnostics import (
@@ -44,13 +48,12 @@ from darkweb_collector.normalized_intelligence import (
     build_display_title,
     ensure_normalized_intelligence,
     load_normalized_event_detail,
-    load_normalized_event_page,
-    load_normalized_events,
     normalized_event_to_detail,
     normalized_event_to_list_item,
 )
 from darkweb_collector.normalization_runtime import get_normalization_runtime_status
 from darkweb_collector.queueing import queue_for_detail, queue_for_seed
+from darkweb_collector.search_schema import SEARCH_ORDER
 from darkweb_collector.runtime import active_release_config, default_db_path, output_root, project_root
 from darkweb_collector.sites.darkforums import normalize_darkforums_timestamp
 from darkweb_collector.site_auth import site_auth_readiness, site_display_name
@@ -723,7 +726,7 @@ def build_event_search_payload(
         state = get_normalized_intelligence_cache_state(connection)
         if state is None and count_normalized_intelligence_events(connection) == 0:
             connection.rollback()
-            ensure_normalized_intelligence(connection, enrichment_budget=0)
+            ensure_normalized_intelligence(connection, enrichment_budget=0, load_events=False)
             connection.commit()
             connection.execute(begin)
             state = get_normalized_intelligence_cache_state(connection)
@@ -778,13 +781,23 @@ def build_event_search_payload(
     return payload
 
 
+def _iter_detail_rows(connection, query: str, parameters: tuple) -> Iterator[Any]:
+    cursor = (connection.iter_rows(query, parameters, batch_size=1)
+              if getattr(connection, "backend_name", "") == "postgresql"
+              else connection.execute(query, parameters))
+    with closing(cursor):
+        for row in cursor:
+            yield row
+
+
 def _build_forum_event_detail_by_id(
     connection,
     site_name: str,
     section: str,
     hash_value: str,
 ) -> dict[str, Any] | None:
-    rows = connection.execute(
+    rows = _iter_detail_rows(
+        connection,
         """
         SELECT d.site_name, d.section, d.topic_url, d.content, d.attachments, d.victims, d.attackers, d.fetched_at, d.raw_json,
                COALESCE(t.title, d.topic_url) AS title,
@@ -799,11 +812,12 @@ def _build_forum_event_detail_by_id(
         ORDER BY datetime(d.fetched_at) DESC
         """,
         (site_name, section),
-    ).fetchall()
-    for row in rows:
-        row_dict = dict(row)
-        if _event_hash(str(row_dict.get("topic_url") or "")) == hash_value:
-            return _build_forum_event_payload(row_dict)
+    )
+    with closing(rows):
+        for row in rows:
+            row_dict = dict(row)
+            if _event_hash(str(row_dict.get("topic_url") or "")) == hash_value:
+                return _build_forum_event_payload(row_dict)
     return None
 
 
@@ -812,7 +826,8 @@ def _build_victim_event_detail_by_id(
     site_name: str,
     hash_value: str,
 ) -> dict[str, Any] | None:
-    rows = connection.execute(
+    rows = _iter_detail_rows(
+        connection,
         """
         SELECT v.site_name, v.source_url, v.name, v.display_label, v.detail_url, v.status, v.published_at_utc, v.raw_json,
                v.last_detail_fetch_status, v.content_hash, v.domain, vd.text_excerpt, vd.page_title, vd.fetched_at_utc
@@ -823,18 +838,19 @@ def _build_victim_event_detail_by_id(
         ORDER BY COALESCE(vd.fetched_at_utc, v.published_at_utc, '') DESC, v.id DESC
         """,
         (site_name,),
-    ).fetchall()
+    )
     seen: set[str] = set()
-    for row in rows:
-        row_dict = dict(row)
-        raw_json = _parse_json(row_dict.get("raw_json"))
-        detail_url = row_dict.get("detail_url") or raw_json.get("detail_url") or ""
-        event_id = f"victim:{row_dict['site_name']}:{_event_hash(str(detail_url or row_dict.get('name', '')))}"
-        if event_id in seen:
-            continue
-        seen.add(event_id)
-        if event_id.split(":", 2)[2] == hash_value:
-            return _build_victim_event_payload(row_dict)
+    with closing(rows):
+        for row in rows:
+            row_dict = dict(row)
+            raw_json = _parse_json(row_dict.get("raw_json"))
+            detail_url = row_dict.get("detail_url") or raw_json.get("detail_url") or ""
+            event_id = f"victim:{row_dict['site_name']}:{_event_hash(str(detail_url or row_dict.get('name', '')))}"
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            if event_id.split(":", 2)[2] == hash_value:
+                return _build_victim_event_payload(row_dict)
     return None
 
 
@@ -916,12 +932,8 @@ def build_vulnerability_records(
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
     with get_db_connection() as connection:
-        rows = list_vulnerability_records(connection)
-
-    raw_events = [
-        normalized_event_to_list_item(_materialize_vulnerability_event(row))
-        for row in rows
-    ]
+        raw_events = [normalized_event_to_list_item(_materialize_vulnerability_event(row))
+                      for row in iter_vulnerability_records(connection)]
     deduped_map: dict[str, dict[str, Any]] = {}
     for item in raw_events:
         key = str(item.get("cveId") or item.get("id") or "")
@@ -962,7 +974,8 @@ def build_vulnerability_records(
 def build_vulnerability_detail(event_id: str) -> dict[str, Any] | None:
     with get_db_connection() as connection:
         cve_id = str(event_id or "").removeprefix("vuln:").upper()
-        row = next((item for item in list_vulnerability_records(connection) if str(item.get("cve_id") or "").upper() == cve_id), None)
+        with closing(iter_vulnerability_records(connection)) as rows:
+            row = next((item for item in rows if str(item.get("cve_id") or "").upper() == cve_id), None)
         if row is not None:
             event = _materialize_vulnerability_event(row)
         else:
@@ -1607,6 +1620,30 @@ def _build_executive_cards(events: list[dict[str, Any]], countries: list[dict[st
     }
 
 
+def _hydrate_payload_event(row: dict[str, Any]) -> dict[str, Any]:
+    event = _hydrate_event_row(row)
+    for key in ("event_metadata_json", "mirror_resources_json", "screenshot_resources_json", "risk_reasons_json"):
+        event.pop(key, None)
+    event["metadata"] = {sys.intern(key): value for key, value in event["metadata"].items()}
+    return event
+
+
+def _iter_payload_events(connection, *, preview_characters: int | None = 500,
+                         event_type: str = "", limit: int | None = None) -> Iterator[dict[str, Any]]:
+    options = {"preview_characters": preview_characters, "event_type": event_type,
+               "limit": limit, "order_by": SEARCH_ORDER["latest"]}
+    rows = iter_normalized_intelligence_events(connection, **options)
+    first = next(rows, None)
+    if first is None and get_normalized_intelligence_cache_state(connection) is None:
+        ensure_normalized_intelligence(connection, force=True, load_events=False)
+        rows = iter_normalized_intelligence_events(connection, **options)
+    elif first is not None:
+        yield _hydrate_payload_event(first)
+    del first
+    for row in rows:
+        yield _hydrate_payload_event(row)
+
+
 @_serialize_payload_build
 def build_intelligence_page_payload(page: str, limit: int | None = None) -> dict[str, Any]:
     page_config = {
@@ -1624,19 +1661,8 @@ def build_intelligence_page_payload(page: str, limit: int | None = None) -> dict
         cached_payload = _get_cached_payload(namespace, cache_key)
         if cached_payload is not None:
             return cached_payload
+        source_events = list(_iter_payload_events(connection, event_type=event_type, limit=event_limit))
         total_events = count_normalized_intelligence_events(connection, event_type)
-        if event_limit is not None:
-            source_events = load_normalized_event_page(
-                connection,
-                event_type=event_type,
-                limit=event_limit,
-            )
-        else:
-            source_events = [
-                item
-                for item in load_normalized_events(connection)
-                if item.get("event_type") == event_type
-            ]
 
     source_events.sort(
         key=lambda item: _parse_dt(
@@ -1766,7 +1792,7 @@ def build_dashboard_payload(days: int = 7) -> dict[str, Any]:
         cached_payload = _get_cached_payload(namespace, cache_key)
         if cached_payload is not None:
             return cached_payload
-        normalized_events = load_normalized_events(connection)
+        normalized_events = list(_iter_payload_events(connection))
         crawl_jobs = [
             dict(row)
             for row in connection.execute(
@@ -1981,8 +2007,14 @@ def build_intelligence_payload() -> dict[str, Any]:
         cached_payload = _get_cached_payload("intelligence", cache_key)
         if cached_payload is not None:
             return cached_payload
-        normalized_events, monitoring_payload = monitoring_rules_module.build_monitoring_payload(connection, load_normalized_events(connection))
-        vulnerability_rows = list_vulnerability_records(connection)
+        normalized_events, monitoring_payload = monitoring_rules_module.build_monitoring_payload(
+            connection, _iter_payload_events(connection, preview_characters=None), retain_detail_text=False)
+        vulnerability_items = [
+            (_parse_dt(str(row.get("last_seen_at") or row.get("disclosure_time") or ""))
+             or datetime.min.replace(tzinfo=timezone.utc),
+             normalized_event_to_list_item(_materialize_vulnerability_event(row)))
+            for row in iter_vulnerability_records(connection)
+        ]
         crawl_jobs = [
             dict(row)
             for row in connection.execute(
@@ -2004,12 +2036,12 @@ def build_intelligence_payload() -> dict[str, Any]:
 
     data_leak_source_events = sort_by_disclosure([item for item in normalized_events if item.get("event_type") == "data_leak"])
     ransomware_source_events = sort_by_disclosure([item for item in normalized_events if item.get("event_type") == "ransomware"])
-    vulnerability_source_events = sort_by_disclosure([_materialize_vulnerability_event(row) for row in vulnerability_rows])
+    vulnerability_source_events = [item for _, item in sorted(vulnerability_items, key=lambda item: item[0], reverse=True)]
     document_exposure_events = build_document_exposure_event_records(limit=100)
     document_exposure_summary = build_document_exposure_summary()
     data_leak_events = [normalized_event_to_list_item(item) for item in data_leak_source_events[:DATA_LEAK_EVENT_LIMIT]]
     ransomware_events = [normalized_event_to_list_item(item) for item in _apply_event_limit(ransomware_source_events, RANSOMWARE_EVENT_LIMIT)]
-    vulnerability_events = [normalized_event_to_list_item(item) for item in vulnerability_source_events[:VULNERABILITY_EVENT_LIMIT]]
+    vulnerability_events = vulnerability_source_events[:VULNERABILITY_EVENT_LIMIT]
     forum_victims = [
         {
             "victim_name": item.get("victim"),
@@ -2026,7 +2058,7 @@ def build_intelligence_payload() -> dict[str, Any]:
 
     data_leak_counter = _count_by_day([row.get("disclosure_time") for row in data_leak_source_events])
     ransomware_counter = _count_by_day([row.get("disclosure_time") for row in ransomware_source_events])
-    vulnerability_counter = _count_by_day([row.get("disclosure_time") for row in vulnerability_source_events])
+    vulnerability_counter = _count_by_day([row.get("disclosureTimeRaw") for row in vulnerability_source_events])
     data_leak_series = _series_from_counter(data_leak_counter)
     ransomware_series = _series_from_counter(ransomware_counter)
     vulnerability_series = _series_from_counter(vulnerability_counter)
@@ -2235,7 +2267,7 @@ def warm_api_payloads() -> None:
     # Prime normalized intelligence and top-level payloads once during startup
     # so the first page load is not blocked on cold work or stale cache.
     with get_db_connection() as connection:
-        ensure_normalized_intelligence(connection, force=False, enrichment_budget=0)
+        ensure_normalized_intelligence(connection, force=False, enrichment_budget=0, load_events=False)
     build_intelligence_page_payload("ransomware", limit=500)
     build_intelligence_page_payload("data-leak", limit=500)
     build_intelligence_payload()
