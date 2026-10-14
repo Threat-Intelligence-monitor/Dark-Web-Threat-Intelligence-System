@@ -369,7 +369,7 @@ def sync_ransomware_live_victims(
             if refresh_normalized:
                 from darkweb_collector.normalized_intelligence import ensure_normalized_intelligence
 
-                ensure_normalized_intelligence(connection, force=True)
+                ensure_normalized_intelligence(connection, force=True, load_events=False)
             connection.commit()
             sync_state = get_ransomware_live_sync_state(connection)
         finally:

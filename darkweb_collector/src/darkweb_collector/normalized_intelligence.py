@@ -3,6 +3,7 @@ from __future__ import annotations
 from darkweb_collector.search_schema import event_report_time
 
 from collections import Counter, OrderedDict, defaultdict
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, wraps
 from html import unescape
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import sqlite3
 import socket
+from tempfile import TemporaryDirectory
 from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
@@ -33,12 +35,11 @@ from darkweb_collector.db import (
     list_document_hits,
     get_normalized_intelligence_cache_state,
     get_normalized_intelligence_event,
-    list_ransomware_live_victims,
     list_normalized_intelligence_events,
     replace_normalized_intelligence_events,
     upsert_normalized_intelligence_cache_state,
 )
-from darkweb_collector.runtime import output_root, project_root
+from darkweb_collector.runtime import output_root, project_root, user_data_root
 from darkweb_collector.sites.breachforums import normalize_breachforums_timestamp
 from darkweb_collector.sites.cracked import normalize_cracked_timestamp
 from darkweb_collector.sites.darkforums import clean_extracted_attackers, normalize_darkforums_timestamp
@@ -61,6 +62,8 @@ from darkweb_collector.vulnerability_i18n import (
 logger = logging.getLogger(__name__)
 NORMALIZED_REFRESH_ADVISORY_LOCK_ID = int.from_bytes(b"DWTINORM", "big")
 _NORMALIZED_REFRESH_LOCK = Lock()
+NORMALIZATION_BATCH_SIZE = 50
+NORMALIZATION_BATCH_BYTES = 8 * 1024 * 1024
 DOMAIN_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE)
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -1821,13 +1824,51 @@ def _recent_cutoff(hours: int = RECENT_EVENT_HOURS) -> datetime:
     return _now_utc() - timedelta(hours=hours)
 
 
+def _normalization_rows(connection, sql, order_by, text_columns=()) -> Iterator[dict[str, Any]]:
+    """Bound driver buffers with a server cursor or text-sized SQL pages."""
+    if getattr(connection, 'backend_name', '') == 'postgresql':
+        cursor = connection.iter_rows(f'SELECT * FROM ({sql}) AS source ORDER BY {order_by}', batch_size=1)
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
+        return
+    offset = 0
+    while True:
+        limit = NORMALIZATION_BATCH_SIZE
+        if text_columns:
+            size = ' + '.join(f'COALESCE(LENGTH({column}), 0)' for column in text_columns)
+            sizes = connection.execute(
+                f'SELECT {size} AS characters FROM ({sql}) AS source ORDER BY {order_by} LIMIT ? OFFSET ?',
+                (limit, offset),
+            ).fetchall()
+            if not sizes:
+                return
+            limit = 0
+            total = 0
+            for row in sizes:
+                estimated_bytes = int(row['characters']) * 4
+                if limit and total + estimated_bytes > NORMALIZATION_BATCH_BYTES:
+                    break
+                limit += 1
+                total += estimated_bytes
+        rows = connection.execute(
+            f'SELECT * FROM ({sql}) AS source ORDER BY {order_by} LIMIT ? OFFSET ?', (limit, offset),
+        ).fetchall()
+        if not rows:
+            return
+        for row in rows:
+            yield dict(row)
+        offset += len(rows)
+
+
 def _forum_artifact_signature(connection) -> dict[str, Any]:
-    rows = connection.execute(
+    rows = _normalization_rows(connection,
         """
-        SELECT site_name, section, topic_url
+        SELECT id, site_name, section, topic_url
         FROM forum_details
-        """
-    ).fetchall()
+        """, 'id')
     mirror_count = 0
     screenshot_count = 0
     for row in rows:
@@ -1844,25 +1885,26 @@ def _forum_artifact_signature(connection) -> dict[str, Any]:
 
 
 def _forum_victim_signature(connection) -> dict[str, Any]:
-    rows = connection.execute(
+    rows = _normalization_rows(connection,
         """
-        SELECT forum_detail_id, victim_name, COALESCE(industry, '') AS industry, COALESCE(region, '') AS region
+        SELECT id, forum_detail_id, victim_name, COALESCE(industry, '') AS industry, COALESCE(region, '') AS region
         FROM forum_victims
-        ORDER BY forum_detail_id, victim_name, industry, region, id
-        """
-    ).fetchall()
+        """, 'forum_detail_id, victim_name, industry, region, id')
     digest = sha1()
     tagged_industry_count = 0
     tagged_region_count = 0
+    count = 0
     for row in rows:
         payload = dict(row)
+        payload.pop('id')
+        count += 1
         digest.update(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
         if payload["industry"] not in {"", "other", "unknown"}:
             tagged_industry_count += 1
         if payload["region"] not in {"", "unknown"}:
             tagged_region_count += 1
     return {
-        "count": len(rows),
+        "count": count,
         "content_hash": digest.hexdigest(),
         "tagged_industry_count": tagged_industry_count,
         "tagged_region_count": tagged_region_count,
@@ -1962,8 +2004,8 @@ def _load_normalized_rows_without_refresh(connection) -> list[dict[str, Any]]:
     return [_hydrate_event_row(row) for row in list_normalized_intelligence_events(connection)]
 
 
-def _forum_rows(connection) -> list[dict[str, Any]]:
-    rows = connection.execute(
+def _forum_rows(connection) -> Iterator[dict[str, Any]]:
+    return _normalization_rows(connection,
         """
         SELECT d.id, d.site_name, d.section, d.topic_url, d.content, d.attachments,
                d.victims, d.attackers, d.timestamps, d.fetched_at, d.raw_json,
@@ -1979,14 +2021,12 @@ def _forum_rows(connection) -> list[dict[str, Any]]:
         LEFT JOIN forum_victims fv
           ON fv.forum_detail_id = d.id
         GROUP BY d.id, t.title
-        ORDER BY d.id DESC
-        """
-    ).fetchall()
-    return [dict(row) for row in rows]
+        """, 'id DESC', ('content', 'raw_json', 'attachments', 'victims', 'attackers', 'timestamps',
+                       'title', 'victim_names', 'industries', 'regions'))
 
 
-def _victim_rows(connection) -> list[dict[str, Any]]:
-    rows = connection.execute(
+def _victim_rows(connection) -> Iterator[dict[str, Any]]:
+    return _normalization_rows(connection,
         """
         SELECT v.id, v.site_name, v.source_url, v.detail_url, v.name, v.display_label, v.domain,
                v.status, v.published_at_utc, v.claimed_size, v.claimed_size_gb, v.content_hash,
@@ -2002,28 +2042,27 @@ def _victim_rows(connection) -> list[dict[str, Any]]:
               ORDER BY datetime(vd2.fetched_at_utc) DESC, vd2.id DESC
               LIMIT 1
           )
-        ORDER BY v.id DESC
-        """
-    ).fetchall()
-    return [dict(row) for row in rows]
+        """, 'id DESC', ('raw_json', 'detail_raw_json', 'text_excerpt', 'page_title', 'name', 'display_label'))
 
 
-def _ransomware_live_rows(connection) -> list[dict[str, Any]]:
-    return list_ransomware_live_victims(connection)
+def _ransomware_live_rows(connection) -> Iterator[dict[str, Any]]:
+    return _normalization_rows(connection,
+        """SELECT id, victim_id, group_name, victim_name, website, country_code, activity,
+                  discovered_at, attacked_at, post_url, permalink, screenshot_url,
+                  description, press_url, raw_json, last_seen_at
+           FROM ransomware_live_victims""",
+        'datetime(COALESCE(attacked_at, discovered_at)) DESC, id DESC', ('description', 'raw_json'))
 
 
-def _vulnerability_rows(connection) -> list[dict[str, Any]]:
-    rows = connection.execute(
+def _vulnerability_rows(connection) -> Iterator[dict[str, Any]]:
+    return _normalization_rows(connection,
         """
         SELECT id, source_name, source_type, cve_id, title, vendor, product, vulnerability_type,
                severity, cvss, is_exploited, has_poc, patch_available, wide_impact,
                disclosure_time, affected_versions, summary, advisory_url, reference_urls_json,
                raw_json, last_seen_at
         FROM vulnerability_records
-        ORDER BY datetime(disclosure_time) DESC, id DESC
-        """
-    ).fetchall()
-    return [dict(row) for row in rows]
+        """, 'datetime(disclosure_time) DESC, id DESC', ('summary', 'raw_json', 'reference_urls_json', 'affected_versions'))
 
 
 def _document_hit_rows(connection) -> list[dict[str, Any]]:
@@ -2625,16 +2664,20 @@ def _compute_spike_counters(events: list[dict[str, Any]], field: str) -> tuple[C
     return recent_counter, previous_counter
 
 
-def _score_events(events: list[dict[str, Any]]) -> None:
-    actor_counter = Counter(event["attacker"] for event in events if event["attacker"] and event["attacker"] != "未知")
-    victim_counter = Counter(event["victim_key"] for event in events if event["victim_key"] and event["victim_key"] != "unknown")
-    actor_sites: defaultdict[str, set[str]] = defaultdict(set)
-    for event in events:
-        actor_sites[event["attacker"]].add(event["source_site_name"])
-
-    industry_recent, industry_previous = _compute_spike_counters(events, "industry")
-    region_recent, region_previous = _compute_spike_counters(events, "region")
-    recent_cutoff = _recent_cutoff()
+def _score_events(events: list[dict[str, Any]], *, statistics=None, recent_cutoff=None) -> None:
+    if statistics is None:
+        actor_counter = Counter(event["attacker"] for event in events if event["attacker"] and event["attacker"] != "未知")
+        victim_counter = Counter(event["victim_key"] for event in events if event["victim_key"] and event["victim_key"] != "unknown")
+        actor_sites: defaultdict[str, set[str]] = defaultdict(set)
+        for event in events:
+            actor_sites[event["attacker"]].add(event["source_site_name"])
+        actor_site_counts = {actor: len(sites) for actor, sites in actor_sites.items()}
+        industry_recent, industry_previous = _compute_spike_counters(events, "industry")
+        region_recent, region_previous = _compute_spike_counters(events, "region")
+    else:
+        (actor_counter, victim_counter, actor_site_counts, industry_recent, industry_previous,
+         region_recent, region_previous) = statistics
+    recent_cutoff = recent_cutoff or _recent_cutoff()
     severity_points = {"critical": 30, "high": 20, "medium": 12, "low": 6}
 
     for event in events:
@@ -2677,7 +2720,7 @@ def _score_events(events: list[dict[str, Any]]) -> None:
             score += min(18, actor_count * 4)
             reasons.append("同一主体近期重复出现")
 
-        if event["event_type"] != "vulnerability" and len(actor_sites.get(actor, set())) >= 2:
+        if event["event_type"] != "vulnerability" and actor_site_counts.get(actor, 0) >= 2:
             score += 12
             reasons.append("同一主体跨站点出现")
 
@@ -3050,138 +3093,190 @@ def _merge_duplicate_events(existing: dict[str, Any], current: dict[str, Any]) -
     return merged
 
 
-def _new_normalized_events(
-    events: list[dict[str, Any]],
-    previous_event_ids: set[str],
-) -> list[dict[str, Any]]:
-    return [
-        event
-        for event in events
-        if (event_id := str(event.get("event_id") or ""))
-        and event_id not in previous_event_ids
-    ]
+def _stage_normalized_events(connection, spool, domain_cache, enrichment_budget):
+    spool.executescript("""
+        CREATE TABLE previous_resources(event_id TEXT PRIMARY KEY, mirrors TEXT, screenshots TEXT, preview TEXT);
+        CREATE TABLE base_events(
+            seq INTEGER PRIMARY KEY, payload TEXT NOT NULL, summary TEXT NOT NULL,
+            victim_key TEXT, country_known INTEGER, country_score INTEGER, industry_known INTEGER,
+            industry_score INTEGER, confidence INTEGER, disclosure_at TEXT, enrichment_risk INTEGER, candidate INTEGER,
+            actor TEXT, site TEXT, industry TEXT, region TEXT, window INTEGER);
+        CREATE INDEX country_context_order ON base_events(victim_key, country_known DESC, country_score DESC, confidence DESC, seq);
+        CREATE INDEX industry_context_order ON base_events(victim_key, industry_known DESC, industry_score DESC, confidence DESC, seq);
+        CREATE TABLE id_events(seq INTEGER PRIMARY KEY, event_id TEXT UNIQUE, payload TEXT NOT NULL);
+        CREATE TABLE final_events(seq INTEGER PRIMARY KEY, site TEXT, kind TEXT, title_key TEXT,
+            event_id TEXT, report_time TEXT, payload TEXT NOT NULL, UNIQUE(site, kind, title_key));
+        CREATE INDEX final_event_order ON final_events(report_time DESC, event_id DESC);
+    """)
+    logger.info("normalized intelligence refresh phase=previous_resources")
+    for row in _normalization_rows(connection,
+            'SELECT event_id, mirror_resources_json, screenshot_resources_json, json_preview_url FROM normalized_intelligence_events',
+            'event_id', ('mirror_resources_json', 'screenshot_resources_json', 'json_preview_url')):
+        spool.execute('INSERT INTO previous_resources VALUES (?, ?, ?, ?)',
+                      (row['event_id'], row['mirror_resources_json'], row['screenshot_resources_json'], row['json_preview_url']))
+    for rows, build in ((_forum_rows, _build_forum_base_event), (_victim_rows, _build_victim_base_event),
+                        (_ransomware_live_rows, _build_ransomware_live_base_event), (_vulnerability_rows, _build_vulnerability_base_event)):
+        logger.info("normalized intelligence refresh phase=source source=%s", getattr(rows, '__name__', 'source'))
+        for row in rows(connection):
+            event = build(row) if build is _build_vulnerability_base_event else build(row, domain_cache=domain_cache)
+            metadata = event['metadata']
+            summary = {key: event.get(key) for key in ('victim_key', 'country', 'country_code', 'region', 'industry',
+                                                      'confidence_score', 'completeness_score')}
+            summary['metadata'] = {key: metadata.get(key) for key in ('country_score', 'country_source', 'industry_score', 'industry_source')}
+            disclosure = _parse_dt(str(event.get('disclosure_time') or ''))
+            spool.execute('INSERT INTO base_events VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0)',
+                (_json_dumps(event), _json_dumps(summary), event.get('victim_key') or 'unknown',
+                 int(str(event.get('country') or '').strip() not in {'', '未知'}), int(metadata.get('country_score') or 0),
+                 int(str(event.get('industry') or '').strip() not in {'', '未知'}), int(metadata.get('industry_score') or 0),
+                 int(event.get('confidence_score') or 0),
+                 disclosure.astimezone(timezone.utc).isoformat(timespec='microseconds') if disclosure else '',
+                 int(event.get('risk_score') or 0),
+                 event['attacker'], event['source_site_name'], _normalize_label(event['industry']), _normalize_label(event['region'])))
+    logger.info("normalized intelligence refresh phase=entity_context")
+    # Keep the first source row on a tie, as max() does on the original ordered list.
+    for name, known, score in (('country', 'country_known', 'country_score'), ('industry', 'industry_known', 'industry_score')):
+        spool.execute(f"""CREATE TABLE {name}_context AS SELECT victim_key, seq, summary FROM (
+            SELECT victim_key, seq, summary, ROW_NUMBER() OVER (
+                PARTITION BY victim_key ORDER BY {known} DESC, {score} DESC, confidence DESC, seq) AS rank
+            FROM base_events WHERE victim_key <> 'unknown') WHERE rank = 1""")
+        spool.execute(f'CREATE UNIQUE INDEX {name}_context_key ON {name}_context(victim_key)')
+    for row in spool.execute('''SELECT e.seq, e.payload, c.seq AS country_seq, c.summary AS country_summary,
+        i.seq AS industry_seq, i.summary AS industry_summary FROM base_events e
+        LEFT JOIN country_context c ON c.victim_key = e.victim_key
+        LEFT JOIN industry_context i ON i.victim_key = e.victim_key ORDER BY e.seq'''):
+        event = json.loads(row['payload'])
+        if row['country_summary'] is not None:
+            context = [(row['country_seq'], json.loads(row['country_summary'])),
+                       (row['industry_seq'], json.loads(row['industry_summary'])), (row['seq'], event)]
+            _propagate_entity_context([item for _, item in sorted(context, key=lambda item: item[0])])
+        domain = _normalize_domain((event['metadata'].get('entity_link_evidence') or {}).get('primary_domain') or '')
+        candidate = bool(domain and not _is_noisy_domain(domain) and (event.get('country') == '未知' or event.get('industry') == '未知'))
+        spool.execute('UPDATE base_events SET payload = ?, candidate = ? WHERE seq = ?', (_json_dumps(event), int(candidate), row['seq']))
+    domain_cache['__remaining__'] = enrichment_budget
+    spool.execute('CREATE INDEX enrichment_order ON base_events(candidate, disclosure_at DESC, enrichment_risk DESC, seq)')
+    for row in spool.execute('SELECT seq, payload FROM base_events WHERE candidate = 1 ORDER BY disclosure_at DESC, enrichment_risk DESC, seq'):
+        event = json.loads(row['payload'])
+        _apply_domain_enrichment([event], domain_cache)
+        spool.execute('UPDATE base_events SET payload = ? WHERE seq = ?', (_json_dumps(event), row['seq']))
+    now = _now_utc()
+    logger.info("normalized intelligence refresh phase=scoring_and_deduplication")
+    recent_cutoff, previous_cutoff = now - timedelta(days=SPIKE_WINDOW_DAYS), now - timedelta(days=SPIKE_WINDOW_DAYS * 2)
+    for row in spool.execute('SELECT seq, payload FROM base_events ORDER BY seq'):
+        event = json.loads(row['payload'])
+        disclosure = _parse_dt(str(event.get('disclosure_time') or ''))
+        window = 1 if disclosure and disclosure >= recent_cutoff else 2 if disclosure and disclosure >= previous_cutoff else 0
+        spool.execute('UPDATE base_events SET industry = ?, region = ?, window = ? WHERE seq = ?',
+                      (_normalize_label(event['industry']), _normalize_label(event['region']), window, row['seq']))
+    spool.executescript('''CREATE TABLE statistics(kind TEXT, label TEXT, total INTEGER, sites INTEGER,
+        recent INTEGER, previous INTEGER, PRIMARY KEY(kind, label));
+        INSERT INTO statistics SELECT 'actor', actor, CASE WHEN actor IN ('', '未知') THEN 0 ELSE COUNT(*) END,
+            COUNT(DISTINCT site), 0, 0 FROM base_events GROUP BY actor;
+        INSERT INTO statistics SELECT 'victim', victim_key, CASE WHEN victim_key IN ('', 'unknown') THEN 0 ELSE COUNT(*) END,
+            0, 0, 0 FROM base_events GROUP BY victim_key;
+        INSERT INTO statistics SELECT 'industry', industry, 0, 0, SUM(window = 1), SUM(window = 2)
+            FROM base_events WHERE industry NOT IN ('', '未知') GROUP BY industry;
+        INSERT INTO statistics SELECT 'region', region, 0, 0, SUM(window = 1), SUM(window = 2)
+            FROM base_events WHERE region NOT IN ('', '未知') GROUP BY region;''')
+    scoring_cutoff = _recent_cutoff()
+    for row in spool.execute('''SELECT e.*, COALESCE(a.total, 0) AS actor_count, COALESCE(a.sites, 0) AS actor_sites,
+        COALESCE(v.total, 0) AS victim_count, COALESCE(i.recent, 0) AS industry_recent, COALESCE(i.previous, 0) AS industry_previous,
+        COALESCE(r.recent, 0) AS region_recent, COALESCE(r.previous, 0) AS region_previous FROM base_events e
+        LEFT JOIN statistics a ON a.kind = 'actor' AND a.label = e.actor
+        LEFT JOIN statistics v ON v.kind = 'victim' AND v.label = e.victim_key
+        LEFT JOIN statistics i ON i.kind = 'industry' AND i.label = e.industry
+        LEFT JOIN statistics r ON r.kind = 'region' AND r.label = e.region ORDER BY e.seq'''):
+        event = json.loads(row['payload'])
+        _score_events([event], statistics=({row['actor']: row['actor_count']}, {row['victim_key']: row['victim_count']},
+            {row['actor']: row['actor_sites']}, {row['industry']: row['industry_recent']}, {row['industry']: row['industry_previous']},
+            {row['region']: row['region_recent']}, {row['region']: row['region_previous']}), recent_cutoff=scoring_cutoff)
+        existing = spool.execute('SELECT payload FROM id_events WHERE event_id = ?', (event['event_id'],)).fetchone()
+        if existing is None:
+            spool.execute('INSERT INTO id_events VALUES (?, ?, ?)', (row['seq'], event['event_id'], _json_dumps(event)))
+        else:
+            event = _merge_duplicate_events(json.loads(existing['payload']), event)
+            spool.execute('UPDATE id_events SET payload = ? WHERE event_id = ?', (_json_dumps(event), event['event_id']))
+    spool.execute('DROP TABLE base_events')
+    for row in spool.execute('SELECT seq, payload FROM id_events ORDER BY seq'):
+        event = json.loads(row['payload'])
+        key = (str(event.get('source_site_name') or ''), str(event.get('event_type') or ''), _canonical_key(event.get('title') or ''))
+        existing = spool.execute('SELECT payload FROM final_events WHERE site = ? AND kind = ? AND title_key = ?', key).fetchone()
+        if existing is None:
+            spool.execute('INSERT INTO final_events VALUES (?, ?, ?, ?, ?, ?, ?)',
+                          (row['seq'], *key, event['event_id'], event_report_time(event), _json_dumps(event)))
+        else:
+            event = _merge_duplicate_events(json.loads(existing['payload']), event)
+            spool.execute('UPDATE final_events SET event_id = ?, report_time = ?, payload = ? WHERE site = ? AND kind = ? AND title_key = ?',
+                          (event['event_id'], event_report_time(event), _json_dumps(event), *key))
 
 
-def refresh_normalized_intelligence(connection, *, enrichment_budget: int | None = None) -> list[dict[str, Any]]:
-    previous_resources = {
-        str(row.get("event_id") or ""): {
-            "mirror_resources": _coerce_resource_list(_parse_json(row.get("mirror_resources_json"))),
-            "screenshot_resources": _coerce_resource_list(_parse_json(row.get("screenshot_resources_json"))),
-            "json_preview_url": str(row.get("json_preview_url") or ""),
+def _normalized_spool_rows(spool, updated_at, *, new_only=False):
+    where = 'WHERE p.event_id IS NULL' if new_only else ''
+    for row in spool.execute(f'''SELECT f.payload, p.mirrors, p.screenshots, p.preview FROM final_events f
+            LEFT JOIN previous_resources p ON p.event_id = f.event_id {where}
+            ORDER BY f.report_time DESC, f.event_id DESC'''):
+        event = json.loads(row['payload'])
+        mirror_resources = _merge_unique_resources(_coerce_resource_list(_parse_json(row['mirrors'])), event.get('mirror_resources') or [])
+        screenshot_resources = _merge_unique_resources(_coerce_resource_list(_parse_json(row['screenshots'])), event.get('screenshot_resources') or [])
+        metadata_payload = {
+            **event['metadata'], 'country': event.get('country') or '未知', 'country_code': event.get('country_code') or '',
+            'macro_region': event.get('region') or '未知', 'confidence_score': int(event.get('confidence_score') or 0),
+            'completeness_score': int(event.get('completeness_score') or 0), 'resource_count': len(mirror_resources),
         }
-        for row in list_normalized_intelligence_events(connection)
-    }
+        yield {**{key: event[key] for key in ('event_id', 'source_kind', 'raw_source_type', 'source_site_name', 'source_record_id',
+                    'event_type', 'category', 'leak_type', 'title', 'attacker', 'victim', 'victim_key', 'industry', 'region', 'severity')},
+            'risk_score': int(event['risk_score']), 'disclosure_time': event.get('disclosure_time') or '',
+            'source_url': event.get('source_url') or '', 'detail_text': event.get('detail_text') or '',
+            'mirror_resources_json': _json_dumps(mirror_resources), 'screenshot_resources_json': _json_dumps(screenshot_resources),
+            'json_preview_url': str(event.get('json_preview_url') or row['preview'] or ''),
+            'risk_reasons_json': _json_dumps(event['metadata'].get('risk_reasons') or []),
+            'event_metadata_json': _json_dumps(metadata_payload), 'updated_at': updated_at}
+
+
+def refresh_normalized_intelligence(connection, *, enrichment_budget: int | None = None,
+                                   load_events: bool = True) -> list[dict[str, Any]]:
     source_signature = _build_source_signature(connection)
     domain_cache = _load_domain_enrichment_cache()
-    effective_enrichment_budget = DOMAIN_ENRICHMENT_BUDGET if enrichment_budget is None else max(0, int(enrichment_budget))
-    domain_cache["__remaining__"] = effective_enrichment_budget
-    base_events: list[dict[str, Any]] = []
-    for row in _forum_rows(connection):
-        base_events.append(_build_forum_base_event(row, domain_cache=domain_cache))
-    for row in _victim_rows(connection):
-        base_events.append(_build_victim_base_event(row, domain_cache=domain_cache))
-    for row in _ransomware_live_rows(connection):
-        base_events.append(_build_ransomware_live_base_event(row, domain_cache=domain_cache))
-    for row in _vulnerability_rows(connection):
-        base_events.append(_build_vulnerability_base_event(row))
+    budget = DOMAIN_ENRICHMENT_BUDGET if enrichment_budget is None else max(0, int(enrichment_budget))
+    domain_cache["__remaining__"] = budget
+    temporary_root = user_data_root() / "tmp"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="normalization-", dir=temporary_root) as directory:
+        spool = sqlite3.connect(Path(directory) / "events.sqlite")
+        spool.row_factory = sqlite3.Row
+        try:
+            spool.execute("PRAGMA cache_size=-4096")
+            spool.execute("PRAGMA temp_store=FILE")
+            spool.execute("PRAGMA mmap_size=0")
+            spool.execute("PRAGMA journal_mode=OFF")
+            spool.execute("PRAGMA synchronous=OFF")
+            _stage_normalized_events(connection, spool, domain_cache, budget)
+            updated_at = _now_utc().isoformat()
+            logger.info("normalized intelligence refresh phase=publish")
+            event_count = replace_normalized_intelligence_events(connection, _normalized_spool_rows(spool, updated_at))
+            upsert_normalized_intelligence_cache_state(
+                connection, source_signature=source_signature, event_count=event_count, refreshed_at=updated_at,
+            )
+            _save_domain_enrichment_cache(domain_cache)
+            connection.commit()
+            try:
+                from darkweb_collector.monitoring_notifications import notify_keyword_matches_for_watchlists
 
-    _propagate_entity_context(base_events)
-    domain_cache["__remaining__"] = effective_enrichment_budget
-    _apply_domain_enrichment(base_events, domain_cache)
-    _score_events(base_events)
-    deduped_events: dict[str, dict[str, Any]] = {}
-    for event in base_events:
-        existing = deduped_events.get(event["event_id"])
-        if existing is None:
-            deduped_events[event["event_id"]] = event
-            continue
-        deduped_events[event["event_id"]] = _merge_duplicate_events(existing, event)
-
-    title_deduped_events: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for event in deduped_events.values():
-        title_key = (
-            str(event.get("source_site_name") or ""),
-            str(event.get("event_type") or ""),
-            _canonical_key(event.get("title") or ""),
-        )
-        existing = title_deduped_events.get(title_key)
-        if existing is None:
-            title_deduped_events[title_key] = event
-            continue
-        title_deduped_events[title_key] = _merge_duplicate_events(existing, event)
-
-    updated_at = _now_utc().isoformat()
-    persisted_rows: list[dict[str, Any]] = []
-    for event in title_deduped_events.values():
-        previous = previous_resources.get(str(event.get("event_id") or ""), {})
-        mirror_resources = _merge_unique_resources(
-            previous.get("mirror_resources") or [],
-            event.get("mirror_resources") or [],
-        )
-        screenshot_resources = _merge_unique_resources(
-            previous.get("screenshot_resources") or [],
-            event.get("screenshot_resources") or [],
-        )
-        json_preview_url = str(
-            event.get("json_preview_url") or previous.get("json_preview_url") or ""
-        )
-        metadata_payload = {
-            **event["metadata"],
-            "country": event.get("country") or "未知",
-            "country_code": event.get("country_code") or "",
-            "macro_region": event.get("region") or "未知",
-            "confidence_score": int(event.get("confidence_score") or 0),
-            "completeness_score": int(event.get("completeness_score") or 0),
-            "resource_count": len(mirror_resources),
-        }
-        persisted_rows.append(
-            {
-                "event_id": event["event_id"],
-                "source_kind": event["source_kind"],
-                "raw_source_type": event["raw_source_type"],
-                "source_site_name": event["source_site_name"],
-                "source_record_id": event["source_record_id"],
-                "event_type": event["event_type"],
-                "category": event["category"],
-                "leak_type": event["leak_type"],
-                "title": event["title"],
-                "attacker": event["attacker"],
-                "victim": event["victim"],
-                "victim_key": event["victim_key"],
-                "industry": event["industry"],
-                "region": event["region"],
-                "disclosure_time": event.get("disclosure_time") or "",
-                "severity": event["severity"],
-                "risk_score": int(event["risk_score"]),
-                "source_url": event.get("source_url") or "",
-                "detail_text": event.get("detail_text") or "",
-                "mirror_resources_json": _json_dumps(mirror_resources),
-                "screenshot_resources_json": _json_dumps(screenshot_resources),
-                "json_preview_url": json_preview_url,
-                "risk_reasons_json": _json_dumps(event["metadata"].get("risk_reasons") or []),
-                "event_metadata_json": _json_dumps(metadata_payload),
-                "updated_at": updated_at,
-            }
-        )
-    replace_normalized_intelligence_events(connection, persisted_rows)
-    upsert_normalized_intelligence_cache_state(
-        connection,
-        source_signature=source_signature,
-        event_count=len(persisted_rows),
-        refreshed_at=updated_at,
-    )
-    _save_domain_enrichment_cache(domain_cache)
-    connection.commit()
-    refreshed_events = load_normalized_events(connection, refresh=False)
-    try:
-        from darkweb_collector.monitoring_notifications import notify_keyword_matches_for_watchlists
-
-        new_events = _new_normalized_events(refreshed_events, set(previous_resources))
-        if new_events:
-            notify_keyword_matches_for_watchlists(connection, new_events)
-    except Exception:
-        logger.exception("failed to send monitoring keyword notifications after normalized intelligence refresh")
-    return refreshed_events
+                batch = []
+                batch_bytes = 0
+                for row in _normalized_spool_rows(spool, updated_at, new_only=True):
+                    size = len(row["detail_text"].encode("utf-8")) + len(row["event_metadata_json"].encode("utf-8"))
+                    if batch and (len(batch) >= NORMALIZATION_BATCH_SIZE or batch_bytes + size > NORMALIZATION_BATCH_BYTES):
+                        notify_keyword_matches_for_watchlists(connection, batch)
+                        batch, batch_bytes = [], 0
+                    batch.append(_hydrate_event_row(row))
+                    batch_bytes += size
+                if batch:
+                    notify_keyword_matches_for_watchlists(connection, batch)
+            except Exception:
+                logger.exception("failed to send monitoring keyword notifications after normalized intelligence refresh")
+            return load_normalized_events(connection, refresh=False) if load_events else []
+        finally:
+            spool.close()
 
 
 def ensure_normalized_intelligence(
@@ -3189,16 +3284,17 @@ def ensure_normalized_intelligence(
     force: bool = False,
     *,
     enrichment_budget: int | None = None,
+    load_events: bool = True,
 ) -> list[dict[str, Any]]:
     if not force and not should_refresh_normalized_intelligence(connection):
-        return load_normalized_events(connection, refresh=False)
+        return load_normalized_events(connection, refresh=False) if load_events else []
     acquired, release_local = _try_acquire_normalized_refresh_lock(connection)
     if not acquired:
-        return _load_normalized_rows_without_refresh(connection)
+        return _load_normalized_rows_without_refresh(connection) if load_events else []
     try:
         if not force and not should_refresh_normalized_intelligence(connection):
-            return _load_normalized_rows_without_refresh(connection)
-        return refresh_normalized_intelligence(connection, enrichment_budget=enrichment_budget)
+            return _load_normalized_rows_without_refresh(connection) if load_events else []
+        return refresh_normalized_intelligence(connection, enrichment_budget=enrichment_budget, load_events=load_events)
     finally:
         if release_local:
             _NORMALIZED_REFRESH_LOCK.release()
@@ -3235,7 +3331,7 @@ def load_normalized_event_page(
     if rows:
         return [_hydrate_event_row(row) for row in rows]
     if get_normalized_intelligence_cache_state(connection) is None:
-        ensure_normalized_intelligence(connection, force=True)
+        ensure_normalized_intelligence(connection, force=True, load_events=False)
         rows = list_normalized_intelligence_events(
             connection,
             event_type=event_type,
@@ -3250,10 +3346,10 @@ def load_normalized_event_page(
 
 def load_normalized_event_detail(connection, event_id: str, refresh: bool = False) -> dict[str, Any] | None:
     if refresh:
-        ensure_normalized_intelligence(connection, force=True)
+        ensure_normalized_intelligence(connection, force=True, load_events=False)
     row = get_normalized_intelligence_event(connection, event_id)
     if row is None and get_normalized_intelligence_cache_state(connection) is None:
-        ensure_normalized_intelligence(connection, force=True)
+        ensure_normalized_intelligence(connection, force=True, load_events=False)
         row = get_normalized_intelligence_event(connection, event_id)
     if row is None:
         return None
