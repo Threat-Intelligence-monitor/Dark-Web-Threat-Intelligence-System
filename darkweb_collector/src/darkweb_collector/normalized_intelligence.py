@@ -52,6 +52,8 @@ from darkweb_collector.vulnerability_i18n import (
     humanize_product_token,
     humanize_raw_source_type,
     humanize_source_type,
+    is_translation_error,
+    resolve_vulnerability_summary,
     translate_product_name,
     translate_vulnerability_summary,
     translate_vulnerability_title,
@@ -562,7 +564,7 @@ REGION_KEYWORDS = {
 
 RECENT_EVENT_HOURS = 72
 SPIKE_WINDOW_DAYS = 7
-NORMALIZATION_VERSION = "2026-08-19-resource-preservation-v7"
+NORMALIZATION_VERSION = "2026-10-15-vulnerability-summary-v8"
 NORMALIZATION_SCHEMA_VERSION = NORMALIZATION_VERSION
 DOMAIN_ENRICHMENT_BUDGET = 20
 DOMAIN_ENRICHMENT_TIMEOUT = 2
@@ -1256,7 +1258,15 @@ def _keyword_match_pattern(keyword: str) -> re.Pattern[str]:
 
 
 def _count_keyword_matches(text: str, keyword: str) -> int:
+    if keyword.lower() not in text:
+        return 0
     return len(_keyword_match_pattern(keyword).findall(text))
+
+
+@lru_cache(maxsize=256)
+def _country_hint_literal(pattern: str) -> str:
+    match = re.fullmatch(r"\\b([a-z0-9 ]+)\\b", pattern)
+    return match.group(1) if match else ""
 
 
 def _cache_text_inference(function):
@@ -1335,6 +1345,9 @@ def _infer_country_bundle(*texts: tuple[str, int]) -> dict[str, Any]:
 
         for code, patterns in COUNTRY_HINT_PATTERNS.items():
             for pattern in patterns:
+                literal = _country_hint_literal(pattern)
+                if literal and literal not in lowered:
+                    continue
                 match = re.search(pattern, lowered)
                 if not match:
                     continue
@@ -1352,7 +1365,11 @@ def _infer_country_bundle(*texts: tuple[str, int]) -> dict[str, Any]:
                 sources[code].append(f"{source_name}:domain")
                 evidence[code].append(domain)
 
+        # These Unicode letters also match ASCII literals under re.IGNORECASE.
+        generic_text = lowered.replace("ı", "i").replace("ſ", "s")
         for code, pattern, alias in _generic_country_patterns():
+            if alias.isascii() and alias.lower() not in generic_text:
+                continue
             match = pattern.search(lowered)
             if not match:
                 continue
@@ -2570,15 +2587,19 @@ def _resolve_vulnerability_vendor_product(row: dict[str, Any], raw_json: dict[st
 
 def _build_vulnerability_base_event(row: dict[str, Any]) -> dict[str, Any]:
     raw_json = _parse_json(row.get("raw_json"))
+    display_summary, original_summary = resolve_vulnerability_summary(row, raw_json)
     source_name = _normalize_label(row.get("source_name")).lower()
     source_label = _label_source(source_name)
-    vendor, product = _resolve_vulnerability_vendor_product(row, raw_json)
+    vendor, product = _resolve_vulnerability_vendor_product({**row, "summary": display_summary}, raw_json)
     cve_id = _normalize_label(row.get("cve_id")).upper()
     vulnerability_type = translate_vulnerability_type(_normalize_label(row.get("vulnerability_type")) or "公开源漏洞")
     original_title = _normalize_label(row.get("title")) or f"{cve_id} {vendor} {product}"
-    original_summary = _normalize_whitespace(row.get("summary"))
     title = translate_vulnerability_title(original_title, vendor=vendor, product=product)
-    summary = translate_vulnerability_summary(original_summary)
+    summary = translate_vulnerability_summary(display_summary)
+    summary_unavailable = not summary and any(
+        is_translation_error(value)
+        for value in (row.get("summary"), raw_json.get("summary"), raw_json.get("original_summary"))
+    )
     affected_versions = _coerce_string_list(row.get("affected_versions"))
     affected_version_items = build_affected_version_items(affected_versions)
     raw_reference_urls = [item.get("url") for item in _coerce_resource_list(_parse_json(row.get("reference_urls_json"))) if item.get("url")]
@@ -2629,6 +2650,7 @@ def _build_vulnerability_base_event(row: dict[str, Any]) -> dict[str, Any]:
             "original_title": original_title,
             "original_summary": original_summary,
             "summary": summary,
+            "summary_unavailable": summary_unavailable,
             "cvss": row.get("cvss"),
             "is_exploited": _coerce_bool(row.get("is_exploited")),
             "has_poc": _coerce_bool(row.get("has_poc")),
@@ -3484,6 +3506,7 @@ def normalized_event_to_detail(event: dict[str, Any]) -> dict[str, Any]:
         "source_type_label": metadata.get("source_type_label") or humanize_source_type(metadata.get("source_type")),
         "original_title": metadata.get("original_title") or event["title"],
         "original_summary": metadata.get("original_summary") or "",
+        "summary_unavailable": bool(metadata.get("summary_unavailable")),
     }
 
 

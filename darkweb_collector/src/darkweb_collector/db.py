@@ -1325,19 +1325,25 @@ def list_vulnerability_records(connection: sqlite3.Connection) -> list[dict]:
     return list(iter_vulnerability_records(connection))
 
 
-def iter_vulnerability_records(connection) -> Iterator[dict]:
-    query = """
-        SELECT id, source_name, source_type, cve_id, title, vendor, product, vulnerability_type,
+def iter_vulnerability_records(connection, *, selection_only: bool = False,
+                               record_ids: list[int] | None = None) -> Iterator[dict]:
+    columns = "id, cve_id, severity, cvss, is_exploited, disclosure_time, last_seen_at" if selection_only else """
+               id, source_name, source_type, cve_id, title, vendor, product, vulnerability_type,
                severity, cvss, is_exploited, has_poc, patch_available, wide_impact,
                disclosure_time, affected_versions, summary, advisory_url, reference_urls_json,
-               raw_json, last_seen_at
-        FROM vulnerability_records
+               raw_json, last_seen_at"""
+    where = ""
+    if record_ids is not None:
+        where = " WHERE id IN (" + ", ".join("?" for _ in record_ids) + ")" if record_ids else " WHERE 1 = 0"
+    query = f"""
+        SELECT {columns}
+        FROM vulnerability_records{where}
         ORDER BY datetime(disclosure_time) DESC, id DESC
         """
     if getattr(connection, "backend_name", "") == "postgresql":
-        cursor = connection.iter_rows(query, batch_size=1)
+        cursor = connection.iter_rows(query, record_ids or (), batch_size=128 if selection_only else 1)
     else:
-        cursor = connection.execute(query)
+        cursor = connection.execute(query, record_ids or ())
     try:
         for row in cursor:
             yield dict(row)
@@ -1648,43 +1654,99 @@ def replace_normalized_intelligence_events(
     return count
 
 
+def _normalized_metadata_sql(connection, *, summary_only: bool = False) -> str:
+    if getattr(connection, "backend_name", "") == "postgresql":
+        if getattr(getattr(connection, "_raw", None), "server_version", 160000) < 160000:
+            return "event_metadata_json"
+        # jsonb rejects valid source JSON containing escaped NULs, lone
+        # surrogates or very large numbers, even inside discarded raw fields.
+        metadata = "CASE WHEN metadata_check.is_object AND metadata_check.is_valid THEN event_metadata_json::json ELSE '{}'::json END"
+        if summary_only:
+            return (f"(SELECT COALESCE(json_object_agg(key, value), '{{}}'::json)::text FROM json_each({metadata}) "
+                    "WHERE key IN ('updated_time', 'country', 'country_code', 'macro_region', 'industry', 'source_label', 'confidence_score'))")
+        return (f"(SELECT COALESCE(json_object_agg(key, value), '{{}}'::json)::text FROM json_each({metadata}) "
+                "WHERE key NOT IN ('raw_json', 'original_summary'))")
+    metadata = "CASE WHEN json_valid(event_metadata_json) AND json_type(event_metadata_json) = 'object' THEN event_metadata_json ELSE '{}' END"
+    if summary_only:
+        keys = ("updated_time", "country", "country_code", "macro_region", "industry", "source_label", "confidence_score")
+        return "json_object(" + ", ".join(f"'{key}', json_extract({metadata}, '$.{key}')" for key in keys) + ")"
+    return f"json_remove({metadata}, '$.raw_json', '$.original_summary')"
+
+
 def iter_normalized_intelligence_events(connection, *, preview_characters: int | None = None,
                                        event_type: str = "", limit: int | None = None,
-                                       order_by: str = "disclosure_time DESC, event_id DESC") -> Iterator[dict]:
+                                       order_by: str = "disclosure_time DESC, event_id DESC",
+                                       report_time_since: str | None = None, summary_only: bool = False,
+                                       event_ids: list[str] | None = None) -> Iterator[dict]:
     """Stream aggregate inputs; PostgreSQL must use a server-side cursor."""
-    body = "detail_text" if preview_characters is None else "SUBSTR(detail_text, 1, ?) AS detail_text"
-    parameters = [] if preview_characters is None else [max(0, int(preview_characters))]
-    where = " WHERE event_type = ?" if event_type else ""
+    body = "'' AS detail_text" if summary_only else "detail_text" if preview_characters is None else "SUBSTR(detail_text, 1, ?) AS detail_text"
+    parameters = [] if summary_only or preview_characters is None else [max(0, int(preview_characters))]
+    conditions = []
     if event_type:
+        conditions.append("event_type = ?")
         parameters.append(event_type)
+    if report_time_since is not None:
+        conditions.append("(report_time >= ? OR report_time IS NULL OR report_time = '')")
+        parameters.append(report_time_since)
+    if event_ids is not None:
+        conditions.append("event_id IN (" + ", ".join("?" for _ in event_ids) + ")" if event_ids else "1 = 0")
+        parameters.extend(event_ids)
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
     limit_sql = " LIMIT ?" if limit is not None else ""
     if limit is not None:
         parameters.append(max(0, int(limit)))
+    metadata = _normalized_metadata_sql(connection, summary_only=summary_only)
+    postgres_json = getattr(connection, "backend_name", "") == "postgresql" and metadata != "event_metadata_json"
+    # OFFSET 0 keeps the validation projection from being inlined and repeated
+    # for both the metadata value and its exceptional-record flag.
+    metadata_check = """ CROSS JOIN LATERAL (
+        SELECT event_metadata_json IS JSON OBJECT AS is_object,
+               pg_input_is_valid(event_metadata_json, 'jsonb') AS is_valid OFFSET 0
+    ) metadata_check""" if postgres_json else ""
+    metadata_fallback = "(metadata_check.is_object AND NOT metadata_check.is_valid)" if postgres_json else "0"
+    resources = "'[]' AS mirror_resources_json, '[]' AS screenshot_resources_json, '' AS json_preview_url, '[]' AS risk_reasons_json" if summary_only else "mirror_resources_json, screenshot_resources_json, json_preview_url, risk_reasons_json"
     query = f"""SELECT event_id, source_kind, raw_source_type, source_site_name, source_record_id,
         event_type, category, leak_type, title, attacker, victim, victim_key,
         industry, region, disclosure_time, severity, risk_score, source_url,
-        {body}, mirror_resources_json, screenshot_resources_json,
-        json_preview_url, risk_reasons_json, event_metadata_json, updated_at
-        FROM normalized_intelligence_events{where} ORDER BY {order_by}{limit_sql}"""
+        {body}, {resources}, {metadata} AS event_metadata_json, updated_at, report_time,
+        {metadata_fallback} AS metadata_requires_fallback
+        FROM normalized_intelligence_events{metadata_check}{where} ORDER BY {order_by}{limit_sql}"""
     if getattr(connection, "backend_name", "") == "postgresql":
-        cursor = connection.iter_rows(query, parameters, batch_size=1)
+        legacy_json = metadata == "event_metadata_json"
+        # Preview summaries are clipped in Python without SQL text coercion.
+        # Fetch one such row at a time so a large summary cannot fill a batch.
+        cursor = connection.iter_rows(query, parameters, batch_size=128 if summary_only and not legacy_json else 1)
     else:
+        legacy_json = False
         cursor = connection.execute(query, parameters)
     try:
         for source in cursor:
             row = dict(source)
-            # Raw payloads often contain a second full body. Aggregate callers
-            # need the promoted metadata; the detail loader retains the original.
-            try:
-                metadata = json.loads(row.get("event_metadata_json") or "{}")
-            except (TypeError, ValueError):
-                metadata = {}
-            if isinstance(metadata, dict):
-                metadata.pop("raw_json", None)
-                metadata.pop("original_summary", None)
-                if metadata.get("summary"):
-                    metadata["summary"] = str(metadata["summary"])[:500]
-            row["event_metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+            metadata_requires_fallback = row.pop("metadata_requires_fallback", False)
+            if metadata_requires_fallback:
+                # Keep exceptional source JSON out of the 128-row batch. Decode
+                # only this record in Python, where its escaped values are valid.
+                original = connection.execute(
+                    "SELECT event_metadata_json FROM normalized_intelligence_events WHERE event_id = ?",
+                    (row["event_id"],),
+                ).fetchone()
+                row["event_metadata_json"] = original["event_metadata_json"] if original else "{}"
+            if legacy_json or metadata_requires_fallback or not summary_only:
+                try:
+                    metadata_value = json.loads(row.get("event_metadata_json") or "{}")
+                except (TypeError, ValueError):
+                    metadata_value = {}
+                if not isinstance(metadata_value, dict):
+                    metadata_value = {}
+                if summary_only:
+                    metadata_value = {key: metadata_value.get(key) for key in (
+                        "updated_time", "country", "country_code", "macro_region", "industry", "source_label", "confidence_score")}
+                else:
+                    metadata_value.pop("raw_json", None)
+                    metadata_value.pop("original_summary", None)
+                    if metadata_value.get("summary"):
+                        metadata_value["summary"] = str(metadata_value["summary"])[:500]
+                row["event_metadata_json"] = json.dumps(metadata_value, ensure_ascii=False)
             yield row
     finally:
         cursor.close()

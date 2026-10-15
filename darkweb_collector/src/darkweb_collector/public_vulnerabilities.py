@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from darkweb_collector.db import get_db_connection, replace_vulnerability_records
 from darkweb_collector.runtime import project_root
 from darkweb_collector.vulnerability_i18n import humanize_product_token
+from darkweb_collector.vulnerability_i18n import resolve_vulnerability_summary
 from darkweb_collector.vulnerability_i18n import translate_vulnerability_summary_live
 from darkweb_collector.vulnerability_i18n import translate_vulnerability_title_live
 
@@ -144,6 +145,7 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
     disclosure_time = str(record.get("disclosure_time") or record.get("published_at") or _now_utc_iso()).strip()
     reference_urls = _unique_strings(_coerce_reference_urls(record.get("reference_urls")))
     advisory_url = str(record.get("advisory_url") or (reference_urls[0] if reference_urls else "")).strip()
+    summary, original_summary = resolve_vulnerability_summary(record)
     return {
         "source_name": str(record.get("source_name") or "public_feed").strip(),
         "source_type": str(record.get("source_type") or "public").strip(),
@@ -160,7 +162,8 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
         "wide_impact": bool(record.get("wide_impact")),
         "disclosure_time": disclosure_time,
         "affected_versions": _coerce_versions(record.get("affected_versions")),
-        "summary": str(record.get("summary") or "").strip(),
+        "summary": summary,
+        "original_summary": original_summary,
         "advisory_url": advisory_url,
         "reference_urls": reference_urls,
         "last_seen_at": str(record.get("last_seen_at") or disclosure_time).strip(),
@@ -454,7 +457,10 @@ def _build_record_from_kev(item: dict[str, Any], *, nvd_enrichment: dict[str, An
     nvd_url = (nvd_enrichment or {}).get("nvd_url") or (f"https://nvd.nist.gov/vuln/detail/{cve_id}" if cve_id else "")
     reference_urls = _unique_strings(note_urls + ([nvd_url] if nvd_url else []))
     required_action = str(item.get("requiredAction") or "").strip()
-    summary = str((nvd_enrichment or {}).get("summary") or item.get("shortDescription") or "").strip()
+    summary, _ = resolve_vulnerability_summary(
+        {"summary": (nvd_enrichment or {}).get("summary")},
+        {"summary": item.get("shortDescription")},
+    )
     title = str(item.get("vulnerabilityName") or f"{item.get('vendorProject', '')} {item.get('product', '')}").strip()
     has_poc = any(token in f"{notes} {summary}".lower() for token in ("poc", "proof-of-concept", "proof of concept", "exploit code"))
     affected_versions = (nvd_enrichment or {}).get("affected_versions") or []
@@ -483,6 +489,7 @@ def _build_record_from_kev(item: dict[str, Any], *, nvd_enrichment: dict[str, An
             "disclosure_time": str(item.get("dateAdded") or _now_utc_iso()).strip(),
             "affected_versions": affected_versions,
             "summary": translate_vulnerability_summary_live(summary),
+            "original_summary": summary,
             "advisory_url": next((url for url in reference_urls if "nvd.nist.gov" not in url), "") or (reference_urls[0] if reference_urls else ""),
             "reference_urls": reference_urls,
             "last_seen_at": _now_utc_iso(),
@@ -525,6 +532,7 @@ def _build_record_from_nvd_item(item: dict[str, Any], *, source_name: str = NVD_
             "disclosure_time": str(cve.get("published") or _now_utc_iso()).strip(),
             "affected_versions": affected_versions,
             "summary": translate_vulnerability_summary_live(description),
+            "original_summary": description,
             "advisory_url": reference_urls[0] if reference_urls else f"https://nvd.nist.gov/vuln/detail/{cve_id}",
             "reference_urls": _unique_strings(reference_urls + ([f"https://nvd.nist.gov/vuln/detail/{cve_id}"] if cve_id else [])),
             "last_seen_at": str(cve.get("lastModified") or _now_utc_iso()).strip(),
@@ -550,7 +558,10 @@ def _build_record_from_github_advisory(
         return None
     cwes = [str(item.get("cwe_id") or "").strip() for item in advisory.get("cwes") or [] if str(item.get("cwe_id") or "").strip()]
     summary = str(advisory.get("summary") or "").strip()
-    description = str((nvd_enrichment or {}).get("summary") or advisory.get("description") or summary).strip()
+    description, _ = resolve_vulnerability_summary(
+        {"summary": (nvd_enrichment or {}).get("summary")},
+        {"summary": advisory.get("description"), "original_summary": summary},
+    )
     severity = str(advisory.get("severity") or "high").strip().lower()
     cvss = (nvd_enrichment or {}).get("cvss")
     if cvss in {None, ""}:
@@ -584,6 +595,7 @@ def _build_record_from_github_advisory(
             "disclosure_time": disclosure_time or _now_utc_iso(),
             "affected_versions": [],
             "summary": translate_vulnerability_summary_live(description),
+            "original_summary": description,
             "advisory_url": references[0] if references else str(advisory.get("html_url") or "").strip(),
             "reference_urls": references,
             "last_seen_at": str(advisory.get("updated_at") or _now_utc_iso()).strip(),

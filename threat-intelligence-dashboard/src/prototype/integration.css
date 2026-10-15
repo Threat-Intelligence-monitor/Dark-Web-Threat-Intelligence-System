@@ -131,6 +131,12 @@
   font-weight: 700;
 }
 
+.runtime-resource-status {
+  margin: 12px 0 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .runtime-mirror-image {
   display: block;
   width: auto;
