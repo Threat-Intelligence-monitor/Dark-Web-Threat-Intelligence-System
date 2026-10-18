@@ -1,6 +1,6 @@
 import countryCentroidsJson from 'world-countries-centroids/dist/countries.geojson?raw'
 import { createRemoteBrowserStream } from '@/utils/remoteBrowserStream'
-import { shouldRenderResourceAsImage } from '@/prototype/resourceRendering'
+import { shouldRenderResourceAsHtml, shouldRenderResourceAsImage } from '@/prototype/resourceRendering'
 
 const COUNTRY_COORDINATES = JSON.parse(countryCentroidsJson).features.reduce((coordinates, feature) => {
   const code = feature.properties.ISO
@@ -2099,6 +2099,7 @@ function setDefinitionPairs(container, pairs) {
       link.textContent = String(value)
       valueNode.replaceWith(link)
     } else {
+      if (valueNode.tagName === 'A') valueNode.removeAttribute('href')
       valueNode.textContent = Array.isArray(value) ? value.join(' / ') : String(value)
     }
   })
@@ -2117,16 +2118,24 @@ function hideDetailRail(root, id) {
 
 function normalizedResourceList(...groups) {
   const resources = []
-  const seen = new Set()
+  const seen = new Map()
   groups.flat(Infinity).forEach((item) => {
     const url = typeof item === 'string' ? item : item?.url || item?.href || ''
-    if (!url || (!/^https?:\/\//i.test(url) && !String(url).startsWith('/')) || seen.has(url)) return
-    seen.add(url)
-    resources.push({
+    if (!url || (!/^https?:\/\//i.test(url) && !String(url).startsWith('/'))) return
+    if (seen.has(url)) {
+      const existing = seen.get(url)
+      if (item?.availability) existing.availability = item.availability
+      if (item?.kind && !existing.kind) existing.kind = item.kind
+      return
+    }
+    const resource = {
       url: String(url),
       label: typeof item === 'object' ? (item.label || item.kind || item.name || '证据资源') : '证据资源',
       kind: typeof item === 'object' ? (item.kind || '') : '',
-    })
+      availability: typeof item === 'object' ? (item.availability || '') : '',
+    }
+    seen.set(url, resource)
+    resources.push(resource)
   })
   return resources
 }
@@ -2181,73 +2190,155 @@ function configureSourceAccess(root, config) {
   if (!section) return
   const normalized = normalizedResourceList(resources)
   const directSource = /^https?:\/\//i.test(sourceUrl) || String(sourceUrl).startsWith('/') ? sourceUrl : ''
-  const source = directSource || normalized.find((item) => /原始|通告|仓库|文件/.test(item.label))?.url || ''
-  const mirror = normalized.find((item) => /screenshot|image/i.test(item.kind))
-    || normalized.find((item) => /截图|image/i.test(item.label))
-    || normalized.find((item) => /mirror/i.test(item.kind))
-    || normalized.find((item) => /镜像/.test(item.label))
-  const downloadable = normalized.find((item) => /artifact|html|json/i.test(item.kind))
-    || normalized.find((item) => /镜像|原始抓取|JSON/i.test(item.label))
-
   const open = query(root, `[data-od-id="${openId}"]`)
-  if (open) {
-    open.hidden = !source
-    if (source) open.href = source
-    else open.removeAttribute('href')
-  }
   const sourceLine = query(section, '.source-link-line')
   const sourceLink = query(sourceLine, 'a')
   const copy = query(sourceLine, 'button')
-  if (sourceLine) sourceLine.hidden = !source
-  if (sourceLink) {
-    sourceLink.hidden = !source
-    if (source) {
-      sourceLink.href = source
-      sourceLink.textContent = source
-    }
-  }
-  if (copy) {
-    copy.dataset.runtimeCopy = source
-    setActionAvailable(copy, Boolean(source), source ? '' : '接口未提供原始链接')
-  }
-
   const view = query(root, `[data-od-id="${viewId}"]`)
-  if (view) {
-    delete view.dataset.toast
-    view.dataset.runtimeOpen = mirror?.url || ''
-    setActionAvailable(view, Boolean(mirror), mirror ? '' : '接口未提供镜像资源')
-  }
   const download = query(root, `[data-od-id="${downloadId}"]`)
-  if (download) {
-    delete download.dataset.toast
-    download.dataset.runtimeDownload = downloadable?.url || ''
-    setActionAvailable(download, Boolean(downloadable), downloadable ? '' : '接口未提供可下载镜像')
+  let status = query(section, '.runtime-resource-status')
+  if (!status) {
+    status = document.createElement('p')
+    status.className = 'runtime-resource-status'
+    status.setAttribute('role', 'status')
+    section.appendChild(status)
   }
-
   const figure = query(section, '.mirror-frame')
-  if (figure) {
-    figure.hidden = !mirror
+  const renderResources = () => {
+    const usable = normalized.filter((item) => !['missing', 'unavailable'].includes(item.availability))
+    const sourceMissing = normalized.some((item) => item.url === directSource && !usable.includes(item))
+    const source = (sourceMissing ? '' : directSource) || usable.find((item) => /原始|通告|仓库|文件/.test(item.label))?.url || ''
+    if (open) {
+      open.hidden = !source
+      if (source) open.href = source
+      else open.removeAttribute('href')
+    }
+    if (sourceLine) sourceLine.hidden = !source
+    if (sourceLink) {
+      sourceLink.hidden = !source
+      if (source) {
+        sourceLink.href = source
+        sourceLink.textContent = source
+      } else sourceLink.removeAttribute('href')
+    }
+    if (copy) {
+      copy.dataset.runtimeCopy = source
+      copy.title = source ? '' : '接口未提供可用原始链接'
+      setActionAvailable(copy, Boolean(source))
+    }
+    const missing = normalized.filter((item) => item.availability === 'missing').length
+    const failed = normalized.filter((item) => item.availability === 'unavailable').length
+    const mirror = usable.find(shouldRenderResourceAsImage)
+      || usable.find((item) => shouldRenderResourceAsHtml(item) && (
+        String(item.kind).toLowerCase() === 'html'
+        || item.url.startsWith('/collector-output/')
+        || /mirror|镜像/i.test(item.label)
+      ))
+      || usable.find((item) => /mirror/i.test(item.kind) || /镜像/.test(item.label))
+    const downloadable = usable.find((item) => /artifact|html|json/i.test(item.kind))
+      || usable.find((item) => /镜像|原始抓取|JSON/i.test(item.label))
+    const message = [missing ? `${missing} 个资源文件缺失，原始引用已保留。` : '', failed ? `${failed} 个资源加载失败，暂时无法查看。` : ''].filter(Boolean).join(' ')
+    status.textContent = message
+    status.hidden = !message
+    if (view) {
+      delete view.dataset.toast
+      view.hidden = false
+      view.removeAttribute('href')
+      view.dataset.runtimeOpen = mirror?.url || ''
+      view.title = mirror ? '' : message || '接口未提供镜像资源'
+      setActionAvailable(view, Boolean(mirror))
+    }
+    if (download) {
+      delete download.dataset.toast
+      download.dataset.runtimeDownload = downloadable?.url || ''
+      download.title = downloadable ? '' : message || '接口未提供可下载镜像'
+      setActionAvailable(download, Boolean(downloadable))
+    }
+    if (!figure) return
+    figure.hidden = !mirror && !missing && !failed
+    figure.dataset.resourceState = mirror ? 'ready' : failed ? 'error' : missing ? 'missing' : 'empty'
+    figure.setAttribute('aria-busy', 'false')
     const slot = query(figure, '.mirror-image-slot')
-    if (slot && mirror) {
+    if (slot) {
       slot.replaceChildren()
-      if (shouldRenderResourceAsImage(mirror)) {
+      if (mirror && shouldRenderResourceAsImage(mirror)) {
+        figure.dataset.resourceState = 'loading'
+        figure.setAttribute('aria-busy', 'true')
+        status.textContent = `${message} 正在加载镜像…`.trim()
+        status.hidden = false
         const image = document.createElement('img')
         image.className = 'runtime-mirror-image'
-        image.src = mirror.url
         image.alt = mirror.label
+        image.hidden = true
+        image.addEventListener('load', () => {
+          if (query(slot, 'img') !== image) return
+          image.hidden = false
+          figure.dataset.resourceState = 'ready'
+          figure.setAttribute('aria-busy', 'false')
+          status.textContent = message
+          status.hidden = !message
+        })
+        image.addEventListener('error', () => {
+          if (query(slot, 'img') !== image) return
+          mirror.availability = 'unavailable'
+          renderResources()
+        })
         slot.appendChild(image)
+        image.src = mirror.url
+      } else if (mirror && shouldRenderResourceAsHtml(mirror)) {
+        const frame = document.createElement('iframe')
+        frame.className = 'runtime-mirror-html'
+        frame.title = mirror.label
+        frame.setAttribute('sandbox', '')
+        frame.referrerPolicy = 'no-referrer'
+        frame.src = mirror.url
+        slot.removeAttribute('role')
+        slot.removeAttribute('aria-label')
+        slot.appendChild(frame)
       } else {
         const label = document.createElement('strong')
-        label.textContent = mirror.label
+        label.textContent = mirror?.label || (failed ? '镜像加载失败' : '镜像文件缺失')
         slot.appendChild(label)
       }
     }
     setText(figure, 'figcaption strong', mirror?.label || '—')
-    setText(figure, 'figcaption span', normalized.length ? `${normalized.length} 个真实资源` : '—')
+    setText(figure, 'figcaption span', normalized.length ? `${normalized.length} 个资源引用${missing + failed ? `，${missing + failed} 个不可用` : ''}` : '—')
     setText(figure, 'figcaption code', '')
     setText(figure, '.mirror-frame-bar time', formatDate(fetchedAt))
   }
-  section.hidden = !source && !normalized.length
+  renderResources()
+  section.hidden = !directSource && !normalized.length
+}
+
+function bindIncidentBody(root, state, detail, id, sectionId) {
+  const section = setDetailSection(root, sectionId, true)
+  if (!section) return
+  const original = usableText(detail.detail_text) || usableText(detail.summary) || usableText(detail.original_summary)
+  setText(section, 'pre', original || (detail.summary_unavailable ? '原摘要不可用，需重新同步来源' : '当前接口未提供正文证据'))
+  const translate = query(section, 'button[data-toast], [data-runtime-translate]')
+  if (!translate) return
+  delete translate.dataset.toast
+  translate.hidden = detail.normalized_event_type === 'vulnerability'
+  translate.title = original ? '' : '当前记录没有可翻译正文'
+  setActionAvailable(translate, Boolean(original))
+  if (!original || translate.hidden) return
+  translate.dataset.runtimeTranslate = '1'
+  translate.textContent = '翻译正文'
+  let translated = ''
+  let showingTranslated = false
+  state.toggleTranslation = async () => {
+    if (!translated) {
+      const payload = await requestJson(`/api/events/${encodeURIComponent(id)}?translate_detail=true`)
+      translated = usableText(payload.detail_text) || original
+      if (payload.translation_applied === false || translated === original) {
+        translated = ''
+        throw new Error(payload.translation_error === 'rate_limited' ? '翻译服务请求过于频繁，请稍后重试' : '翻译服务暂时不可用，请稍后重试')
+      }
+    }
+    showingTranslated = !showingTranslated
+    setText(section, 'pre', showingTranslated ? translated : original)
+    translate.textContent = showingTranslated ? '显示原文' : '显示译文'
+  }
 }
 
 function bindDetailBase(root, detail, summaryPairs, kpiPairs) {
@@ -2675,12 +2766,23 @@ async function hydrateIncidentDetail(root, state, file, id) {
     detail.mirror_resources,
     detail.screenshot_resources,
     detail.sample_links,
-    detail.json_preview_url ? [{ label: 'JSON 记录', url: detail.json_preview_url, kind: 'artifact' }] : [],
+    detail.json_preview_url ? [{ label: 'JSON 记录', url: detail.json_preview_url, kind: 'artifact', availability: detail.json_preview_availability }] : [],
   )
-  const sourceUrl = detail.disclosure_url || detail.source_url || detail.advisory_url || referenceResources[0]?.url || ''
+  const usableReference = referenceResources.find((item) => !['missing', 'unavailable'].includes(item.availability))
+  const firstReference = usableReference || referenceResources[0]
+  const directSource = detail.disclosure_url || detail.source_url || detail.advisory_url || ''
+  const sourceMissing = referenceResources.some((item) => item.url === directSource && ['missing', 'unavailable'].includes(item.availability))
+  const sourceUrl = (sourceMissing ? '' : directSource) || usableReference?.url || ''
   const affectedVersions = (detail.affected_version_items || detail.affected_versions || [])
     .map((item) => typeof item === 'string' ? item : item?.display || item?.raw || item?.version || item?.label || item?.value)
     .filter(Boolean)
+  const bodySections = {
+    'event-detail.html': 'detail-evidence',
+    'ransomware-detail.html': 'ransomware-event-detail',
+    'data-leak-detail.html': 'data-leak-event-detail',
+    'vulnerability-detail.html': 'vulnerability-event-detail',
+  }
+  bindIncidentBody(root, state, detail, id, bodySections[file])
 
   if (file === 'event-detail.html') {
     bindDetailBase(root, detail, [
@@ -2704,37 +2806,12 @@ async function hydrateIncidentDetail(root, state, file, id) {
       note: '接口返回的风险依据',
     })))
     const evidence = query(root, '[data-od-id="detail-evidence"]')
-    const evidenceText = usableText(detail.detail_text) || usableText(detail.summary) || '当前接口未提供正文证据'
-    setText(evidence, 'pre', evidenceText)
     setDefinitionPairs(query(evidence, '.definition-grid'), [
       { label: '来源类别', value: detail.raw_source_type_label || detail.source || '未标注' },
-      { label: '参考链接', value: referenceResources[0]?.label || sourceUrl, url: referenceResources[0]?.url || sourceUrl },
+      { label: '参考链接', value: !usableReference && firstReference ? `${firstReference.label}（文件缺失）` : firstReference?.label || sourceUrl, url: usableReference?.url || sourceUrl },
       { label: '样本证据', value: detail.has_sample_evidence ? `${number(detail.sample_link_count || detail.sample_links?.length)} 个` : '未提供' },
     ])
     hideDetailRail(root, 'detail-action-rail')
-    const translate = queryAll(evidence, 'button[data-toast]').find((button) => button.textContent.includes('切换原文'))
-    if (translate && usableText(detail.detail_text)) {
-      delete translate.dataset.toast
-      translate.dataset.runtimeTranslate = '1'
-      setActionAvailable(translate, true)
-      const original = usableText(detail.detail_text)
-      let translated = ''
-      let showingTranslated = false
-      state.toggleTranslation = async () => {
-        if (!translated) {
-          const payload = await requestJson(`/api/events/${encodeURIComponent(id)}?translate_detail=true`)
-          translated = usableText(payload.detail_text) || original
-          if (payload.translation_applied === false || translated === original) {
-            throw new Error(payload.translation_error === 'rate_limited' ? '翻译服务请求过于频繁，请稍后重试' : '翻译服务暂时不可用，请稍后重试')
-          }
-        }
-        showingTranslated = !showingTranslated
-        setText(evidence, 'pre', showingTranslated ? translated : original)
-        translate.textContent = showingTranslated ? '显示原文' : '显示译文'
-      }
-    } else if (translate) {
-      setActionAvailable(translate, false, '当前记录没有可切换正文')
-    }
     return
   }
 
@@ -2775,7 +2852,7 @@ async function hydrateIncidentDetail(root, state, file, id) {
     replaceStructuredRows(query(sourceSection, '.detail-list'), referenceResources.slice(0, 6).map((item) => ({
       label: item.label,
       value: item.url,
-      note: '真实接口资源',
+      note: item.availability === 'missing' ? '文件缺失，引用已保留' : '真实接口资源',
     })))
     configureSourceAccess(root, {
       sectionId: 'vulnerability-sources', openId: 'vulnerability-open-source', viewId: 'vulnerability-view-mirror', downloadId: 'vulnerability-download-mirror',
@@ -2837,32 +2914,6 @@ async function hydrateIncidentDetail(root, state, file, id) {
   setDetailSection(root, 'data-leak-field-matrix', false)
   setDetailSection(root, 'data-leak-sample-preview', false)
   setDetailSection(root, 'data-leak-dedup', false)
-  const eventDetailText = usableText(detail.detail_text) || usableText(detail.summary)
-  const eventDetailSection = setDetailSection(root, 'data-leak-event-detail', Boolean(eventDetailText))
-  setText(eventDetailSection, 'pre', eventDetailText)
-  const translate = query(eventDetailSection, 'button[data-toast]')
-  if (translate && usableText(detail.detail_text)) {
-    delete translate.dataset.toast
-    translate.dataset.runtimeTranslate = '1'
-    setActionAvailable(translate, true)
-    const original = usableText(detail.detail_text)
-    let translated = ''
-    let showingTranslated = false
-    state.toggleTranslation = async () => {
-      if (!translated) {
-        const payload = await requestJson(`/api/events/${encodeURIComponent(id)}?translate_detail=true`)
-        translated = usableText(payload.detail_text) || original
-        if (payload.translation_applied === false || translated === original) {
-          throw new Error(payload.translation_error === 'rate_limited' ? '翻译服务请求过于频繁，请稍后重试' : '翻译服务暂时不可用，请稍后重试')
-        }
-      }
-      showingTranslated = !showingTranslated
-      setText(eventDetailSection, 'pre', showingTranslated ? translated : original)
-      translate.textContent = showingTranslated ? '显示原文' : '显示译文'
-    }
-  } else if (translate) {
-    setActionAvailable(translate, false, '当前记录没有可翻译正文')
-  }
   configureSourceAccess(root, {
     sectionId: 'data-leak-mirror-evidence', openId: 'data-leak-open-source', viewId: 'data-leak-view-mirror', downloadId: 'data-leak-download-mirror',
     sourceUrl, resources: referenceResources, fetchedAt: detail.updated_time || detail.disclosure_time,

@@ -131,6 +131,12 @@
   font-weight: 700;
 }
 
+.runtime-resource-status {
+  margin: 12px 0 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .runtime-mirror-image {
   display: block;
   width: auto;
@@ -156,6 +162,22 @@
   height: auto;
   max-width: 100%;
   max-height: min(82vh, 900px);
+}
+
+.mirror-image-slot:has(> .runtime-mirror-html) {
+  display: block;
+  height: auto;
+  aspect-ratio: auto;
+  padding: 0;
+  overflow: hidden;
+}
+
+.runtime-mirror-html {
+  display: block;
+  width: 100%;
+  height: clamp(360px, 70vh, 900px);
+  border: 0;
+  background: #fff;
 }
 
 @media (max-width: 720px) {
