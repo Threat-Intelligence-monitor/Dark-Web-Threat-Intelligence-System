@@ -164,6 +164,22 @@
   max-height: min(82vh, 900px);
 }
 
+.mirror-image-slot:has(> .runtime-mirror-html) {
+  display: block;
+  height: auto;
+  aspect-ratio: auto;
+  padding: 0;
+  overflow: hidden;
+}
+
+.runtime-mirror-html {
+  display: block;
+  width: 100%;
+  height: clamp(360px, 70vh, 900px);
+  border: 0;
+  background: #fff;
+}
+
 @media (max-width: 720px) {
   .mirror-image-slot:has(> .runtime-mirror-image) {
     padding: 8px;

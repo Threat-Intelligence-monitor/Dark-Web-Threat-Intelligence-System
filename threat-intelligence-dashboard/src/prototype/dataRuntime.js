@@ -1,6 +1,6 @@
 import countryCentroidsJson from 'world-countries-centroids/dist/countries.geojson?raw'
 import { createRemoteBrowserStream } from '@/utils/remoteBrowserStream'
-import { shouldRenderResourceAsImage } from '@/prototype/resourceRendering'
+import { shouldRenderResourceAsHtml, shouldRenderResourceAsImage } from '@/prototype/resourceRendering'
 
 const COUNTRY_COORDINATES = JSON.parse(countryCentroidsJson).features.reduce((coordinates, feature) => {
   const code = feature.properties.ISO
@@ -2229,6 +2229,11 @@ function configureSourceAccess(root, config) {
     const missing = normalized.filter((item) => item.availability === 'missing').length
     const failed = normalized.filter((item) => item.availability === 'unavailable').length
     const mirror = usable.find(shouldRenderResourceAsImage)
+      || usable.find((item) => shouldRenderResourceAsHtml(item) && (
+        String(item.kind).toLowerCase() === 'html'
+        || item.url.startsWith('/collector-output/')
+        || /mirror|镜像/i.test(item.label)
+      ))
       || usable.find((item) => /mirror/i.test(item.kind) || /镜像/.test(item.label))
     const downloadable = usable.find((item) => /artifact|html|json/i.test(item.kind))
       || usable.find((item) => /镜像|原始抓取|JSON/i.test(item.label))
@@ -2280,6 +2285,16 @@ function configureSourceAccess(root, config) {
         })
         slot.appendChild(image)
         image.src = mirror.url
+      } else if (mirror && shouldRenderResourceAsHtml(mirror)) {
+        const frame = document.createElement('iframe')
+        frame.className = 'runtime-mirror-html'
+        frame.title = mirror.label
+        frame.setAttribute('sandbox', '')
+        frame.referrerPolicy = 'no-referrer'
+        frame.src = mirror.url
+        slot.removeAttribute('role')
+        slot.removeAttribute('aria-label')
+        slot.appendChild(frame)
       } else {
         const label = document.createElement('strong')
         label.textContent = mirror?.label || (failed ? '镜像加载失败' : '镜像文件缺失')
