@@ -1130,6 +1130,8 @@ function renderIntelligenceItems(root, events, counts = null) {
     if (title) {
       title.textContent = item.title || '未命名事件'
       title.href = detailHref(item)
+      title.target = '_blank'
+      title.rel = 'noopener noreferrer'
     }
     setText(row, 'p', excerpt(item.summary || item.detail_text, 260) || '暂无摘要')
     const context = queryAll(row, '.intel-result-context > *')
