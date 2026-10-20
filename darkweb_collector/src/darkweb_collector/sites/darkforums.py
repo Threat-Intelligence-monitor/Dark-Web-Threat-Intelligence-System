@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from html import unescape
 from urllib.parse import urljoin, urlparse
 
+from darkweb_collector.collection_errors import CollectionFailure
 from darkweb_collector.normalize import content_hash
 
 
@@ -331,6 +332,20 @@ def _extract_victim_from_title(title: str) -> str:
     return ""
 
 
+def raise_if_hidden_post(content: str, html: str) -> None:
+    hidden_wrapper = re.search(
+        r"<[^>]+\bclass=['\"][^'\"]*\b(?:hide-tag|hide-content|hidden-content|bbcode_hidden|hidebox)\b",
+        html, re.IGNORECASE,
+    )
+    if hidden_wrapper and re.fullmatch(
+        r"(?:(?:hidden content|this content is hidden)[\s.!:,-]*)?"
+        r"(?:you (?:must|need to|have to) (?:log in|login|register|reply|react|like)|"
+        r"(?:please )?(?:log in|login|register|reply|react|like)|only registered members).{0,300}",
+        " ".join(content.split()), re.IGNORECASE,
+    ):
+        raise CollectionFailure("restricted", "post body only contains an access or interaction prompt")
+
+
 def parse_darkforums_detail(url: str, html: str) -> dict:
     """
     Parse DarkForums detail page to extract post content and metadata
@@ -369,6 +384,7 @@ def parse_darkforums_detail(url: str, html: str) -> dict:
                 content_match = fallback_match
                 break
     content = _clean_html_text(content_match.group(1)) if content_match else ""
+    raise_if_hidden_post(content, post_block)
 
     _debug_log(f"[{time.strftime('%H:%M:%S')}] Extracted content length: {len(content)} chars")
     

@@ -87,11 +87,11 @@ def _extract_matching_card_html(html: str, detail_path: str) -> str:
     href_marker = f'href="{detail_path}"'
     idx = html.find(href_marker)
     if idx == -1:
-        return html
+        return ""
     start_marker = '<div class="rounded-xl bg-bunker p-4 flex justify-between w-full">'
     start = html.rfind(start_marker, 0, idx)
     if start == -1:
-        return html
+        return ""
     next_start = html.find(start_marker, idx + len(href_marker))
     if next_start == -1:
         return html[start:]

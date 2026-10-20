@@ -2549,6 +2549,13 @@ def build_failed_jobs_payload(page: int = 1, page_size: int = FAILED_JOB_HISTORY
 def build_jobs_payload() -> dict[str, Any]:
     failure_cutoff = _now_utc() - timedelta(hours=RECENT_FAILURE_WINDOW_HOURS)
     with get_db_connection() as connection:
+        detail_yield = [dict(row) for row in connection.execute(
+            """SELECT site_name, COUNT(*) AS completed_jobs, SUM(new_count) AS new_count,
+                      SUM(updated_count) AS updated_count, SUM(unchanged_count) AS unchanged_count,
+                      SUM(CASE WHEN outcome = 'partial' THEN 1 ELSE 0 END) AS artifacts_pending_jobs
+               FROM crawl_detail_results WHERE finished_at >= ? GROUP BY site_name""",
+            (failure_cutoff.timestamp(),),
+        ).fetchall()]
         crawl_jobs = [
             dict(row)
             for row in connection.execute(
@@ -2831,6 +2838,7 @@ def build_jobs_payload() -> dict[str, Any]:
         "running_jobs": running_jobs,
         "stale_jobs": stale_jobs,
         "failed_jobs_24h": failed_jobs_24h,
+        "detail_yield_24h": {"unit": "raw_detail_records", "by_site": detail_yield},
         "recent_failures": recent_failures,
         **build_failed_jobs_payload(),
         "site_health": site_health,

@@ -343,6 +343,7 @@ def _get_pool(
                 with raw.cursor() as cursor:
                     cursor.execute("SELECT pg_advisory_xact_lock(hashtext(current_schema()), hashtext('crawl_frontier_v1'))")
                     ensure_frontier_schema(cursor)
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_victim_details_victim_id ON victim_details(victim_id, id)")
                     ensure_search_indexes(cursor)
                     ensure_keyword_index_schema(cursor, postgres=True)
                 raw.commit()

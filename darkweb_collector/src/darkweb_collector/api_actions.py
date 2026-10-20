@@ -6,7 +6,7 @@ import logging
 import time
 from typing import Any
 
-from darkweb_collector.browser_process_pool import browser_process_pool_status, submit_browser_site
+from darkweb_collector.browser_process_pool import browser_process_pool_status
 from darkweb_collector.code_monitoring import (
     github_code_search_status_payload,
     list_code_watchlists_payload,
@@ -25,7 +25,7 @@ from darkweb_collector.db import (
 from darkweb_collector.document_exposure import list_watchlists_payload, scan_watchlist_once
 from darkweb_collector.changan_auto_login import changan_auto_login_available
 from darkweb_collector.job_diagnostics import consecutive_failures, failure_cooldown_until
-from darkweb_collector.orchestrator import dispatch_seed_job, is_site_due, mark_seed_dispatch_failed, run_site_once
+from darkweb_collector.orchestrator import dispatch_seed_job, is_site_due
 from darkweb_collector.public_vulnerabilities import sync_public_vulnerability_feed
 from darkweb_collector.queueing import (
     BROWSER_ACTIVE_QUEUES,
@@ -393,17 +393,6 @@ def _has_queue_worker(queue_name: str) -> bool:
         return queue_name in _worker_queue_cache
 
 
-def _run_site_in_thread(site_name: str, job_id: str, force: bool) -> None:
-    try:
-        run_site_once(site_name, job_id=job_id, force=force)
-    except Exception:
-        try:
-            mark_seed_dispatch_failed(job_id)
-        except Exception:
-            logger.warning("Could not record local seed startup failure for %s", site_name)
-        return
-
-
 def dispatch_run_site(site_name: str, force: bool = True) -> dict[str, Any]:
     config = get_site_config(site_name)
     auth = site_auth_readiness(config)
@@ -469,27 +458,14 @@ def dispatch_run_site(site_name: str, force: bool = True) -> dict[str, Any]:
 
     queue_name = queue_for_seed(config)
     if not _has_queue_worker(queue_name):
-        if config.uses_browser:
-            job_id = dispatch_seed_job(
-                config,
-                lambda selected_id: submit_browser_site(site_name, selected_id, force=force),
-            )
-            return {
-                "site_name": site_name,
-                "dispatch_mode": "process",
-                "message": "未检测到可消费浏览器队列的 worker，已提交到本地浏览器进程池",
-                "job_id": job_id,
-            }
-        job_id = dispatch_seed_job(
-            config,
-            lambda selected_id: Thread(target=_run_site_in_thread, args=(site_name, selected_id, force), daemon=True).start(),
-        )
         return {
             "site_name": site_name,
-            "dispatch_mode": "thread",
-            "message": "未检测到可消费该队列的 worker，已在本地线程触发单次运行",
-            "job_id": job_id,
+            "dispatch_mode": "skipped",
+            "message": "该队列的采集进程尚未就绪，请等待自动恢复后重试",
+            "job_id": "",
+            "reason": "worker_unavailable",
         }
+
     from darkweb_collector.tasks import crawl_seed
 
     job_id = dispatch_seed_job(

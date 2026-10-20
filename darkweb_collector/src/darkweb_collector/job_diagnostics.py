@@ -26,6 +26,10 @@ def classify_error(message: str | None) -> str:
     lowered = (message or "").lower()
     if not lowered:
         return ""
+    category = lowered.split(":", 1)[0]
+    if category in {"unavailable", "auth_required", "restricted", "blocked", "rate_limited", "network",
+                    "timeout", "parse", "unknown", "artifact", "infrastructure", "retry_budget"}:
+        return category
     if (
         "cannot switch to a different thread" in lowered
         or "greenlet" in lowered

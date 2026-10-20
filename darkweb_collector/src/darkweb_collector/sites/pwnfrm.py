@@ -9,6 +9,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 from darkweb_collector.normalize import content_hash
 from darkweb_collector.sites.darkforums import (
+    raise_if_hidden_post,
     determine_industry,
     determine_region,
     extract_attackers_from_content,
@@ -343,6 +344,7 @@ def parse_pwnfrm_detail(
                 content_match = fallback_match
                 break
     content = _clean_html_text(content_match.group(1)) if content_match else ""
+    raise_if_hidden_post(content, post_block)
     _debug_log(f"[{time.strftime('%H:%M:%S')}] [{site_name}] content length: {len(content)} chars")
 
     # Prefer the /User-NAME slug from the profile link — it's stable across

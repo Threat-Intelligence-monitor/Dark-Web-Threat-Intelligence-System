@@ -8,7 +8,10 @@ from threading import Lock, current_thread
 import traceback
 import time
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urlparse
+
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt
+from darkweb_collector.tor_fetch import raise_for_http_status
 
 
 @dataclass(frozen=True)
@@ -123,10 +126,13 @@ class BrowserClient:
         persist_storage_state: bool = False,
         capture_ready_script: str = "",
         cookie_header: str | None = None,
-    ) -> tuple[str, bytes]:
+    ) -> tuple[str, bytes | None]:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-        self._ensure_browser()
+        try:
+            self._ensure_browser()
+        except Exception as exc:
+            raise CollectionFailure("infrastructure", "browser runtime could not be started", scope="site") from exc
         assert self._browser is not None
         storage_path = Path(storage_state_path).expanduser().resolve() if storage_state_path else None
         if self._proxy.engine == "chromium":
@@ -162,32 +168,64 @@ class BrowserClient:
         if cookie_rows:
             context.add_cookies(cookie_rows)
         page = context.new_page()
+        main_response = None
+
+        def remember_main_response(received):
+            nonlocal main_response
+            if received.request.is_navigation_request() and received.frame == page.main_frame:
+                main_response = received
+
+        page.on("response", remember_main_response)
         selector_timeout_ms = min(timeout_seconds * 1000, 10_000)
         try:
             # Onion sites commonly keep polling or streaming connections open,
             # so waiting for networkidle adds a full timeout to otherwise loaded
             # pages. The configured render wait and selectors below handle the
             # dynamic content after DOM readiness.
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+            request_attempt()
+            try:
+                response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+            except PlaywrightTimeoutError as exc:
+                raise CollectionFailure("timeout", "browser document navigation timed out") from exc
+            except Exception as exc:
+                raise CollectionFailure("network", "browser document navigation failed") from exc
+            status = getattr(response, "status", 0)
+            if status in {401, 429}:
+                raise_for_http_status(status)
             page.wait_for_timeout(wait_seconds * 1000)
             _clear_browser_check_interstitial(page, timeout_ms=timeout_seconds * 1000)
-            if hide_selectors:
-                selector_rules = ", ".join(hide_selectors)
-                page.add_style_tag(content=f"{selector_rules} {{ display: none !important; }}")
-                page.wait_for_timeout(500)
-            if screenshot_styles:
-                page.add_style_tag(content=screenshot_styles)
-                page.wait_for_timeout(500)
+            raise_if_error_page(_read_page_content(page))
+            if main_response is not None and (
+                urldefrag(main_response.url)[0] == urldefrag(page.url)[0]
+                == urldefrag(response.url if response is not None else url)[0]
+            ):
+                status = main_response.status
+            raise_for_http_status(status)
+            try:
+                if hide_selectors:
+                    selector_rules = ", ".join(hide_selectors)
+                    page.add_style_tag(content=f"{selector_rules} {{ display: none !important; }}")
+                    page.wait_for_timeout(500)
+                if screenshot_styles:
+                    page.add_style_tag(content=screenshot_styles)
+                    page.wait_for_timeout(500)
+            except Exception:
+                self._task_count += 1
+                return _read_page_content(page), None
             if not capture_screenshot:
                 html = _read_page_content(page)
                 self._task_count += 1
                 return html, b""
             capture_timeout_ms = min(timeout_seconds * 1000, 30_000) if capture_ready_script else selector_timeout_ms
-            _wait_for_capture_ready(
-                page,
-                timeout_ms=capture_timeout_ms,
-                capture_ready_script=capture_ready_script,
-            )
+            try:
+                _wait_for_capture_ready(
+                    page,
+                    timeout_ms=capture_timeout_ms,
+                    capture_ready_script=capture_ready_script,
+                )
+            except Exception:
+                self._task_count += 1
+                return _read_page_content(page), None
             screenshot_png = None
             if screenshot_selectors:
                 try:
@@ -215,7 +253,7 @@ class BrowserClient:
                                 "height": max_y - min_y,
                             },
                         )
-                except PlaywrightTimeoutError:
+                except Exception:
                     screenshot_png = None
             elif screenshot_selector:
                 try:
@@ -227,15 +265,18 @@ class BrowserClient:
                         timeout=selector_timeout_ms,
                         animations="disabled",
                     )
-                except PlaywrightTimeoutError:
+                except Exception:
                     screenshot_png = None
             if screenshot_png is None:
-                screenshot_png = page.screenshot(
-                    type="png",
-                    full_page=True,
-                    timeout=selector_timeout_ms,
-                    animations="disabled",
-                )
+                try:
+                    screenshot_png = page.screenshot(
+                        type="png",
+                        full_page=True,
+                        timeout=selector_timeout_ms,
+                        animations="disabled",
+                    )
+                except Exception:
+                    screenshot_png = None
             # Capture HTML after the page-specific selectors have had a chance to
             # appear. Some forum pages finish rendering well after the initial
             # DOMContentLoaded/networkidle checkpoint, which made us persist a
@@ -521,7 +562,10 @@ def fetch_html_with_browser(
     cookie_header: str | None = None,
 ) -> str:
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
-    client = _get_or_create_client(requested_proxy)
+    try:
+        client = _get_or_create_client(requested_proxy)
+    except Exception as exc:
+        raise CollectionFailure("infrastructure", "browser runtime could not be started", scope="site") from exc
     try:
         html, _ = client.fetch_page_artifacts(
             url=url,
@@ -552,9 +596,12 @@ def fetch_page_artifacts_with_browser(
     persist_storage_state: bool = False,
     capture_ready_script: str = "",
     cookie_header: str | None = None,
-) -> tuple[str, bytes]:
+) -> tuple[str, bytes | None]:
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
-    client = _get_or_create_client(requested_proxy)
+    try:
+        client = _get_or_create_client(requested_proxy)
+    except Exception as exc:
+        raise CollectionFailure("infrastructure", "browser runtime could not be started", scope="site") from exc
     try:
         return client.fetch_page_artifacts(
             url=url,
