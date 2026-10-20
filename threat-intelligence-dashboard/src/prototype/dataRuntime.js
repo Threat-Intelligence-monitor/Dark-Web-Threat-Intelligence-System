@@ -61,15 +61,15 @@ const inFlightJsonRequests = new Map()
 const searchResponseCache = new Map()
 let searchCacheAccount = ''
 
-async function requestSearch(url) {
+async function requestSearch(url, { refresh = false, signal } = {}) {
   const account = localStorage.getItem('dwti-current-user') || ''
   if (account !== searchCacheAccount) {
     searchResponseCache.clear()
     searchCacheAccount = account
   }
   const cached = searchResponseCache.get(url)
-  if (cached && Date.now() - cached.storedAt < JSON_CACHE_TTL_MS) return cached.payload
-  const payload = await requestJsonUncached(url)
+  if (!refresh && cached && Date.now() - cached.storedAt < JSON_CACHE_TTL_MS) return cached.payload
+  const payload = await requestJsonUncached(url, { signal })
   if (account === (localStorage.getItem('dwti-current-user') || '')) {
     searchResponseCache.delete(url)
     searchResponseCache.set(url, { payload, storedAt: Date.now() })
@@ -1153,14 +1153,40 @@ function renderIntelligenceItems(root, events, counts = null) {
   setText(root, '[data-intel-total]', Number(resolvedCounts.all || 0))
 }
 
-async function hydrateIntelligence(root) {
+function installIntelligenceRefresh(root) {
+  if (root.__intelligenceRefreshCleanup) return
+  const refresh = () => {
+    if (!root.isConnected) {
+      root.__intelligenceRefreshCleanup?.()
+      return
+    }
+    if (!document.hidden && navigator.onLine !== false && !root.__intelligencePending) {
+      void hydrateIntelligence(root, { background: true })
+    }
+  }
+  const timer = window.setInterval(refresh, 30_000)
+  document.addEventListener('visibilitychange', refresh)
+  window.addEventListener('online', refresh)
+  root.__intelligenceRefreshCleanup = () => {
+    window.clearInterval(timer)
+    document.removeEventListener('visibilitychange', refresh)
+    window.removeEventListener('online', refresh)
+    root.__intelligenceRefreshCleanup = null
+  }
+}
+
+async function hydrateIntelligence(root, { background = false } = {}) {
   const list = query(root, '#intel-results')
   if (list) {
     list.__runtimeItemTemplate ||= query(list, '.intel-result-item')?.cloneNode(true)
   }
   if (!list) return
-  const request = {}
+  if (background && root.__intelligencePending) return
+  installIntelligenceRefresh(root)
+  root.__intelligenceRequest?.controller?.abort()
+  const request = { controller: new AbortController() }
   root.__intelligenceRequest = request
+  root.__intelligencePending = request
   const account = localStorage.getItem('dwti-current-user') || ''
   if (list.__searchAccount !== account) {
     delete list.dataset.loaded
@@ -1172,13 +1198,13 @@ async function hydrateIntelligence(root) {
     list.replaceChildren()
     queryAll(root, '.intel-result-tabs b, [data-intel-total]').forEach((node) => { node.textContent = '—' })
   }
-  setDataState(root, 'loading', list.dataset.loaded ? '正在更新查询结果，暂时显示上次结果…' : '正在查询情报…')
+  if (!background) setDataState(root, 'loading', list.dataset.loaded ? '正在更新查询结果，暂时显示上次结果…' : '正在查询情报…')
   const empty = query(root, '[data-table-empty="intel-results"]')
   if (empty) empty.hidden = true
-  list.inert = true
+  list.inert = !background
   list.setAttribute('aria-busy', 'true')
   const pagination = query(root, '[data-pagination-for="intel-results"]')
-  if (pagination) pagination.inert = true
+  if (pagination) pagination.inert = !background
 
   const locationParameters = new URLSearchParams(window.location.search)
   const searchQuery = locationParameters.get('q')?.trim() || ''
@@ -1191,9 +1217,9 @@ async function hydrateIntelligence(root) {
     : 'latest'
 
   const searchInput = query(root, '[data-table-search="intel-results"]')
-  if (searchInput) searchInput.value = searchQuery
+  if (searchInput && !background) searchInput.value = searchQuery
   const sortControl = query(root, '[data-intel-sort]')
-  if (sortControl) sortControl.value = requestedSort
+  if (sortControl && !background) sortControl.value = requestedSort
   list.dataset.activeTab = requestedType
   queryAll(root, '.intel-result-tabs .tab').forEach((button) => {
     const active = button.dataset.tab === requestedType
@@ -1243,16 +1269,30 @@ async function hydrateIntelligence(root) {
   })
   if (searchQuery) parameters.set('q', searchQuery)
   let payload
+  const timeout = window.setTimeout(() => request.controller.abort(), 30_000)
   try {
-    payload = await requestSearch(`/api/events/search?${parameters}`)
+    payload = await requestSearch(`/api/events/search?${parameters}`, { refresh: background, signal: request.controller.signal })
   } catch (error) {
     if (current()) {
+      list.inert = false
       list.setAttribute('aria-busy', 'false')
-      setDataState(root, 'error', `查询失败：${error.message}。请重新提交查询。`)
+      if (pagination) pagination.inert = false
+      const message = error.name === 'AbortError' ? '请求超时' : error.message
+      setDataState(root, 'error', `查询失败：${message}。稍后自动重试，也可重新提交查询。`)
     }
     return
+  } finally {
+    window.clearTimeout(timeout)
+    if (root.__intelligencePending === request) root.__intelligencePending = null
   }
   if (!current()) return
+  const responseRevision = payload.revision || JSON.stringify(payload)
+  if (background && list.__searchRevision === responseRevision && list.__searchParameters === String(parameters)) {
+    list.setAttribute('aria-busy', 'false')
+    setDataState(root, 'ready')
+    return
+  }
+  const scrollPosition = { top: window.scrollY, left: window.scrollX, behavior: 'instant' }
   const events = (payload.items || []).filter((item) => eventType(item))
   list.dataset.serverTotal = String(payload.total || 0)
   list.dataset.serverPage = String(payload.page || 1)
@@ -1279,10 +1319,13 @@ async function hydrateIntelligence(root) {
   ]
   queryAll(root, '.intel-corpus-item b').forEach((node, index) => { node.textContent = number(values[index]) })
   list.dataset.loaded = 'true'
+  list.__searchRevision = responseRevision
+  list.__searchParameters = String(parameters)
   list.inert = false
   list.setAttribute('aria-busy', 'false')
   if (pagination) pagination.inert = false
   setDataState(root, 'ready')
+  if (background) window.scrollTo(scrollPosition)
 }
 
 async function hydrateRansomware(root, state) {
@@ -3263,7 +3306,10 @@ async function hydrateCodeDetail(root, state, id) {
 
 export function disposePrototypeScreen(root) {
   if (!root) return
+  root.__intelligenceRefreshCleanup?.()
+  root.__intelligenceRequest?.controller?.abort()
   root.__intelligenceRequest = null
+  root.__intelligencePending = null
   if (root.__codeContinuousStatusTimer) {
     window.clearInterval(root.__codeContinuousStatusTimer)
     root.__codeContinuousStatusTimer = null

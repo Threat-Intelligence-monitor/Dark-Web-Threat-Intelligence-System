@@ -699,6 +699,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
     _ensure_legacy_columns(connection)
     ensure_search_indexes(connection)
     ensure_keyword_index_schema(connection)
+    _ensure_intelligence_publication_schema(connection)
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_monitoring_keyword_notifications_event_key
@@ -712,6 +713,14 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         WHERE resource_fingerprint <> ''
         """
     )
+
+
+def _ensure_intelligence_publication_schema(connection) -> None:
+    from darkweb_collector.intelligence_changes import ensure_change_schema
+    from darkweb_collector.incremental_intelligence import ensure_incremental_projection_schema
+
+    ensure_change_schema(connection)
+    ensure_incremental_projection_schema(connection)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -753,6 +762,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
                             ensure_frontier_schema(connection)
                             ensure_search_indexes(connection)
                             ensure_keyword_index_schema(connection)
+                            _ensure_intelligence_publication_schema(connection)
                         else:
                             _ensure_schema(connection)
                         connection.commit()

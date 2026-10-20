@@ -52,7 +52,6 @@ from darkweb_collector.normalized_intelligence import (
     _normalize_label,
     _severity_from_vulnerability,
     build_display_title,
-    ensure_normalized_intelligence,
     load_normalized_event_detail,
     normalized_event_to_detail,
     normalized_event_to_list_item,
@@ -733,12 +732,6 @@ def build_event_search_payload(
         begin = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ" if identity and identity[0] == "postgresql" else "BEGIN"
         connection.execute(begin)
         state = get_normalized_intelligence_cache_state(connection)
-        if state is None and count_normalized_intelligence_events(connection) == 0:
-            connection.rollback()
-            ensure_normalized_intelligence(connection, enrichment_budget=0, load_events=False)
-            connection.commit()
-            connection.execute(begin)
-            state = get_normalized_intelligence_cache_state(connection)
         timings["revision"] = (monotonic() - phase) * 1000
         counts_key = (
             identity, state["source_signature"], state["refreshed_at"], state["event_count"], query
@@ -783,6 +776,7 @@ def build_event_search_payload(
         "event_type": event_type,
         "sort": sort,
         "counts": counts,
+        "revision": f"{state['source_signature']}:{state['refreshed_at']}" if state else "",
     }
     _search_cache_put(_SEARCH_PAGE_CACHE, page_key, payload)
     timings["hydrate"] = (monotonic() - phase) * 1000
@@ -1807,10 +1801,7 @@ def _iter_payload_events(connection, *, preview_characters: int | None = 500,
         options["event_ids"] = event_ids
     rows = iter_normalized_intelligence_events(connection, **options)
     first = next(rows, None)
-    if first is None and get_normalized_intelligence_cache_state(connection) is None:
-        ensure_normalized_intelligence(connection, force=True, load_events=False)
-        rows = iter_normalized_intelligence_events(connection, **options)
-    elif first is not None:
+    if first is not None:
         yield _hydrate_payload_event(first)
     del first
     for row in rows:
@@ -2418,10 +2409,7 @@ def build_intelligence_payload() -> dict[str, Any]:
 
 
 def warm_api_payloads() -> None:
-    # Prime normalized intelligence and top-level payloads once during startup
-    # so the first page load is not blocked on cold work or stale cache.
-    with get_db_connection() as connection:
-        ensure_normalized_intelligence(connection, force=False, enrichment_budget=0, load_events=False)
+    # Warm published views; background publication owns source processing.
     build_intelligence_page_payload("ransomware", limit=500)
     build_intelligence_page_payload("data-leak", limit=500)
     build_dashboard_payload()

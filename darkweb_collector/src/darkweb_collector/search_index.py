@@ -88,6 +88,42 @@ def _source_metadata(connection):
         after = batch[-1]["event_id"]
 
 
+def _upsert_search_document(connection, event_id, fingerprint, values):
+    pg = _postgres(connection)
+    cursor = connection.execute(f"SELECT {SEARCH_TEXT} AS search_text "
+        "FROM normalized_intelligence_events WHERE event_id=? LIMIT 1", (event_id,))
+    try:
+        source = cursor.fetchone()
+    finally:
+        cursor.close()
+    if source is None:
+        return False
+    text = source["search_text"]
+    # SQLite LIKE terminates at NUL; the index represents that same haystack.
+    effective_text = text if pg else text.split("\x00", 1)[0]
+    grams = _grams(effective_text)
+    columns = "event_id, fingerprint, search_text, event_type, report_time, severity_rank, risk_score, text_length"
+    if pg:
+        columns += ", grams"
+    updates = ", ".join(f"{column}=excluded.{column}" for column in columns.split(", ")[1:])
+    document = (event_id, fingerprint, text, *values, len(effective_text), *([grams] if pg else []))
+    connection.execute(f"INSERT INTO intelligence_search_documents ({columns}) "
+                       f"VALUES ({','.join('?' for _ in document)}) "
+                       f"ON CONFLICT(event_id) DO UPDATE SET {updates}", document)
+    if not pg:
+        rowid = connection.execute("SELECT rowid FROM intelligence_search_documents WHERE event_id=?", (event_id,)).fetchone()[0]
+        connection.execute("DELETE FROM intelligence_search_fts WHERE rowid=?", (rowid,))
+        connection.execute("INSERT INTO intelligence_search_fts(rowid, grams) VALUES (?, ?)", (rowid, " ".join(grams)))
+    return True
+
+
+def _mark_search_pending(connection):
+    token = uuid4().hex
+    connection.execute("INSERT INTO intelligence_search_pending(id, token) VALUES(1, ?) "
+                       "ON CONFLICT(id) DO UPDATE SET token=excluded.token", (token,))
+    connection._search_index_synced = token
+
+
 def sync_search_documents(connection, rows=None):
     """Caller owns commit; retain unchanged postings across normalized full refreshes."""
     _lock(connection)
@@ -123,40 +159,49 @@ def sync_search_documents(connection, rows=None):
             connection.execute("DELETE FROM intelligence_search_fts WHERE rowid = "
                                "(SELECT rowid FROM intelligence_search_documents WHERE event_id=?)", (event_id,))
         connection.execute("DELETE FROM intelligence_search_documents WHERE event_id=?", (event_id,))
-    columns = "event_id, fingerprint, search_text, event_type, report_time, severity_rank, risk_score, text_length"
-    if pg:
-        columns += ", grams"
-    updates = ", ".join(f"{column}=excluded.{column}" for column in columns.split(", ")[1:])
     for event_id, (fingerprint, values) in changed.items():
-        cursor = connection.execute(f"SELECT {SEARCH_TEXT} AS search_text "
-            "FROM normalized_intelligence_events WHERE event_id=? LIMIT 1", (event_id,))
-        try:
-            source = cursor.fetchone()
-        finally:
-            cursor.close()
-        if source is None:
-            continue
-        text = source["search_text"]
-        # SQLite LIKE terminates at NUL; the index represents that same haystack.
-        effective_text = text if pg else text.split("\x00", 1)[0]
-        grams = _grams(effective_text)
-        document = (event_id, fingerprint, text, *values, len(effective_text), *([grams] if pg else []))
-        connection.execute(f"INSERT INTO intelligence_search_documents ({columns}) "
-                           f"VALUES ({','.join('?' for _ in document)}) "
-                           f"ON CONFLICT(event_id) DO UPDATE SET {updates}", document)
-        if not pg:
-            rowid = connection.execute("SELECT rowid FROM intelligence_search_documents WHERE event_id=?", (event_id,)).fetchone()[0]
-            connection.execute("DELETE FROM intelligence_search_fts WHERE rowid=?", (rowid,))
-            connection.execute("INSERT INTO intelligence_search_fts(rowid, grams) VALUES (?, ?)", (rowid, " ".join(grams)))
-        del source, text, effective_text, grams, document
+        _upsert_search_document(connection, event_id, fingerprint, values)
     if pg and len(changed) + len(removed) >= 1000:
         # New GIN indexes otherwise wait for autovacuum before useful estimates exist.
         connection.execute("ANALYZE intelligence_search_documents")
-    token = uuid4().hex
-    connection.execute("INSERT INTO intelligence_search_pending(id, token) VALUES(1, ?) "
-                       "ON CONFLICT(id) DO UPDATE SET token=excluded.token", (token,))
-    connection._search_index_synced = token
+    _mark_search_pending(connection)
     return {"updated": len(changed), "metadata_updated": len(metadata), "deleted": len(removed)}
+
+
+def sync_search_document_delta(connection, rows, removed_ids=()):
+    """Update only supplied event IDs; normalized writes and revision share this transaction."""
+    _lock(connection)
+    pg = _postgres(connection)
+    rows = {row["event_id"]: dict(row) for row in rows}
+    previous = {}
+    ids = list(rows)
+    for start in range(0, len(ids), 200):
+        batch = ids[start:start + 200]
+        previous.update((row["event_id"], dict(row)) for row in connection.execute(
+            "SELECT event_id, fingerprint, event_type, report_time, severity_rank, risk_score "
+            "FROM intelligence_search_documents WHERE event_id IN ("
+            + ",".join("?" for _ in batch) + ")", batch).fetchall())
+    updated = metadata_updated = deleted = 0
+    for event_id in set(removed_ids) - rows.keys():
+        if not pg:
+            connection.execute("DELETE FROM intelligence_search_fts WHERE rowid = "
+                "(SELECT rowid FROM intelligence_search_documents WHERE event_id=?)", (event_id,))
+        deleted += connection.execute("DELETE FROM intelligence_search_documents WHERE event_id=?", (event_id,)).rowcount
+    for event_id, row in rows.items():
+        fingerprint = _fingerprint(row)
+        severity = {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(str(row["severity"]).lower(), 0)
+        values = (row["event_type"], event_report_time(row), severity, row["risk_score"])
+        old = previous.get(event_id)
+        if old is None or old["fingerprint"] != fingerprint:
+            if not _upsert_search_document(connection, event_id, fingerprint, values):
+                raise ValueError("normalized event missing during search delta")
+            updated += 1
+        elif values != tuple(old[key] for key in ("event_type", "report_time", "severity_rank", "risk_score")):
+            connection.execute("UPDATE intelligence_search_documents SET event_type=?, report_time=?, "
+                "severity_rank=?, risk_score=? WHERE event_id=?", (*values, event_id))
+            metadata_updated += 1
+    _mark_search_pending(connection)
+    return {"updated": updated, "metadata_updated": metadata_updated, "deleted": deleted}
 
 
 def mark_search_index_revision(connection, source_signature, event_count, refreshed_at):
