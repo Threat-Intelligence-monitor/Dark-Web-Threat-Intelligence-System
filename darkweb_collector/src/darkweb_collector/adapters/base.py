@@ -23,5 +23,6 @@ class SiteAdapter(Protocol):
         run_ctx: RunContext,
         seed_result: SeedResult | None = None,
         detail_results: list[DetailResult] | None = None,
+        connection=None,
     ) -> None:
         ...

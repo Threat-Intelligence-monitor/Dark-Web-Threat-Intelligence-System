@@ -59,9 +59,15 @@ class SiteConfig:
         return max(1, int(self.extras.get("max_concurrent_details", 1)))
 
     @property
+    def detail_task_timeout_seconds(self) -> int:
+        default = 600 if self.browser_queue == "browser_onion" else 300
+        return max(60, min(900, int(self.extras.get("detail_task_timeout_seconds", default))))
+
+    @property
     def detail_slot_ttl_seconds(self) -> int:
         default_ttl = max(900, self.fetch_timeout_seconds * 4)
-        return max(60, int(self.extras.get("detail_slot_ttl_seconds", default_ttl)))
+        return max(self.detail_task_timeout_seconds + 90,
+                   int(self.extras.get("detail_slot_ttl_seconds", default_ttl)))
 
     @property
     def detail_slot_retry_seconds(self) -> int:

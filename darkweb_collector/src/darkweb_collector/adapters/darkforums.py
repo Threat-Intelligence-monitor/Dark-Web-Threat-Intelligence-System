@@ -5,9 +5,10 @@ import hashlib
 from urllib.parse import urlparse
 
 from darkweb_collector.adapters.base import SiteAdapter
-from darkweb_collector.adapters.forum_artifacts import restore_detail_artifacts
+from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
-from darkweb_collector.browser_client import close_browser_client, screenshot_html_with_browser
+from darkweb_collector.browser_client import screenshot_html_with_browser
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 from darkweb_collector.db import (
     get_db_connection,
     get_forum_detail_snapshot,
@@ -16,6 +17,7 @@ from darkweb_collector.db import (
     upsert_forum_topic,
 )
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
+from darkweb_collector.session_cookies import resolve_session_cookie
 from darkweb_collector.sites.darkforums import parse_darkforums_detail, parse_darkforums_list
 from darkweb_collector.tor_fetch import fetch_page_artifacts, fetch_url, fetch_via_http_proxy
 from darkweb_collector.utils import dump_json, dump_text, safe_stem
@@ -35,12 +37,7 @@ def _detail_artifact_stem(url: str) -> str:
 def _detail_artifacts_exist(output_dir, section_name: str, topic_url: str) -> bool:
     artifact_stem = _detail_artifact_stem(topic_url)
     details_dir = output_dir / section_name / "details"
-    required = [
-        details_dir / f"{artifact_stem}.html",
-        details_dir / f"{artifact_stem}.json",
-        details_dir / f"{artifact_stem}.png",
-    ]
-    return all(path.exists() for path in required)
+    return detail_artifacts_complete(details_dir, artifact_stem)
 
 
 class DarkforumsAdapter(SiteAdapter):
@@ -90,8 +87,7 @@ class DarkforumsAdapter(SiteAdapter):
     @staticmethod
     def _is_valid_detail_payload(detail: dict) -> bool:
         content = str(detail.get("content") or "").strip()
-        author = str(detail.get("author") or "").strip()
-        return bool(content) or (author and author != "Unknown")
+        return bool(content)
 
     def collect_seed(self, config: SiteConfig, run_ctx: RunContext) -> SeedResult:
         return collect_forum_seed(self, config, self.list_parser, _section_name)
@@ -168,7 +164,9 @@ class DarkforumsAdapter(SiteAdapter):
                 timeout=config.fetch_timeout_seconds,
                 retries=0,
                 bypass_proxy=True,
+                cookie_header=resolve_session_cookie(config),
             )
+            raise_if_error_page(direct_html)
             if self._is_valid_detail_html(direct_html):
                 direct_detail = self.detail_parser(detail_task.target_url, direct_html)
                 if self._is_valid_detail_payload(direct_detail):
@@ -191,43 +189,31 @@ class DarkforumsAdapter(SiteAdapter):
                         screenshot_png=screenshot_png,
                         metadata=detail_task.metadata,
                     )
+        except CollectionFailure as exc:
+            if exc.kind in {"retry_budget", "unavailable", "rate_limited", "restricted"}:
+                raise
         except Exception:
             pass
-        for attempt in range(3):
-            html, screenshot_png = fetch_page_artifacts(
-                url=detail_task.target_url,
-                mode=config.detail_fetch_mode,
-                timeout_seconds=config.fetch_timeout_seconds,
-                render_wait_seconds=config.render_wait_seconds,
-                screenshot_selectors=self.detail_screenshot_selectors,
-                hide_selectors=(
-                    "header",
-                    "#panel",
-                    "#quick-search",
-                    ".bam_wrapper",
-                    ".footer",
-                    "footer",
-                ),
-                render_html_for_screenshot=True,
-            )
-            if self._is_valid_detail_html(html):
-                detail = self.detail_parser(detail_task.target_url, html)
-                if self._is_valid_detail_payload(detail):
-                    return DetailResult(
-                        site_name=self.site_name,
-                        target_url=detail_task.target_url,
-                        payload=detail,
-                        raw_html=html,
-                        screenshot_png=screenshot_png,
-                        metadata=detail_task.metadata,
-                    )
-            print(
-                f"[{self.site_name}] invalid detail html on attempt {attempt + 1} for "
-                f"{detail_task.target_url}; retrying"
-            )
-            close_browser_client()
-        print(f"[{self.site_name}] skipping invalid detail persist for {detail_task.target_url}")
-        return None
+        html, screenshot_png = fetch_page_artifacts(
+            url=detail_task.target_url,
+            mode=config.detail_fetch_mode,
+            timeout_seconds=config.fetch_timeout_seconds,
+            render_wait_seconds=config.render_wait_seconds,
+            screenshot_selectors=self.detail_screenshot_selectors,
+            hide_selectors=("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
+            render_html_for_screenshot=True,
+            cookie_header=resolve_session_cookie(config),
+        )
+        raise_if_error_page(html)
+        if not self._is_valid_detail_html(html):
+            raise CollectionFailure("parse", f"{self.site_name} detail has no recognized post structure")
+        detail = self.detail_parser(detail_task.target_url, html)
+        if not self._is_valid_detail_payload(detail):
+            raise CollectionFailure("parse", f"{self.site_name} detail has no visible post content")
+        return DetailResult(
+            site_name=self.site_name, target_url=detail_task.target_url, payload=detail,
+            raw_html=html, screenshot_png=screenshot_png, metadata=detail_task.metadata,
+        )
 
     def persist(
         self,
@@ -275,7 +261,7 @@ class DarkforumsAdapter(SiteAdapter):
                         dump_text(section_dir / f"{artifact_stem}.html", detail_result.raw_html)
                     if detail_result.screenshot_png is not None:
                         (section_dir / f"{artifact_stem}.png").write_bytes(detail_result.screenshot_png)
-                    dump_json(section_dir / f"{artifact_stem}.json", detail_result.payload)
+                    dump_json(section_dir / f"{artifact_stem}.json", {**detail_result.payload, "_collector_artifacts_complete": detail_result.screenshot_png is not None})
                     upsert_forum_detail(
                         detail_connection,
                         site_name=self.site_name,

@@ -8,13 +8,21 @@ import os
 import tempfile
 from urllib.parse import urlparse
 
+from darkweb_collector.collection_errors import CollectionFailure, managed_request, request_attempt, raise_if_error_page
 
-class TorFetchError(RuntimeError):
+
+class TorFetchError(CollectionFailure):
     """Raised when a Tor-backed fetch fails."""
 
+    def __init__(self, message: str, *, kind: str = "network") -> None:
+        super().__init__(kind, message)
 
-class ProxyFetchError(RuntimeError):
+
+class ProxyFetchError(CollectionFailure):
     """Raised when a proxy-backed fetch fails."""
+
+    def __init__(self, message: str, *, kind: str = "network") -> None:
+        super().__init__(kind, message)
 
 
 def _stderr_text(stderr: str | bytes | None) -> str:
@@ -23,6 +31,21 @@ def _stderr_text(stderr: str | bytes | None) -> str:
     if isinstance(stderr, bytes):
         return stderr.decode("utf-8", errors="replace").strip()
     return stderr.strip()
+
+
+def raise_for_http_status(status: int) -> None:
+    if status == 401:
+        raise CollectionFailure("auth_required", "source requires authentication", scope="site")
+    if status == 403:
+        raise CollectionFailure("blocked", "source refused the request", scope="target")
+    if status == 429:
+        raise CollectionFailure("rate_limited", "source rate limit reached", scope="site")
+    if status in {404, 410}:
+        raise CollectionFailure("unknown", f"HTTP {status}; target availability is unconfirmed")
+    if status in {408, 504}:
+        raise CollectionFailure("timeout", "source request timed out")
+    if isinstance(status, int) and 500 <= status < 600:
+        raise CollectionFailure("network", "source returned a temporary server error", scope="site")
 
 
 def is_onion_hostname(hostname: str | None) -> bool:
@@ -82,6 +105,7 @@ def fetch_url(
             wait_seconds=render_wait_seconds,
             timeout_seconds=timeout_seconds,
             proxy_server=browser_proxy_server_for_url(url),
+            cookie_header=cookie_header,
         )
 
     if is_onion_url(url):
@@ -131,6 +155,7 @@ def fetch_page_artifacts(
             screenshot_selectors=screenshot_selectors,
             hide_selectors=hide_selectors,
             screenshot_styles=screenshot_styles,
+            cookie_header=cookie_header,
         )
         return html, screenshot_png
 
@@ -170,6 +195,7 @@ def fetch_page_artifacts(
                 screenshot_selectors=screenshot_selectors,
                 hide_selectors=hide_selectors,
                 screenshot_styles=screenshot_styles,
+                cookie_header=cookie_header,
             )
         return html, screenshot_png
     except Exception as exc:
@@ -189,10 +215,9 @@ def fetch_via_tor_curl(
 ) -> str:
     curl = shutil.which("curl")
     if not curl:
-        raise TorFetchError("curl not found in PATH")
+        raise TorFetchError("curl not found in PATH", kind="infrastructure")
 
-    attempts = retries + 1
-    last_error = "unknown curl error"
+    attempts = 1 if managed_request() else retries + 1
     for attempt in range(1, attempts + 1):
         command = [
             curl,
@@ -204,6 +229,8 @@ def fetch_via_tor_curl(
             "--location",
             "--max-time",
             str(timeout),
+            "--write-out",
+            "\nDWTI_HTTP_STATUS:%{http_code}",
             "--user-agent",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -212,17 +239,19 @@ def fetch_via_tor_curl(
             command.extend(["--cookie", cookie_header])
         command.append(url)
 
+        request_attempt()
         result = subprocess.run(command, capture_output=True, check=False)
+        output = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
+        body, marker, code = output.rpartition("\nDWTI_HTTP_STATUS:")
+        if marker and code.strip().isdigit():
+            raise_for_http_status(int(code.strip()))
         if result.returncode == 0:
-            if isinstance(result.stdout, bytes):
-                return result.stdout.decode("utf-8", errors="replace")
-            return str(result.stdout or "")
+            return body if marker else output
 
-        last_error = _stderr_text(result.stderr)
         if attempt < attempts:
             time.sleep(backoff_seconds * attempt)
 
-    raise TorFetchError(f"curl fetch failed for {url}: {last_error}")
+    raise TorFetchError("curl fetch failed", kind="timeout" if result.returncode == 28 else "network")
 
 def fetch_with_cloudflare_bypass(
     url: str,
@@ -266,7 +295,7 @@ def fetch_with_cloudflare_bypass(
     if not curl:
         raise TorFetchError("curl not found in PATH")
     
-    attempts = retries + 1
+    attempts = 1 if managed_request() else retries + 1
     last_error = "unknown curl error"
     
     for attempt in range(1, attempts + 1):
@@ -301,6 +330,7 @@ def fetch_with_cloudflare_bypass(
         ] + headers + [url]
         
         # Execute curl command with proper encoding handling
+        request_attempt()
         result = subprocess.run(command, capture_output=True, check=False)
         
         if result.returncode == 0:
@@ -406,10 +436,9 @@ def fetch_via_http_proxy(
     # Use curl with HTTP proxy
     curl = shutil.which("curl")
     if not curl:
-        raise ProxyFetchError("curl not found in PATH")
+        raise ProxyFetchError("curl not found in PATH", kind="infrastructure")
     
-    attempts = retries + 1
-    last_error = "unknown curl error"
+    attempts = 1 if managed_request() else retries + 1
     
     # Create temp directory for cookies and output
     temp_scope = tempfile.TemporaryDirectory(prefix="dwti-http-fetch-")
@@ -445,6 +474,7 @@ def fetch_via_http_proxy(
             "--show-error",
             "--location",
             "--max-time", str(timeout),
+            "--write-out", "%{http_code}",
             "--cookie-jar", cookie_file,
             "--cookie", cookie_file,
             "--output", output_file
@@ -462,47 +492,26 @@ def fetch_via_http_proxy(
         command.extend(headers + [url])
         
         # Execute curl command
+        request_attempt()
         result = subprocess.run(command, capture_output=True, check=False)
+        status_text = result.stdout.decode("ascii", errors="ignore") if isinstance(result.stdout, bytes) else str(result.stdout or "")
+        if status_text.strip().isdigit():
+            raise_for_http_status(int(status_text.strip()))
         
         if result.returncode == 0:
             try:
                 # Try UTF-8 first
                 with open(output_file, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-                
-                # Check if we got a Cloudflare/interstitial page
-                if "Checking your browser" in content or "cf-browser-verification" in content:
-                    time.sleep(random.uniform(5, 10))
-                    continue
-                    
-                return content
-            except Exception:
-                # Try other encodings
-                encodings = ['latin-1', 'cp1252']
-                for encoding in encodings:
-                    try:
-                        with open(output_file, "r", encoding=encoding, errors="replace") as f:
-                            content = f.read()
-                        if "Checking your browser" in content or "cf-browser-verification" in content:
-                            time.sleep(random.uniform(5, 10))
-                            continue
-                        return content
-                    except:
-                        continue
-                
-                # Binary read as fallback
-                try:
-                    with open(output_file, "rb") as f:
-                        content = f.read()
-                    return content.decode('utf-8', errors='replace')
-                except:
-                    return ""
+            except OSError as exc:
+                raise ProxyFetchError("HTTP response body could not be read", kind="parse") from exc
+            raise_if_error_page(content)
+            return content
         
-        last_error = _stderr_text(result.stderr)
         if attempt < attempts:
             time.sleep(backoff_seconds * attempt)
     
-    raise ProxyFetchError(f"Proxy fetch failed for {url}: {last_error}")
+    raise ProxyFetchError("proxy fetch failed", kind="timeout" if result.returncode == 28 else "network")
 
 
 def fetch_with_proxy_bypass(

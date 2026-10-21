@@ -8,7 +8,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from darkweb_collector.adapters.base import SiteAdapter
-from darkweb_collector.adapters.forum_artifacts import restore_detail_artifacts
+from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
 from darkweb_collector.browser_client import (
     close_browser_client,
@@ -16,6 +16,7 @@ from darkweb_collector.browser_client import (
     fetch_page_artifacts_with_browser,
     screenshot_html_with_browser,
 )
+from darkweb_collector.collection_errors import CollectionFailure, classify_failure, raise_if_error_page
 from darkweb_collector.db import (
     get_db_connection,
     get_forum_detail_snapshot,
@@ -47,12 +48,7 @@ def _detail_artifact_stem(url: str) -> str:
 def _detail_artifacts_exist(output_dir, section_name: str, topic_url: str) -> bool:
     artifact_stem = _detail_artifact_stem(topic_url)
     details_dir = output_dir / section_name / "details"
-    required = [
-        details_dir / f"{artifact_stem}.html",
-        details_dir / f"{artifact_stem}.json",
-        details_dir / f"{artifact_stem}.png",
-    ]
-    return all(path.exists() for path in required)
+    return detail_artifacts_complete(details_dir, artifact_stem)
 
 
 def _browser_storage_state_path(config: SiteConfig) -> str | None:
@@ -95,6 +91,7 @@ class CrackedAdapter(SiteAdapter):
                 timeout=config.fetch_timeout_seconds,
                 retries=0,
                 bypass_proxy=bypass_proxy,
+                cookie_header=cookie_header,
             )
             screenshot = None
             if capture_screenshot:
@@ -147,19 +144,24 @@ class CrackedAdapter(SiteAdapter):
         if cookie_header:
             routes.append(("browser_cookie", lambda: browser_route(cookie_header)))
 
-        failures: list[str] = []
-        for index, (route_name, fetcher) in enumerate(routes):
+        last_failure = None
+        for index, (_route_name, fetcher) in enumerate(routes):
             try:
                 html, screenshot = fetcher()
+                raise_if_error_page(html)
                 if validator(html):
                     return html, screenshot
-                failures.append(f"{route_name}:invalid_html")
+                last_failure = CollectionFailure("parse", "cracked detail has no recognized post structure")
+            except CollectionFailure as exc:
+                if exc.kind in {"retry_budget", "unavailable", "rate_limited", "restricted"}:
+                    raise
+                last_failure = exc
             except Exception as exc:
-                failures.append(f"{route_name}:{type(exc).__name__}:{str(exc)[:160]}")
+                last_failure = classify_failure(exc)
             close_browser_client()
             if index + 1 < len(routes):
                 time.sleep(1)
-        raise RuntimeError(f"Cracked fetch failed after bounded fallback: {'; '.join(failures)}")
+        raise last_failure or CollectionFailure("unknown", "cracked fetch routes exhausted")
 
     def _fetch_html(self, url: str, config: SiteConfig, mode: str) -> str:
         del mode
@@ -183,8 +185,7 @@ class CrackedAdapter(SiteAdapter):
     @staticmethod
     def _is_valid_detail_payload(detail: dict) -> bool:
         content = str(detail.get("content") or "").strip()
-        author = str(detail.get("author") or "").strip()
-        return bool(content) or (author and author != "Unknown")
+        return bool(content)
 
     def collect_seed(self, config: SiteConfig, run_ctx: RunContext) -> SeedResult:
         return collect_forum_seed(self, config, parse_cracked_list, _section_name)
@@ -266,8 +267,7 @@ class CrackedAdapter(SiteAdapter):
         )
         detail = parse_cracked_detail(detail_task.target_url, html)
         if not self._is_valid_detail_payload(detail):
-            print(f"[cracked] skipping invalid detail persist for {detail_task.target_url}")
-            return None
+            raise CollectionFailure("parse", "cracked detail has no visible post content")
         return DetailResult(
             site_name=self.site_name,
             target_url=detail_task.target_url,
@@ -326,7 +326,7 @@ class CrackedAdapter(SiteAdapter):
                         dump_text(section_dir / f"{artifact_stem}.html", detail_result.raw_html)
                     if detail_result.screenshot_png is not None:
                         (section_dir / f"{artifact_stem}.png").write_bytes(detail_result.screenshot_png)
-                    dump_json(section_dir / f"{artifact_stem}.json", detail_result.payload)
+                    dump_json(section_dir / f"{artifact_stem}.json", {**detail_result.payload, "_collector_artifacts_complete": detail_result.screenshot_png is not None})
                     upsert_forum_detail(
                         detail_connection,
                         site_name=self.site_name,

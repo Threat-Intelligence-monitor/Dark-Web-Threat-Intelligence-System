@@ -12,14 +12,23 @@ from darkweb_collector.models import DetailTask
 DISPATCH_RESERVATION_SECONDS = 60
 _AVAILABLE = """(
     f.status = 'pending'
-    OR (f.status IN ('dispatching', 'running') AND f.lease_until <= ?)
+    OR (f.status IN ('dispatching', 'running') AND f.lease_until <= ?
+        AND NOT EXISTS (SELECT 1 FROM crawl_detail_control c WHERE c.owner_token = f.lease_token AND c.owner_token <> ''))
     OR (f.status = 'queued' AND f.lease_until > 0 AND f.lease_until <= ?
         AND NOT EXISTS (SELECT 1 FROM crawl_jobs j WHERE j.job_id = f.lease_token))
+    OR (f.status IN ('queued', 'legacy_queued') AND EXISTS (
+        SELECT 1 FROM crawl_jobs j WHERE j.job_id = f.lease_token
+            AND (j.finished_at IS NOT NULL OR j.status NOT IN ('enqueued', 'running')))
+        AND NOT EXISTS (SELECT 1 FROM crawl_detail_control c WHERE c.owner_token = f.lease_token AND c.owner_token <> ''))
 )"""
 _ACTIVE = """(
-    (f.status IN ('dispatching', 'running') AND f.lease_until > ?)
-    OR (f.status = 'queued' AND (f.lease_until = 0 OR f.lease_until > ?
-        OR EXISTS (SELECT 1 FROM crawl_jobs j WHERE j.job_id = f.lease_token)))
+    (f.status IN ('dispatching', 'running') AND (f.lease_until > ?
+        OR EXISTS (SELECT 1 FROM crawl_detail_control c WHERE c.owner_token = f.lease_token AND c.owner_token <> '')))
+    OR (f.status = 'queued' AND (
+        EXISTS (SELECT 1 FROM crawl_jobs j WHERE j.job_id = f.lease_token
+            AND j.status IN ('enqueued', 'running') AND j.finished_at IS NULL)
+        OR (NOT EXISTS (SELECT 1 FROM crawl_jobs j WHERE j.job_id = f.lease_token)
+            AND f.lease_until > ?)))
 )"""
 
 
@@ -70,6 +79,8 @@ def ensure_frontier_schema(connection) -> None:
     for statement in FRONTIER_SCHEMA.split(";"):
         if statement.strip():
             connection.execute(statement)
+    from darkweb_collector.detail_lifecycle import ensure_collection_schema
+    ensure_collection_schema(connection)
 
 
 def _timestamp(now: float | None) -> float:
@@ -128,7 +139,9 @@ def observe_frontier(connection, site_name: str, detail_tasks: Iterable[DetailTa
                     WHEN crawl_frontier.status = 'queued' AND (crawl_frontier.lease_until = 0
                         OR EXISTS (SELECT 1 FROM crawl_jobs j WHERE j.job_id = crawl_frontier.lease_token))
                         THEN 'queued'
-                    WHEN crawl_frontier.lease_until > excluded.updated_at THEN crawl_frontier.status
+                    WHEN crawl_frontier.lease_until > excluded.updated_at OR EXISTS (
+                        SELECT 1 FROM crawl_detail_control c WHERE c.owner_token = crawl_frontier.lease_token
+                            AND c.owner_token <> '') THEN crawl_frontier.status
                     WHEN excluded.observed_version = crawl_frontier.fetched_version
                         AND crawl_frontier.artifacts_complete = 1 THEN 'done'
                     ELSE 'pending' END
@@ -162,6 +175,11 @@ def list_frontier_candidates(connection, site_name: str, now=None, limit: int = 
             JOIN activity a ON a.section = f.section AND a.discovery_lane = f.discovery_lane
             WHERE f.site_name = ? AND f.status <> 'done'
                 AND f.next_retry <= ? AND {_AVAILABLE}
+                AND NOT EXISTS (SELECT 1 FROM crawl_detail_control c
+                    WHERE c.site_name = f.site_name AND c.target_url = f.target_url
+                        AND ((c.next_retry > ? AND c.source_version = f.observed_version) OR c.owner_token <> ''))
+                AND NOT EXISTS (SELECT 1 FROM crawl_site_control s
+                    WHERE s.site_name = f.site_name AND s.next_retry > ?)
         )
         SELECT * FROM candidates
         ORDER BY CASE WHEN discovery_lane = 'recent' THEN 0 ELSE 1 END,
@@ -170,7 +188,7 @@ def list_frontier_candidates(connection, site_name: str, now=None, limit: int = 
             section_rank, served_at, section
         LIMIT ?
         """,
-        (site_name, site_name, timestamp, timestamp, timestamp, max(1, int(limit))),
+        (site_name, site_name, timestamp, timestamp, timestamp, timestamp, timestamp, max(1, int(limit))),
     ).fetchall()
     return [_task(row) for row in rows]
 
@@ -184,6 +202,8 @@ def count_frontier_active(connection, site_name: str, now=None) -> int:
 
 
 def _lock_site_admission(connection, site_name, timestamp):
+    from darkweb_collector.detail_lifecycle import reconcile_detail_owners
+    reconcile_detail_owners(connection, now=timestamp)
     connection.execute(
         """INSERT INTO crawl_frontier_admission(site_name, updated_at) VALUES (?, ?)
         ON CONFLICT(site_name) DO UPDATE SET updated_at = excluded.updated_at""",
@@ -219,10 +239,15 @@ def claim_frontier(connection, site_name: str, target_url: str | None, lease_tok
             claimed_version = observed_version, last_claimed_at = ?, updated_at = ?
         WHERE site_name = ? AND target_url = ? AND status <> 'done'
             AND next_retry <= ? AND {_AVAILABLE}
+            AND NOT EXISTS (SELECT 1 FROM crawl_detail_control c
+                WHERE c.site_name = f.site_name AND c.target_url = f.target_url
+                    AND ((c.next_retry > ? AND c.source_version = f.observed_version) OR c.owner_token <> ''))
+            AND NOT EXISTS (SELECT 1 FROM crawl_site_control s
+                WHERE s.site_name = f.site_name AND s.next_retry > ?)
         RETURNING *
         """,
         (lease_token, timestamp + max(1, lease_seconds), timestamp, timestamp,
-         site_name, target_url, timestamp, timestamp, timestamp),
+         site_name, target_url, timestamp, timestamp, timestamp, timestamp, timestamp),
     ).fetchone()
     return _task(row, claimed=True) if row is not None else None
 
@@ -362,11 +387,20 @@ def fail_frontier(connection, site_name, target_url, lease_token, *, retry_secon
     return cursor.rowcount == 1
 
 
-def count_frontier_pending(connection, site_name: str) -> int:
-    row = connection.execute(
-        "SELECT COUNT(*) FROM crawl_frontier WHERE site_name = ? AND status <> 'done'", (site_name,),
-    ).fetchone()
-    return int(row[0])
+def count_frontier_pending(connection, site_name: str, now=None) -> int:
+    """Count active deliveries and executable backlog, excluding cooled inventory."""
+    timestamp = _timestamp(now)
+    return int(connection.execute(
+        f"""SELECT COUNT(*) FROM crawl_frontier f WHERE site_name = ? AND status <> 'done'
+            AND ({_ACTIVE} OR (status = 'legacy_queued' AND EXISTS (
+                SELECT 1 FROM crawl_jobs j WHERE j.job_id = f.lease_token
+                    AND j.status IN ('enqueued', 'running') AND j.finished_at IS NULL))
+            OR (next_retry <= ? AND {_AVAILABLE} AND NOT EXISTS (
+                SELECT 1 FROM crawl_detail_control c WHERE c.site_name = f.site_name
+                    AND c.target_url = f.target_url AND c.next_retry > ?
+                    AND c.source_version = f.observed_version)))""",
+        (site_name, timestamp, timestamp, timestamp, timestamp, timestamp, timestamp),
+    ).fetchone()[0])
 
 
 def _sites_filter(site_names, column="site_name"):

@@ -1953,6 +1953,10 @@ def _source_signature_payload(connection) -> dict[str, Any]:
         FROM vulnerability_records
         """
     ).fetchone()
+    ransomware_live_stats = connection.execute(
+        """SELECT COUNT(*) AS count, MAX(id) AS max_id,
+                  MAX(last_seen_at) AS latest_at FROM ransomware_live_victims"""
+    ).fetchone()
     document_hit_stats = connection.execute(
         """
         SELECT COUNT(*) AS count, MAX(id) AS max_id, MAX(last_seen_at) AS latest_at
@@ -1973,6 +1977,7 @@ def _source_signature_payload(connection) -> dict[str, Any]:
         "victims": dict(victim_stats),
         "victim_details": dict(victim_detail_stats),
         "vulnerability_records": dict(vulnerability_stats),
+        "ransomware_live_victims": dict(ransomware_live_stats),
         "document_hits": dict(document_hit_stats),
         "document_hit_snapshots": dict(document_snapshot_stats),
     }
@@ -3279,23 +3284,17 @@ def refresh_normalized_intelligence(connection, *, enrichment_budget: int | None
                 connection, source_signature=source_signature, event_count=event_count, refreshed_at=updated_at,
             )
             _save_domain_enrichment_cache(domain_cache)
-            connection.commit()
-            try:
-                from darkweb_collector.monitoring_notifications import notify_keyword_matches_for_watchlists
+            from darkweb_collector.incremental_intelligence import reset_incremental_projection
 
-                batch = []
-                batch_bytes = 0
-                for row in _normalized_spool_rows(spool, updated_at, new_only=True):
-                    size = len(row["detail_text"].encode("utf-8")) + len(row["event_metadata_json"].encode("utf-8"))
-                    if batch and (len(batch) >= NORMALIZATION_BATCH_SIZE or batch_bytes + size > NORMALIZATION_BATCH_BYTES):
-                        notify_keyword_matches_for_watchlists(connection, batch)
-                        batch, batch_bytes = [], 0
-                    batch.append(_hydrate_event_row(row))
-                    batch_bytes += size
-                if batch:
-                    notify_keyword_matches_for_watchlists(connection, batch)
-            except Exception:
-                logger.exception("failed to send monitoring keyword notifications after normalized intelligence refresh")
+            reset_incremental_projection(connection)
+            for row in _normalized_spool_rows(spool, updated_at, new_only=True):
+                connection.execute("""INSERT INTO normalized_notification_outbox
+                    (event_id, payload, revision, enqueued_at) VALUES (?, ?, 1, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET payload = excluded.payload,
+                    revision = normalized_notification_outbox.revision + 1,
+                    enqueued_at = excluded.enqueued_at, attempts = 0, next_retry = 0, lease_until = 0""",
+                    (row["event_id"], _json_dumps(row), _now_utc().timestamp()))
+            connection.commit()
             return load_normalized_events(connection, refresh=False) if load_events else []
         finally:
             spool.close()
@@ -3328,8 +3327,6 @@ def load_normalized_events(connection, refresh: bool = False) -> list[dict[str, 
     rows = list_normalized_intelligence_events(connection)
     if rows:
         return [_hydrate_event_row(row) for row in rows]
-    if get_normalized_intelligence_cache_state(connection) is None:
-        return ensure_normalized_intelligence(connection, force=True)
     return []
 
 
@@ -3352,17 +3349,6 @@ def load_normalized_event_page(
     )
     if rows:
         return [_hydrate_event_row(row) for row in rows]
-    if get_normalized_intelligence_cache_state(connection) is None:
-        ensure_normalized_intelligence(connection, force=True, load_events=False)
-        rows = list_normalized_intelligence_events(
-            connection,
-            event_type=event_type,
-            limit=limit,
-            offset=offset,
-            query=query,
-            sort=sort,
-        )
-        return [_hydrate_event_row(row) for row in rows]
     return []
 
 
@@ -3370,9 +3356,6 @@ def load_normalized_event_detail(connection, event_id: str, refresh: bool = Fals
     if refresh:
         ensure_normalized_intelligence(connection, force=True, load_events=False)
     row = get_normalized_intelligence_event(connection, event_id)
-    if row is None and get_normalized_intelligence_cache_state(connection) is None:
-        ensure_normalized_intelligence(connection, force=True, load_events=False)
-        row = get_normalized_intelligence_event(connection, event_id)
     if row is None:
         return None
     return _hydrate_event_row(row)

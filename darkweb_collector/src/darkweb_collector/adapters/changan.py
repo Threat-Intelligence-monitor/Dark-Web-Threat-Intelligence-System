@@ -10,10 +10,11 @@ import subprocess
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from darkweb_collector.adapters.base import SiteAdapter
-from darkweb_collector.adapters.forum_artifacts import restore_detail_artifacts
+from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_paginated_seed
 from darkweb_collector.browser_client import fetch_page_artifacts_with_browser
 from darkweb_collector.changan_auto_login import recover_changan_session
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt
 from darkweb_collector.db import (
     get_db_connection,
     get_forum_detail_snapshot,
@@ -28,7 +29,7 @@ from darkweb_collector.site_auth import (
     require_site_auth_token,
 )
 from darkweb_collector.sites.changan import parse_changan_detail, parse_changan_list
-from darkweb_collector.tor_fetch import browser_proxy_server_for_url, get_tor_socks_settings
+from darkweb_collector.tor_fetch import browser_proxy_server_for_url, get_tor_socks_settings, raise_for_http_status
 from darkweb_collector.utils import dump_json, dump_text, utc_now_iso
 
 
@@ -114,7 +115,7 @@ class ChanganAdapter(SiteAdapter):
         url = f"{base_url}{path}{'?' + query if query else ''}"
         curl = shutil.which("curl")
         if not curl:
-            raise RuntimeError("curl not found in PATH")
+            raise CollectionFailure("infrastructure", "curl not found in PATH")
         socks_host, socks_port = get_tor_socks_settings()
         command = [
             curl,
@@ -125,6 +126,8 @@ class ChanganAdapter(SiteAdapter):
             "--location",
             "--max-time",
             str(config.fetch_timeout_seconds),
+            "--write-out",
+            "\nDWTI_HTTP_STATUS:%{http_code}",
             "--header",
             "Accept: application/json",
             "--header",
@@ -135,22 +138,34 @@ class ChanganAdapter(SiteAdapter):
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
             url,
         ]
+        request_attempt()
         result = subprocess.run(command, capture_output=True, check=False)
-        if result.returncode != 0:
-            error = result.stderr.decode("utf-8", errors="replace").strip() or "unknown curl error"
-            raise RuntimeError(f"changan API request failed: {error}")
         body = result.stdout.decode("utf-8", errors="replace")
+        response_body, marker, status_text = body.rpartition("\nDWTI_HTTP_STATUS:")
+        if marker and status_text.strip().isdigit():
+            body = response_body
+            raise_for_http_status(int(status_text.strip()))
+        if result.returncode != 0:
+            raise CollectionFailure("timeout" if result.returncode == 28 else "network", "changan API request failed")
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise RuntimeError("changan API returned invalid JSON") from exc
-        code = int(payload.get("code") or 0)
+            raise_if_error_page(body)
+            raise CollectionFailure("parse", "changan API returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise CollectionFailure("parse", "changan API returned an invalid response object")
+        try:
+            code = int(payload.get("code") or 0)
+        except (ValueError, TypeError) as exc:
+            raise CollectionFailure("parse", "changan API returned an invalid result code") from exc
         if code in AUTH_ERROR_CODES:
             message = str(payload.get("msg") or "长安不夜城登录会话已失效")
             mark_site_auth_invalid(config, message)
             raise SiteAuthenticationRequired(str(config.extras.get("auth_platform") or "changan"), message)
+        if code == 4007 and path == "/api/goods/detail":
+            raise CollectionFailure("unavailable", "changan API reports that this product is unavailable (4007)")
         if code != 2000:
-            raise RuntimeError(f"changan API error {code}: {payload.get('msg') or 'unknown error'}")
+            raise CollectionFailure("unknown", f"changan API returned unrecognized result code {code}")
         return payload
 
     def _api_get(
@@ -163,8 +178,11 @@ class ChanganAdapter(SiteAdapter):
             return self._api_get_once(config, path, params)
         except SiteAuthenticationRequired as exc:
             if recover_changan_session(config, str(exc)):
-                return self._api_get_once(config, path, params)
-            raise
+                try:
+                    return self._api_get_once(config, path, params)
+                except SiteAuthenticationRequired as recovered_exc:
+                    raise CollectionFailure("auth_required", "changan session requires login", scope="account") from recovered_exc
+            raise CollectionFailure("auth_required", "changan session requires login", scope="account") from exc
 
     def collect_seed(self, config: SiteConfig, run_ctx: RunContext) -> SeedResult:
         base_url = _base_url(config.seed_urls[0])
@@ -213,10 +231,7 @@ class ChanganAdapter(SiteAdapter):
                 detail_snapshot = get_forum_detail_snapshot(connection, self.site_name, SECTION, topic_url)
                 stem = _artifact_stem(topic_url)
                 detail_dir = config.output_dir / SECTION / "details"
-                artifacts_ready = all(
-                    (detail_dir / f"{stem}.{suffix}").exists()
-                    for suffix in ("html", "json", "png")
-                )
+                artifacts_ready = detail_artifacts_complete(detail_dir, stem)
                 if artifacts_ready:
                     artifacts_ready = _stored_capture_is_complete(
                         detail_dir / f"{stem}.html",
@@ -258,11 +273,13 @@ class ChanganAdapter(SiteAdapter):
             detail_url=detail_task.target_url,
             collected_at_utc=utc_now_iso(),
         )
+        if not str(detail.get("content") or "").strip() or detail.get("title") == detail_task.target_url:
+            raise CollectionFailure("parse", "changan detail has no recognized product content")
         raw_html = _fallback_html(detail)
         screenshot_png = None
-        _, storage_state_path = require_site_auth_token(config)
         try:
-            raw_html, screenshot_png = fetch_page_artifacts_with_browser(
+            _, storage_state_path = require_site_auth_token(config)
+            rendered_html, screenshot_png = fetch_page_artifacts_with_browser(
                 url=detail_task.target_url,
                 wait_seconds=config.render_wait_seconds,
                 timeout_seconds=config.fetch_timeout_seconds,
@@ -272,8 +289,14 @@ class ChanganAdapter(SiteAdapter):
                 storage_state_path=storage_state_path,
                 capture_ready_script=_capture_ready_script(bool(detail.get("attachments"))),
             )
+            raise_if_error_page(rendered_html)
+            if screenshot_png is not None and "product-detail-info" in rendered_html:
+                raw_html = rendered_html
+            else:
+                screenshot_png = None
         except Exception as exc:
-            print(f"[changan] warning: detail screenshot failed for {detail_task.target_url}: {exc}")
+            screenshot_png = None
+            print(f"[changan] detail evidence capture failed: {type(exc).__name__}")
         return DetailResult(
             site_name=self.site_name,
             target_url=detail_task.target_url,
@@ -324,7 +347,7 @@ class ChanganAdapter(SiteAdapter):
                         dump_text(detail_dir / f"{stem}.html", result.raw_html)
                     if result.screenshot_png is not None:
                         (detail_dir / f"{stem}.png").write_bytes(result.screenshot_png)
-                    dump_json(detail_dir / f"{stem}.json", result.payload)
+                    dump_json(detail_dir / f"{stem}.json", {**result.payload, "_collector_artifacts_complete": result.screenshot_png is not None})
                     upsert_forum_detail(
                         detail_connection,
                         site_name=self.site_name,

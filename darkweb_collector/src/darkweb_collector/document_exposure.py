@@ -2984,6 +2984,7 @@ def scan_watchlist_once(
     file_types: list[str] | None = None,
     page_limit: int | None = None,
     detail_fetch: bool | None = None,
+    document_library_candidate_limit: int | None = None,
 ) -> dict[str, Any]:
     ensure_default_watchlist()
     started_at = _now_utc_iso()
@@ -3072,6 +3073,8 @@ def scan_watchlist_once(
             source_page_limit = selected_page_limit
             if page_limit is None and source_family == "document_library":
                 source_page_limit = int(source_policy.get("candidate_limit") or selected_page_limit)
+            if source_family == "document_library" and document_library_candidate_limit is not None:
+                source_page_limit = document_library_candidate_limit
             source_file_types = selected_file_types if file_types is not None else _normalize_file_types(
                 source_policy.get("file_types") or selected_file_types
             )

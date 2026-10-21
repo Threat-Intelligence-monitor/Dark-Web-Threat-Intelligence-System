@@ -5,6 +5,7 @@ from html.parser import HTMLParser
 import re
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 from darkweb_collector.normalize import content_hash
 from darkweb_collector.sites.darkforums import (
     determine_industry,
@@ -76,10 +77,11 @@ def _text(node: _Node | None) -> str:
 
 
 def _document(html: str, template: str) -> _Node:
+    raise_if_error_page(html)
     root = _Document(html).root
     element = root.first("html")
     if element is None or element.attrs.get("data-template") != template:
-        raise ValueError("XForums returned a browser check, login page, or unrecognized forum page")
+        raise CollectionFailure("parse", "XForums response has no recognized forum template")
     return root
 
 
@@ -188,16 +190,16 @@ def parse_xforums_list(url: str, html: str, max_topics: int = 20) -> dict:
 def parse_xforums_detail(url: str, html: str) -> dict:
     root = _document(html, "thread_view")
     if _pagination(root, url)[0] != 1:
-        raise ValueError("XForums detail must contain the original post, not a replies page")
+        raise CollectionFailure("parse", "XForums detail must contain the original post, not a replies page")
     posts = root.find_all("article", "message--post")
     post = next((item for item in posts if item.has_class("is-first") or item.attrs.get("data-position") == "0"), None)
     if post is None:
-        raise ValueError("XForums original post is unavailable or requires login")
+        raise CollectionFailure("parse", "XForums response does not contain the original post")
     message_body = post.first(cls="message-body")
     body = message_body.first(cls="bbWrapper") if message_body else None
     content = _text(body)
     if not content:
-        raise ValueError("XForums original post has no visible text")
+        raise CollectionFailure("parse", "XForums original post has no visible text")
     restricted = [
         node for node in body.find_all()
         if any(name.startswith(("bbCodeBlock--hide", "bbCodeBlock--hidden")) for name in (node.attrs.get("class") or "").split())
@@ -209,7 +211,7 @@ def parse_xforums_detail(url: str, html: str) -> dict:
         r"you (?:must|need to|have to) (?:log in|login|register|reply|react).{0,200}",
         visible.strip(), re.IGNORECASE,
     ):
-        raise ValueError("XForums post content requires login or an interaction")
+        raise CollectionFailure("restricted", "XForums post content requires login or an interaction")
     title = _text(root.first("h1", "p-title-value")) or _text(root.first("title")).split(" | ", 1)[0]
     attribution = post.first(cls="message-attribution")
     timestamp_node = attribution.first("time") if attribution else post.first("time")

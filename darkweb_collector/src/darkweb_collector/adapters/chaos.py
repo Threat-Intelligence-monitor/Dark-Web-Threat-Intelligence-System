@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from darkweb_collector.adapters.base import SiteAdapter
+from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 from darkweb_collector.db import get_db_connection, get_victim_snapshot, record_victim_detail
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
 from darkweb_collector.pipeline import persist_run
@@ -13,7 +16,7 @@ from urllib.parse import urlparse
 
 def _detail_artifacts_exist(output_dir, artifact_stem: str) -> bool:
     details_dir = output_dir / "details"
-    return all((details_dir / f"{artifact_stem}.{suffix}").exists() for suffix in ("html", "json", "png"))
+    return detail_artifacts_complete(details_dir, artifact_stem)
 
 
 class ChaosAdapter(SiteAdapter):
@@ -79,6 +82,12 @@ class ChaosAdapter(SiteAdapter):
                             "domain": victim.get("domain"),
                             "status": victim["status"],
                             "artifact_stem": artifact_stem,
+                            "source_version": victim["content_hash"],
+                            "frontier_artifact_only": bool(
+                                snapshot and snapshot["content_hash"] == victim["content_hash"]
+                                and snapshot["last_detail_fetch_status"] == "ok"
+                                and all((config.output_dir / "details" / f"{artifact_stem}.{suffix}").exists() for suffix in ("html", "json"))
+                            ),
                         },
                     )
                 )
@@ -94,6 +103,9 @@ class ChaosAdapter(SiteAdapter):
                 f"xpath=//a[@href='{detail_path}']/ancestor::div[contains(@class,'rounded-xl') "
                 f"and contains(@class,'bg-bunker')][1]"
             )
+        restored = restore_detail_artifacts(detail_task, config, screenshot_selector=screenshot_selector)
+        if restored is not None:
+            return restored
         html, screenshot_png = fetch_page_artifacts(
             url=detail_task.target_url,
             mode=config.detail_fetch_mode,
@@ -101,7 +113,10 @@ class ChaosAdapter(SiteAdapter):
             render_wait_seconds=config.render_wait_seconds,
             screenshot_selector=screenshot_selector,
         )
+        raise_if_error_page(html)
         detail = parse_chaos_detail(detail_task.target_url, html)
+        if not str(detail.get("content") or "").strip() or not detail.get("victims"):
+            raise CollectionFailure("parse", "chaos detail has no recognized victim content")
         return DetailResult(
             site_name=self.site_name,
             target_url=detail_task.target_url,
@@ -117,6 +132,7 @@ class ChaosAdapter(SiteAdapter):
         run_ctx: RunContext,
         seed_result: SeedResult | None = None,
         detail_results: list[DetailResult] | None = None,
+        connection=None,
     ) -> None:
         if seed_result is not None:
             output_dir = config.output_dir
@@ -128,16 +144,16 @@ class ChaosAdapter(SiteAdapter):
 
         if detail_results:
             details_dir = config.output_dir / "details"
-            with get_db_connection() as connection:
+            with (nullcontext(connection) if connection is not None else get_db_connection()) as detail_connection:
                 for detail_result in detail_results:
                     artifact_stem = detail_result.metadata.get("artifact_stem") or safe_stem(detail_result.target_url)
                     if detail_result.raw_html is not None:
                         dump_text(details_dir / f"{artifact_stem}.html", detail_result.raw_html)
                     if detail_result.screenshot_png is not None:
                         (details_dir / f"{artifact_stem}.png").write_bytes(detail_result.screenshot_png)
-                    dump_json(details_dir / f"{artifact_stem}.json", detail_result.payload)
+                    dump_json(details_dir / f"{artifact_stem}.json", {**detail_result.payload, "_collector_artifacts_complete": detail_result.screenshot_png is not None})
                     record_victim_detail(
-                        connection,
+                        detail_connection,
                         site_name=self.site_name,
                         source_url=str(detail_result.metadata["source_url"]),
                         name=str(detail_result.metadata["name"]),
@@ -145,4 +161,5 @@ class ChaosAdapter(SiteAdapter):
                         status=str(detail_result.metadata["status"]),
                         detail_payload=detail_result.payload,
                     )
-                connection.commit()
+                if connection is None:
+                    detail_connection.commit()

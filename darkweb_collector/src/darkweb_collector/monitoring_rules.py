@@ -18,7 +18,7 @@ from darkweb_collector.db import (
     list_monitoring_keywords,
     replace_monitoring_keywords,
 )
-from darkweb_collector.normalized_intelligence import _hydrate_event_row, ensure_normalized_intelligence
+from darkweb_collector.normalized_intelligence import _hydrate_event_row
 from darkweb_collector.search_schema import SEARCH_ORDER
 from darkweb_collector.utils import utc_now_iso
 
@@ -544,8 +544,6 @@ def build_monitoring_status() -> dict[str, Any]:
         cached = _cached_monitoring_summary(connection)
         if cached is not None:
             return cached
-        if get_normalized_intelligence_cache_state(connection) is None:
-            ensure_normalized_intelligence(connection, load_events=False)
         events = (_hydrate_event_row(row) for row in iter_normalized_intelligence_events(
             connection, order_by=SEARCH_ORDER["latest"]))
         enriched_events, payload = build_monitoring_payload(connection, events, retain_detail_text=False)

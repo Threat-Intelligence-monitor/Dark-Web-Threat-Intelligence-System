@@ -1,7 +1,10 @@
 """Lynx site adapter for darkweb_collector."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from darkweb_collector.adapters.base import SiteAdapter
+from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 from darkweb_collector.db import get_db_connection, get_victim_snapshot, record_victim_detail
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
 from darkweb_collector.pipeline import persist_run
@@ -13,7 +16,7 @@ from darkweb_collector.utils import dump_json, dump_text, safe_stem
 
 def _detail_artifacts_exist(output_dir, artifact_stem: str) -> bool:
     details_dir = output_dir / "details"
-    return all((details_dir / f"{artifact_stem}.{suffix}").exists() for suffix in ("html", "json", "png"))
+    return detail_artifacts_complete(details_dir, artifact_stem)
 
 
 class LynxAdapter(SiteAdapter):
@@ -110,6 +113,12 @@ class LynxAdapter(SiteAdapter):
                             "display_label": victim.get("display_label", victim["name"]),
                             "content_hash": victim.get("content_hash", ""),
                             "artifact_stem": artifact_stem,
+                            "source_version": victim.get("content_hash", ""),
+                            "frontier_artifact_only": bool(
+                                snapshot and snapshot.get("content_hash") == victim.get("content_hash")
+                                and snapshot.get("last_detail_fetch_status") == "ok"
+                                and all((config.output_dir / "details" / f"{artifact_stem}.{suffix}").exists() for suffix in ("html", "json"))
+                            ),
                         },
                     )
                 )
@@ -130,31 +139,28 @@ class LynxAdapter(SiteAdapter):
             run_ctx: Run context
 
         Returns:
-            DetailResult or None if failed
+            Parsed detail result.
         """
-        try:
-            html, screenshot_png = fetch_page_artifacts(
-                url=detail_task.target_url,
-                mode=config.detail_fetch_mode,
-                timeout_seconds=config.fetch_timeout_seconds,
-                render_wait_seconds=config.render_wait_seconds,
-                screenshot_selectors=(".chat__block", ".chat__block-title", ".chat__block-descr"),
-            )
-            detail = parse_lynx_detail_page(detail_task.target_url, html)
-            detail["artifact_stem"] = detail_task.metadata.get("artifact_stem") or ""
-
-            return DetailResult(
-                site_name=self.site_name,
-                target_url=detail_task.target_url,
-                payload=detail,
-                raw_html=html,
-                screenshot_png=screenshot_png,
-                metadata=detail_task.metadata,
-            )
-        except Exception as e:
-            # Log error but don't fail the entire run
-            print(f"Error collecting detail for {detail_task.target_url}: {e}")
-            return None
+        selectors = (".chat__block", ".chat__block-title", ".chat__block-descr")
+        restored = restore_detail_artifacts(detail_task, config, screenshot_selectors=selectors)
+        if restored is not None:
+            return restored
+        html, screenshot_png = fetch_page_artifacts(
+            url=detail_task.target_url,
+            mode=config.detail_fetch_mode,
+            timeout_seconds=config.fetch_timeout_seconds,
+            render_wait_seconds=config.render_wait_seconds,
+            screenshot_selectors=selectors,
+        )
+        raise_if_error_page(html)
+        detail = parse_lynx_detail_page(detail_task.target_url, html)
+        if not str(detail.get("content") or "").strip() or not any(marker in html for marker in ("chat__block", 'class="detailed"')):
+            raise CollectionFailure("parse", "lynx detail has no recognized publication content")
+        detail["artifact_stem"] = detail_task.metadata.get("artifact_stem") or ""
+        return DetailResult(
+            site_name=self.site_name, target_url=detail_task.target_url, payload=detail,
+            raw_html=html, screenshot_png=screenshot_png, metadata=detail_task.metadata,
+        )
 
     def persist(
         self,
@@ -162,6 +168,7 @@ class LynxAdapter(SiteAdapter):
         run_ctx: RunContext,
         seed_result: SeedResult | None = None,
         detail_results: list[DetailResult] | None = None,
+        connection=None,
     ) -> None:
         """Persist results to storage.
 
@@ -191,7 +198,7 @@ class LynxAdapter(SiteAdapter):
             details_dir = config.output_dir / "details"
             details_dir.mkdir(parents=True, exist_ok=True)
 
-            with get_db_connection() as connection:
+            with (nullcontext(connection) if connection is not None else get_db_connection()) as detail_connection:
                 for detail_result in detail_results:
                     if detail_result is None:
                         continue
@@ -209,11 +216,11 @@ class LynxAdapter(SiteAdapter):
                         (details_dir / f"{artifact_stem}.png").write_bytes(detail_result.screenshot_png)
 
                     # Save parsed JSON
-                    dump_json(details_dir / f"{artifact_stem}.json", detail_result.payload)
+                    dump_json(details_dir / f"{artifact_stem}.json", {**detail_result.payload, "_collector_artifacts_complete": detail_result.screenshot_png is not None})
 
                     # Record in database
                     record_victim_detail(
-                        connection,
+                        detail_connection,
                         site_name=self.site_name,
                         source_url=str(detail_result.metadata.get("source_url", "")),
                         name=str(detail_result.metadata.get("name", "")),
@@ -222,4 +229,5 @@ class LynxAdapter(SiteAdapter):
                         detail_payload=detail_result.payload,
                     )
 
-                connection.commit()
+                if connection is None:
+                    detail_connection.commit()
