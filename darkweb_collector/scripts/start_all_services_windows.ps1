@@ -10,6 +10,10 @@ param(
 
     [string]$DataRoot = "",
 
+    [string]$ServiceRoot = "",
+
+    [switch]$KeepGarnet,
+
     [switch]$Force
 )
 
@@ -76,6 +80,17 @@ $BrowserConcurrency = $BrowserPublicConcurrency + $BrowserOnionConcurrency
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CollectorRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $ProjectRoot = (Resolve-Path (Join-Path $CollectorRoot "..")).Path
+if ($ServiceRoot) {
+    if (-not [IO.Path]::IsPathRooted($ServiceRoot) -or $ServiceRoot.StartsWith("\\")) {
+        throw "ServiceRoot must be an absolute local release directory."
+    }
+    $ProjectRoot = (Resolve-Path -LiteralPath $ServiceRoot).Path
+    $CollectorRoot = Join-Path $ProjectRoot "darkweb_collector"
+    if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot "version.json") -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path $CollectorRoot "scripts\serve_api.py") -PathType Leaf)) {
+        throw "ServiceRoot is not a prepared application release."
+    }
+}
 $DashboardRoot = Join-Path $ProjectRoot "threat-intelligence-dashboard"
 $PostgreSqlSetupScript = Join-Path $ScriptDir "setup_postgresql_windows.ps1"
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE "AppData\Local" } else { Join-Path $ProjectRoot ".runtime\user" }
@@ -203,7 +218,7 @@ if (Test-Path -LiteralPath $InstallationStatePath -PathType Leaf) {
                 $ManagedInstallation = $candidateInstallation
                 $ManagedInstallationActive = $true
             }
-            elseif ($Action -ne "prepare-update" -and (Test-Path -LiteralPath $targetScript -PathType Leaf)) {
+            elseif (-not $ServiceRoot -and $Action -ne "prepare-update" -and (Test-Path -LiteralPath $targetScript -PathType Leaf)) {
                 $forwardArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $targetScript, $Action)
                 if ($Action -eq "uninstall") {
                     $forwardArguments += $UninstallMode
@@ -223,8 +238,13 @@ if (Test-Path -LiteralPath $InstallationStatePath -PathType Leaf) {
         }
     }
     catch {
+        if ($ServiceRoot) { throw }
         Write-Host "[WARN] Ignoring invalid managed installation state: $($_.Exception.Message)"
     }
+}
+if ($ServiceRoot -and (-not $ManagedInstallationActive -or
+    (Split-Path -Parent $ProjectRoot) -ine (Join-Path $AppRoot 'releases'))) {
+    throw 'ServiceRoot must match the active installation directly below the managed releases directory.'
 }
 $ActiveReleaseFile = Resolve-MigratedDataPath $env:DARKWEB_ACTIVE_RELEASE_FILE (Join-Path $DefaultUserDataDir "active-release.json")
 $ActiveRelease = $null
@@ -246,13 +266,13 @@ $DefaultTorBridgeAutoRuntimeDir = Join-Path $DefaultUserDataDir "tor_bridge_runt
 $DefaultNpmCacheDir = Join-Path $DefaultUserDataDir "npm-cache"
 $DefaultRuntimeRoot = Join-Path $DefaultUserDataDir "runtimes"
 $GarnetVersion = "2.2.1"
-$GarnetRuntimeRevision = "2.2.1-dwti.3"
-$GarnetArchiveUrl = "https://github.com/Threat-Intelligence-monitor/Dark-Web-Threat-Intelligence-System/releases/download/garnet-2.2.1-dwti.3/garnet-2.2.1-dwti.3-win-x64.zip"
-$GarnetArchiveSha256 = "8ec7bd6262d43d22fa9d6c58fef07ef8f53e5fd4d67b281452a71c792b198fa4"
-$GarnetServerSha256 = "d6dc88fe976cf09a23e58139855d0d1cea8ce17b17211e13fc78289fb7b237a6"
-$GarnetServerAssemblySha256 = "58a9dd9c8fc43ea37edca953810c661c802b51f3b13dfcd4716d51cabb29a77c"
-$GarnetCommonAssemblySha256 = "e2724ed09c8e78d604a365327d5025ac3823db4fef6bbc273523d25e9c55275b"
-$GarnetCoreAssemblySha256 = "9348db40a13c5361dc50bfb516094c41ff6c4b09f3f2ffed93a61f8b4bac4c17"
+$GarnetRuntimeRevision = "2.2.1-dwti.4"
+$GarnetArchiveUrl = "https://github.com/Threat-Intelligence-monitor/Dark-Web-Threat-Intelligence-System/releases/download/garnet-2.2.1-dwti.4/garnet-2.2.1-dwti.4-win-x64.zip"
+$GarnetArchiveSha256 = "ce14f02a5504c3f574cc69edbd4fdf2b8cd171ce595c361f6dfbea5b24e1783f"
+$GarnetServerSha256 = "8db658c39101e8df713f2023e39ddf7739dd08e5829cafd19228e50076544059"
+$GarnetServerAssemblySha256 = "7ef7d7eadd38bbceb24c23b042e5a143624c70a144c26fa0b22a0ae96e27ccba"
+$GarnetCommonAssemblySha256 = "437b23fe0671b9b49de2a64dbca55dadbbeead7634491c66002320e19369ba3d"
+$GarnetCoreAssemblySha256 = "e8d21e5f2ce4c6fae9754dc480c5f1e5c8bc940ce1c8ea7894f92cb341422b7a"
 $GarnetSourceUrl = "https://github.com/microsoft/garnet/tree/b0255a31de95b1e903ee187feb59ceb04819a639"
 $GarnetRuntimeRoot = Join-Path $DefaultRuntimeRoot "garnet\$GarnetRuntimeRevision"
 $GarnetServerExecutable = Join-Path $GarnetRuntimeRoot "net10.0\GarnetServer.exe"
@@ -270,6 +290,7 @@ $GarnetDataRoot = Resolve-MigratedDataPath $env:DARKWEB_GARNET_DATA_ROOT $Defaul
 $GarnetCheckpointDir = Join-Path $GarnetDataRoot "checkpoints"
 $GarnetCheckpointIntervalSeconds = if ($env:DARKWEB_GARNET_CHECKPOINT_INTERVAL_SECONDS) { [Math]::Max([int]$env:DARKWEB_GARNET_CHECKPOINT_INTERVAL_SECONDS, 300) } else { 21600 }
 $GarnetRuntimeManifest = Join-Path $DefaultUserDataDir "garnet-runtime.json"
+$GarnetProcessState = Join-Path $DefaultUserDataDir 'garnet-process.json'
 $ManagedGarnetRedisUrl = "redis://127.0.0.1:6380/0"
 $LegacyManagedRedisUrl = "redis://127.0.0.1:6379/0"
 $script:RedisProvider = "external"
@@ -1462,6 +1483,90 @@ function Test-RedisReady {
     }
 }
 
+function Invoke-ManagedGarnetCommand {
+    param([string[]]$Arguments)
+    $endpoint = Get-RedisEndpoint
+    if ($RedisUrl -ne $ManagedGarnetRedisUrl) { throw "Only the managed local Garnet endpoint accepts lifecycle commands." }
+    $client = [Net.Sockets.TcpClient]::new()
+    $reader = $null
+    try {
+        $client.ReceiveTimeout = 30000
+        $client.SendTimeout = 5000
+        $connecting = $client.BeginConnect($endpoint.Host, $endpoint.Port, $null, $null)
+        try {
+            if (-not $connecting.AsyncWaitHandle.WaitOne(5000)) { throw "Garnet connection timed out." }
+            $client.EndConnect($connecting)
+        }
+        finally { $connecting.AsyncWaitHandle.Close() }
+        $stream = $client.GetStream()
+        $request = "*$($Arguments.Count)`r`n"
+        foreach ($argument in $Arguments) { $request += "`$$([Text.Encoding]::UTF8.GetByteCount($argument))`r`n$argument`r`n" }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($request)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8)
+        $line = $reader.ReadLine()
+        if (-not $line -or $line[0] -eq '-') { throw "Garnet rejected $($Arguments[0]): $line" }
+        if ($line[0] -eq '+' -or $line[0] -eq ':') { return $line.Substring(1) }
+        if ($line[0] -ne '$') { throw "Unexpected Garnet lifecycle response." }
+        $length = [int]$line.Substring(1)
+        if ($length -lt 0 -or $length -gt 1048576) { throw "Missing or oversized Garnet lifecycle response." }
+        $buffer = [char[]]::new($length + 2)
+        $offset = 0
+        while ($offset -lt $buffer.Length) {
+            $count = $reader.Read($buffer, $offset, $buffer.Length - $offset)
+            if ($count -le 0) { throw "Incomplete Garnet lifecycle response." }
+            $offset += $count
+        }
+        if ($buffer[$length] -ne "`r" -or $buffer[$length + 1] -ne "`n") { throw "Invalid Garnet response terminator." }
+        if ($length -eq 0) { return '' }
+        return -join $buffer[0..($length - 1)]
+    }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        $client.Dispose()
+    }
+}
+
+function Assert-GarnetReadWrite {
+    if ($RedisUrl -ne $ManagedGarnetRedisUrl) { return }
+    $value = [Guid]::NewGuid().ToString('N')
+    $key = "__darkweb_lifecycle__:$value"
+    try {
+        if ((Invoke-ManagedGarnetCommand -Arguments @('SET', $key, $value, 'EX', '60')) -ne 'OK' -or
+            (Invoke-ManagedGarnetCommand -Arguments @('GET', $key)) -ne $value) {
+            throw "Garnet read/write verification failed."
+        }
+    }
+    finally { $null = Invoke-ManagedGarnetCommand -Arguments @('DEL', $key) }
+}
+
+function Confirm-GarnetPersistence {
+    param([switch]$Quiesced)
+    $reply = Invoke-ManagedGarnetCommand -Arguments @('COMMITAOF')
+    if ($reply -ne 'AOF file committed') { throw "Garnet did not confirm its AOF commit." }
+    $info = Invoke-ManagedGarnetCommand -Arguments @('INFO', 'PERSISTENCE')
+    $addresses = @([regex]::Matches($info, '(?m)^(CommittedUntilAddress|TailAddress):([^\r\n]+)'))
+    if ($addresses.Count -eq 0 -or @($addresses | Where-Object { $_.Groups[2].Value -notmatch '^\d+$' }).Count) {
+        throw "Garnet AOF persistence is disabled or cannot be verified."
+    }
+    if ($Quiesced) {
+        $committed = @($addresses | Where-Object { $_.Groups[1].Value -eq 'CommittedUntilAddress' })
+        $tails = @($addresses | Where-Object { $_.Groups[1].Value -eq 'TailAddress' })
+        if ($committed.Count -ne $tails.Count) { throw "Incomplete Garnet AOF commit evidence." }
+        for ($index = 0; $index -lt $tails.Count; $index++) {
+            if ([long]$committed[$index].Groups[2].Value -lt [long]$tails[$index].Groups[2].Value) {
+                throw "Garnet still has uncommitted AOF writes; its process was preserved."
+            }
+        }
+    }
+    Ensure-Directory $RuntimeDir
+    $evidence = @{ committed_at = [DateTime]::UtcNow.ToString('o'); quiesced = [bool]$Quiesced; checkpoint_root = $GarnetCheckpointDir; persistence = $info }
+    $path = Join-Path $RuntimeDir 'garnet-stop.json'
+    [IO.File]::WriteAllText("$path.tmp", ($evidence | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath "$path.tmp" -Destination $path -Force
+    Write-Info "Garnet AOF commit verified (quiesced=$([bool]$Quiesced)); evidence: $path"
+}
+
 function Wait-ForRedis {
     param([int]$TimeoutSeconds)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -1539,7 +1644,8 @@ function Load-RuntimePorts {
 function Test-DarkwebApiReady {
     try {
         $payload = Invoke-RestMethod -Uri $ApiHealthUrl -TimeoutSec 3
-        return ($payload.status -eq "ok")
+        $version = Get-Content -LiteralPath (Join-Path $ProjectRoot 'version.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        return ($payload.status -eq "ok" -and $payload.version -eq $version.version)
     }
     catch {
         return $false
@@ -1721,6 +1827,8 @@ function Test-DarkwebStackReady {
     if (-not (Test-RedisReady)) {
         return $false
     }
+    try { Assert-GarnetReadWrite }
+    catch { return $false }
     if (-not (Test-DarkwebApiReady)) {
         return $false
     }
@@ -1770,6 +1878,30 @@ function Stop-ManagedGarnetProcesses {
             Stop-ProcessTree -ProcessId $process.Id -ProcessRows $processRows -ProcessRowMap $processRowMap -Label "managed Garnet"
         }
     }
+}
+
+function Save-GarnetProcessRecord {
+    param([object]$Record)
+    $process = Get-Process -Id ([int]$Record.pid) -ErrorAction Stop
+    if (-not (Test-ManagedGarnetImagePath $process.Path)) { throw 'Cannot save logs for an unverified Garnet process.' }
+    $Record | Add-Member -NotePropertyName process_start_ticks -NotePropertyValue $process.StartTime.ToUniversalTime().Ticks -Force
+    $Record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$GarnetProcessState.tmp" -Encoding UTF8
+    Move-Item -LiteralPath "$GarnetProcessState.tmp" -Destination $GarnetProcessState -Force
+}
+
+function Read-GarnetProcessRecord {
+    param([Diagnostics.Process]$Process)
+    if (Test-Path -LiteralPath $GarnetProcessState -PathType Leaf) {
+        try {
+            $record = Get-Content -LiteralPath $GarnetProcessState -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ([int]$record.pid -eq $Process.Id -and
+                [long]$record.process_start_ticks -eq $Process.StartTime.ToUniversalTime().Ticks -and
+                $record.log -and (Test-Path -LiteralPath ([string]$record.log) -PathType Leaf)) { return $record }
+        }
+        catch { Write-Warn 'The saved Garnet process log record could not be verified.' }
+    }
+    Write-Warn 'The running Garnet stdout log path is unknown; no new-release log path was fabricated.'
+    return $null
 }
 
 function Stop-ManagedProjectPythonProcesses {
@@ -2032,6 +2164,7 @@ function Test-ManagedGarnetImagePath {
     param([string]$Path)
     try {
         return (Test-SamePath -Left $Path -Right $GarnetServerExecutable) -or
+            (Test-SamePath -Left $Path -Right (Join-Path $DefaultRuntimeRoot "garnet\2.2.1-dwti.3\net10.0\GarnetServer.exe")) -or
             (Test-SamePath -Left $Path -Right (Join-Path $DefaultRuntimeRoot "garnet\2.2.1-dwti.2\net10.0\GarnetServer.exe")) -or
             (Test-SamePath -Left $Path -Right (Join-Path $DefaultRuntimeRoot "garnet\2.2.1-dwti.1\net10.0\GarnetServer.exe")) -or
             (Test-SamePath -Left $Path -Right (Join-Path $DefaultRuntimeRoot "garnet\$GarnetVersion\net10.0\GarnetServer.exe"))
@@ -2398,13 +2531,15 @@ function Start-ManagedGarnetProcess {
         if ($null -eq $previousDotnetRootX64) { Remove-Item Env:DOTNET_ROOT_X64 -ErrorAction SilentlyContinue } else { Set-Item Env:DOTNET_ROOT_X64 -Value $previousDotnetRootX64 }
     }
 
-    return [pscustomobject]@{
+    $record = [pscustomobject]@{
         name = "garnet"
         pid = $process.Id
         log = $logPath
         error_log = $errorLogPath
         started_at = (Get-Date).ToString("s")
     }
+    Save-GarnetProcessRecord $record
+    return $record
 }
 
 function Ensure-PythonRuntime {
@@ -2597,6 +2732,13 @@ function Register-DarkwebCommand {
         Load-RuntimePorts
     }
     Ensure-Directory $CommandBinDir
+    $serviceLauncher = '%COLLECTOR_ROOT%\scripts\start_all_services_windows.ps1'
+    $serviceArguments = ''
+    if ($ServiceRoot) {
+        # Keep the verified management code when rolling application code back.
+        $serviceLauncher = Join-Path $ScriptDir 'start_all_services_windows.ps1'
+        $serviceArguments = '-ServiceRoot "' + $ProjectRoot + '"'
+    }
     $commandText = @"
 @echo off
 set "COLLECTOR_ROOT=%DARKWEB_COLLECTOR_ROOT%"
@@ -2614,9 +2756,9 @@ if not exist "%COLLECTOR_ROOT%\scripts\start_all_services_windows.ps1" (
 if "%~1"=="" (
   "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%COLLECTOR_ROOT%\scripts\configure_data_root_windows.ps1" first-run
   if errorlevel 1 exit /b 1
-  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%COLLECTOR_ROOT%\scripts\start_all_services_windows.ps1" start
+  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$serviceLauncher" $serviceArguments start
 ) else (
-  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%COLLECTOR_ROOT%\scripts\start_all_services_windows.ps1" %*
+  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$serviceLauncher" $serviceArguments %*
 )
 "@
     Set-Content -LiteralPath $DarkwebCommandPath -Value $commandText -Encoding ASCII
@@ -3111,11 +3253,12 @@ function Ensure-Redis {
         if ($managedGarnet) {
             Set-ManagedGarnetCpuLimit -Process $managedGarnet[0] -ExpectedExecutable $GarnetServerExecutable
             $script:RedisProvider = "garnet"
+            $previousRecord = Read-GarnetProcessRecord $managedGarnet[0]
             return [pscustomobject]@{
                 name = "garnet"
                 pid = $managedGarnet[0].Id
-                log = Join-Path $LogDir "garnet.log"
-                error_log = Join-Path $LogDir "garnet-error.log"
+                log = if ($previousRecord) { $previousRecord.log } else { '' }
+                error_log = if ($previousRecord -and $previousRecord.PSObject.Properties['error_log']) { $previousRecord.error_log } else { '' }
                 started_at = $managedGarnet[0].StartTime.ToString("s")
             }
         }
@@ -3307,10 +3450,10 @@ function Start-Services {
 
     Ensure-Environment
 
-    $existingRecords = @(Get-ServiceRecords | Where-Object { Test-ProcessRunning -ProcessId ([int]$_.pid) })
+    $existingRecords = @(Get-ServiceRecords | Where-Object { $_.name -ne 'garnet' -and (Test-ProcessRunning -ProcessId ([int]$_.pid)) })
     if ($existingRecords.Count -gt 0) {
         Write-Warn "Existing $SessionName services are running; stopping them first"
-        Stop-Services
+        Stop-Services -PreserveGarnet
     }
 
     # A previous run may have lost its PID file, or another dev server may
@@ -3375,16 +3518,29 @@ function Start-Services {
 }
 
 function Stop-Services {
+    param([switch]$PreserveGarnet)
     $portsToClean = @($ApiPort, $FrontendPort)
     Load-RuntimePorts
     $runtimePortsToClean = @($ApiPort, $FrontendPort)
     $projectPortsToClean = @(8000, 5173, 5174)
 
     $records = @(Get-ServiceRecords)
+    $garnetProcesses = @(Get-ManagedGarnetProcesses)
+    $preserveQueue = $false
+    if ($garnetProcesses.Count) {
+        # An unsuccessful preflight leaves the application and installation pointer intact.
+        Assert-GarnetReadWrite
+        Confirm-GarnetPersistence
+        $preserveQueue = ($KeepGarnet -or $PreserveGarnet) -and
+            @($garnetProcesses | Where-Object { -not (Test-SamePath -Left $_.Path -Right $GarnetServerExecutable) }).Count -eq 0 -and
+            [bool](Resolve-ManagedGarnetRuntime)
+    }
     $ownedProcessIds = @()
     $processRows = @(Get-ProcessRows)
     $processRowMap = New-ProcessRowMap -ProcessRows $processRows
-    $stopRecords = @($records | Sort-Object @{ Expression = { if ($_.name -eq "garnet") { 1 } else { 0 } } })
+    $protectedIds = Get-ProtectedUpdateProcessIds -ProcessRows $processRows -ProcessRowMap $processRowMap
+    foreach ($process in $garnetProcesses) { $null = $protectedIds.Add($process.Id) }
+    $stopRecords = @($records | Where-Object { $_.name -ne 'garnet' })
     foreach ($record in $stopRecords) {
         $pidValue = [int]$record.pid
         if (Test-ProcessRunning -ProcessId $pidValue) {
@@ -3392,7 +3548,7 @@ function Stop-Services {
                 if ($record.name -ne "garnet") {
                     $ownedProcessIds += $pidValue
                 }
-                Stop-ProcessTree -ProcessId $pidValue -ProcessRows $processRows -ProcessRowMap $processRowMap -Label $record.name
+                Stop-ProcessTree -ProcessId $pidValue -ProcessRows $processRows -ProcessRowMap $processRowMap -Label $record.name -ProtectedProcessIds $protectedIds
             }
             else {
                 Write-Warn "Ignoring stale PID record for $($record.name): $pidValue"
@@ -3406,11 +3562,10 @@ function Stop-Services {
     Get-ProjectManagedProcessRows -ProcessRows $processRows -ProcessRowMap $processRowMap |
         Sort-Object ProcessId -Descending |
         ForEach-Object {
-            Stop-ProcessTree -ProcessId ([int]$_.ProcessId) -ProcessRows $processRows -ProcessRowMap $processRowMap -Label "project process"
+            Stop-ProcessTree -ProcessId ([int]$_.ProcessId) -ProcessRows $processRows -ProcessRowMap $processRowMap -Label "project process" -ProtectedProcessIds $protectedIds
         }
     Stop-ManagedDashboardProcesses
     Stop-ManagedProjectPythonProcesses
-    Stop-ManagedGarnetProcesses
 
     foreach ($port in @($runtimePortsToClean | Where-Object { $_ -and [int]$_ -gt 0 } | Sort-Object -Unique)) {
         Stop-ProjectListenersOnPort -Port ([int]$port) -Reason "darkweb runtime port cleanup"
@@ -3424,13 +3579,30 @@ function Stop-Services {
     $remainingRows = @(Get-ProcessRows)
     $remainingRowMap = New-ProcessRowMap -ProcessRows $remainingRows
     $remainingManaged = @(Get-ProjectManagedProcessRows -ProcessRows $remainingRows -ProcessRowMap $remainingRowMap |
-        Where-Object { [int]$_.ProcessId -ne $PID })
+        Where-Object { [int]$_.ProcessId -ne $PID -and -not $protectedIds.Contains([int]$_.ProcessId) })
     if ($remainingOwned.Count -gt 0 -or $remainingManaged.Count -gt 0) {
         Stop-WithError "Managed project processes are still running after stop."
     }
 
-    if (Test-Path -LiteralPath $PidFile) {
+    if ($garnetProcesses.Count) {
+        # All producers, consumers and checkpoint loops have exited before the final commit.
+        Confirm-GarnetPersistence -Quiesced
+        if (-not $preserveQueue) {
+            Stop-ManagedGarnetProcesses
+            if (@(Get-ManagedGarnetProcesses).Count) { Stop-WithError 'Managed Garnet did not stop after its committed AOF was verified.' }
+        }
+    }
+    if ($preserveQueue) {
+        $retainedRecords = @($records | Where-Object { $_.name -eq 'garnet' })
+        if ($retainedRecords.Count) { Save-GarnetProcessRecord $retainedRecords[0] }
+        Save-ServiceRecords $retainedRecords
+        Write-Info 'Preserved the healthy, verified Garnet process for the application update.'
+    }
+    elseif (Test-Path -LiteralPath $PidFile) {
         Remove-Item -LiteralPath $PidFile -Force
+    }
+    if (-not $preserveQueue -and (Test-Path -LiteralPath $GarnetProcessState -PathType Leaf)) {
+        Remove-Item -LiteralPath $GarnetProcessState -Force
     }
     Write-Info "Services stopped"
 }

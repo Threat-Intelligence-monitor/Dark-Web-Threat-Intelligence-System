@@ -13,6 +13,7 @@ import sys
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -33,7 +34,7 @@ from darkweb_collector.storage_paths import app_root, data_root, update_state_ro
 
 
 ACTIVE_STATUSES = {"queued", "running"}
-UPDATER_VERSION = 1
+UPDATER_VERSION = 2
 MAX_ARCHIVE_MEMBERS = 50_000
 MAX_UNPACKED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 500
@@ -241,13 +242,41 @@ def _read_installation() -> dict[str, Any]:
     return payload
 
 
-def _launcher_command(project_root: Path, action: str) -> list[str]:
+def _installed_update_source(installed_root: Path) -> tuple[Path, dict[str, Any]]:
+    original = installed_root.expanduser().absolute()
+    for path in (original, *original.parents):
+        if path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise SelfUpdateError("升级引导不允许链接的安装目录")
+    root = installed_root.expanduser().resolve(strict=True)
+    releases = _releases_dir().resolve()
+    installation = _read_installation()
+    if root.parent != releases or root != Path(str(installation.get("current_root") or "")).resolve():
+        raise SelfUpdateError("升级引导只允许更新安装记录指向的受管版本目录")
+    try:
+        payload = json.loads((root / "version.json").read_text(encoding="utf-8"))
+        if str(payload["version"]) != str(installation.get("current_version") or ""):
+            raise ValueError("version mismatch")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SelfUpdateError("当前安装版本记录与版本文件不一致") from exc
+    current = current_version_payload()
+    current.update({key: payload[key] for key in ("version", "commit", "data_schema", "channel", "branch", "repository") if key in payload})
+    return root, current
+
+
+def _launcher_command(
+    project_root: Path, action: str, *, service_root: Path | None = None, keep_garnet: bool = False
+) -> list[str]:
     if os.name == "nt":
         script = project_root / "darkweb_collector" / "scripts" / "start_all_services_windows.ps1"
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
         if not powershell or not script.exists():
             raise SelfUpdateError("找不到 Windows 服务启动脚本或 PowerShell")
-        return [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-DataRoot", str(data_root()), action]
+        command = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-DataRoot", str(data_root()), action]
+        if service_root is not None:
+            command.extend(["-ServiceRoot", str(service_root)])
+        if keep_garnet:
+            command.append("-KeepGarnet")
+        return command
     raise SelfUpdateError("当前无 Git 更新器暂仅支持 Windows")
 
 
@@ -545,20 +574,6 @@ def _backup_sqlite_database(job_id: str) -> tuple[Path, Path] | None:
     return source, backup
 
 
-def _restore_sqlite_database(database_backup: tuple[Path, Path] | None) -> None:
-    if database_backup is None:
-        return
-    target, backup = database_backup
-    if not backup.is_file():
-        raise SelfUpdateError("SQLite 回滚备份不存在")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.rollback")
-    shutil.copy2(backup, temporary)
-    os.replace(temporary, target)
-    Path(f"{target}-wal").unlink(missing_ok=True)
-    Path(f"{target}-shm").unlink(missing_ok=True)
-
-
 def _current_sites_path(current_root: Path, installation: dict[str, Any]) -> Path:
     configured = str(installation.get("sites_file") or os.environ.get("DARKWEB_COLLECTOR_SITES_FILE") or "").strip()
     path = Path(configured).expanduser() if configured else current_root / "darkweb_collector" / "sites.yaml"
@@ -630,18 +645,31 @@ def _health_version(project_root: Path, expected_version: str) -> None:
         with urllib.request.urlopen(f"{api_base}/api/health", timeout=10) as response:
             health_status = json.loads(response.read().decode("utf-8"))
         if health_status.get("status") != "ok":
-            raise SelfUpdateError("新版 API 健康检查失败")
+            raise SelfUpdateError("API 健康检查失败")
         running_version = str(health_status.get("version") or "")
         if running_version != expected_version:
-            raise SelfUpdateError(f"新版 API 版本校验失败：{running_version or 'unknown'}")
+            raise SelfUpdateError(f"API 版本校验失败：期望 {expected_version}，实际 {running_version or 'unknown'}")
         with urllib.request.urlopen(frontend_url, timeout=10) as response:
             frontend = response.read(1024 * 1024).decode("utf-8", errors="replace")
         if '<meta name="darkweb-ui" content="xuanjian-new-ui"' not in frontend:
-            raise SelfUpdateError("新版前端健康检查失败")
+            raise SelfUpdateError("前端健康检查失败")
+        dist = project_root / "threat-intelligence-dashboard" / "dist"
+        built_html = (dist / "index.html").read_text(encoding="utf-8")
+        scripts = re.findall(r'<script\b[^>]*\bsrc="(/assets/[^"?#]+\.js)"', built_html)
+        if not scripts or any(f'src="{script}"' not in frontend for script in scripts):
+            raise SelfUpdateError("前端仍在提供其他版本的构建文件")
+        for script in scripts:
+            expected = hashlib.sha256((dist / script.lstrip("/")).read_bytes()).digest()
+            actual = hashlib.sha256()
+            with urllib.request.urlopen(urllib.parse.urljoin(frontend_url, script), timeout=10) as response:
+                for chunk in iter(lambda: response.read(65536), b""):
+                    actual.update(chunk)
+            if actual.digest() != expected:
+                raise SelfUpdateError("前端构建资源校验失败")
     except SelfUpdateError:
         raise
     except Exception as exc:
-        raise SelfUpdateError(f"新版健康检查失败：{exc}") from exc
+        raise SelfUpdateError(f"服务健康检查失败：{exc}") from exc
 
 
 def _rollback(
@@ -652,14 +680,14 @@ def _rollback(
     old_sites: Path,
     old_output: Path,
     new_root: Path | None,
-    database_backup: tuple[Path, Path] | None,
+    controller_root: Path,
     log: TextIO,
 ) -> str:
     try:
         stop_error: Exception | None = None
         if new_root is not None:
             try:
-                _run_logged(_launcher_command(new_root, "stop"), new_root, log, timeout=300)
+                _run_logged(_launcher_command(controller_root, "stop", service_root=new_root, keep_garnet=True), new_root, log, timeout=300)
             except Exception as exc:
                 stop_error = exc
         restore_payload = old_installation or _installation_payload(
@@ -669,25 +697,34 @@ def _rollback(
             output_root=old_output,
             previous=None,
         )
-        _atomic_json(_installation_path(), restore_payload)
         if stop_error is not None:
             raise SelfUpdateError(f"新版服务未能完全停止：{stop_error}")
-        _restore_sqlite_database(database_backup)
-        _run_logged(_launcher_command(old_root, "start"), old_root, log)
-        _run_logged(_launcher_command(old_root, "health"), old_root, log, timeout=120)
+        _atomic_json(_installation_path(), restore_payload)
+        # Rollback-compatible releases keep the database, including records collected
+        # while the candidate was running. Restoring the old snapshot would lose them.
+        _run_logged(_launcher_command(controller_root, "start", service_root=old_root), old_root, log)
+        _run_logged(_launcher_command(controller_root, "health", service_root=old_root), old_root, log, timeout=120)
+        _health_version(old_root, old_version)
         return "completed"
     except Exception as exc:
         log.write(f"\n[{_now_iso()}] Rollback failed: {exc}\n")
         return f"failed: {exc}"
 
 
-def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dict[str, Any]:
+def apply_release_update(
+    job_id: str, state: dict[str, Any], log: TextIO, *, installed_root: Path | None = None
+) -> dict[str, Any]:
     _ensure_update_enabled()
     current = current_version_payload()
+    old_root = _project_root().resolve()
+    if installed_root is not None:
+        old_root, current = _installed_update_source(installed_root)
     manifest = _load_manifest_for_update(current)
     signature_status = _verify_manifest_signature(manifest)
     if manifest["minimum_updater_version"] > UPDATER_VERSION:
         raise SelfUpdateError("当前更新器版本过旧，无法安装该版本")
+    if manifest["minimum_updater_version"] < 2:
+        raise SelfUpdateError("目标版本不支持安全队列生命周期，需先发布 minimum_updater_version=2 的更新包")
     if manifest["channel"] != current["channel"]:
         raise SelfUpdateError("更新清单通道与当前配置不一致")
     if not manifest["rollback_compatible"]:
@@ -712,12 +749,10 @@ def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dic
 
     job_dir = _downloads_dir() / job_id
     archive = job_dir / "update.zip"
-    old_root = _project_root().resolve()
     old_installation = _read_installation()
     old_sites = _current_sites_path(old_root, old_installation)
     old_output = _current_output_root(old_root, old_installation)
     new_root: Path | None = None
-    database_backup: tuple[Path, Path] | None = None
     preserve_backup = False
     stop_attempted = False
     activated = False
@@ -758,12 +793,12 @@ def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dic
         state.update(stage="stopping", message="更新包已就绪，正在停止旧版服务", restart_required=True)
         _write_update_status(state)
         stop_attempted = True
-        _run_logged(_launcher_command(old_root, "stop"), old_root, log, timeout=300)
+        _run_logged(_launcher_command(new_root, "stop", service_root=old_root, keep_garnet=True), old_root, log, timeout=300)
         _merge_sites_config(old_sites, new_root / "darkweb_collector" / "sites.yaml", new_sites)
         _copy_shared_secrets(old_root)
         state.update(stage="backing_up", message="正在创建更新前数据备份")
         _write_update_status(state)
-        database_backup = _backup_sqlite_database(job_id)
+        _backup_sqlite_database(job_id)
 
         state.update(stage="switching", message="正在切换到新版本")
         _write_update_status(state)
@@ -772,11 +807,11 @@ def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dic
 
         state.update(stage="restarting", message="正在启动新版本")
         _write_update_status(state)
-        _run_logged(_launcher_command(new_root, "start"), new_root, log)
+        _run_logged(_launcher_command(new_root, "start", service_root=new_root), new_root, log)
 
         state.update(stage="health_check", message="正在检查新版服务")
         _write_update_status(state)
-        _run_logged(_launcher_command(new_root, "health"), new_root, log, timeout=120)
+        _run_logged(_launcher_command(new_root, "health", service_root=new_root), new_root, log, timeout=120)
         _health_version(new_root, manifest["version"])
         return {
             "updated": True,
@@ -794,11 +829,11 @@ def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dic
             rollback_status = _rollback(
                 old_root=old_root,
                 old_version=str(current["version"]),
-                old_installation=old_installation if activated else {},
+                old_installation=old_installation,
                 old_sites=old_sites,
                 old_output=old_output,
                 new_root=new_root if activated else None,
-                database_backup=database_backup,
+                controller_root=new_root or old_root,
                 log=log,
             )
             state["rollback_status"] = rollback_status
@@ -814,7 +849,7 @@ def apply_release_update(job_id: str, state: dict[str, Any], log: TextIO) -> dic
             shutil.rmtree(data_root() / "update-backups" / job_id, ignore_errors=True)
 
 
-def run_self_update(job_id: str, wait_seconds: float = 1.0) -> None:
+def run_self_update(job_id: str, wait_seconds: float = 1.0, *, installed_root: Path | None = None) -> None:
     import psutil
 
     if wait_seconds > 0:
@@ -839,7 +874,7 @@ def run_self_update(job_id: str, wait_seconds: float = 1.0) -> None:
             _write_update_status(state)
             _log_path().parent.mkdir(parents=True, exist_ok=True)
             with _log_path().open("a", encoding="utf-8") as log:
-                result = apply_release_update(job_id, state, log)
+                result = apply_release_update(job_id, state, log, installed_root=installed_root)
         state.update(result)
         if result["updated"]:
             state.update(
@@ -871,6 +906,20 @@ def run_self_update(job_id: str, wait_seconds: float = 1.0) -> None:
             _write_update_status(state)
 
 
+def run_installed_self_update(installed_root: Path) -> None:
+    _ensure_update_enabled()
+    with _update_lock():
+        _installed_update_source(installed_root)
+        if read_update_status().get("status") in ACTIVE_STATUSES:
+            raise SelfUpdateError("已有更新任务正在执行")
+        job_id = uuid.uuid4().hex
+        _write_update_status({"job_id": job_id, "status": "queued", "stage": "queued", "started_at": _now_iso()})
+    run_self_update(job_id, wait_seconds=0, installed_root=installed_root)
+    status = read_update_status()
+    if status.get("job_id") != job_id or status.get("status") != "completed":
+        raise SelfUpdateError(str(status.get("error") or "安全升级未完成，请检查更新状态"))
+
+
 def start_self_update() -> dict[str, Any]:
     _ensure_update_enabled()
     with _update_lock():
@@ -883,6 +932,8 @@ def start_self_update() -> dict[str, Any]:
         _verify_manifest_signature(manifest)
         if manifest["minimum_updater_version"] > UPDATER_VERSION:
             raise SelfUpdateError("当前更新器版本过旧，无法安装该版本")
+        if manifest["minimum_updater_version"] < 2:
+            raise SelfUpdateError("目标版本不支持安全队列生命周期，需先发布 minimum_updater_version=2 的更新包")
 
         job_id = uuid.uuid4().hex
         state = _write_update_status(

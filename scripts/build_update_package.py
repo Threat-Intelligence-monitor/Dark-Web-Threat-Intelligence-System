@@ -150,7 +150,7 @@ def build_package(repository: str, version: str, output_dir: Path, signing_key: 
         "commit": commit,
         "published_at": updated_at,
         "release_url": f"https://github.com/{repository}/releases/tag/{version}",
-        "minimum_updater_version": 1,
+        "minimum_updater_version": 2,
         "data_schema": int(version_payload.get("data_schema") or 1),
         "rollback_compatible": True,
         "package": {

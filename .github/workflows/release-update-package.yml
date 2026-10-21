@@ -54,6 +54,24 @@ jobs:
           ) | Out-Null
           if ($errors.Count) { $errors | Format-List; exit 1 }
 
+      - name: Verify the required Garnet component is already available
+        shell: pwsh
+        run: |
+          $build = Get-Content -LiteralPath "patches/garnet/build.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          $asset = $build.artifact
+          $url = "https://github.com/${{ github.repository }}/releases/download/garnet-$($build.runtime_revision)/$($asset.name)"
+          $archive = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          if ((Get-Item -LiteralPath $archive).Length -ne $asset.bytes -or
+              (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $asset.sha256) {
+            throw "Required Garnet component does not match the validated runtime"
+          }
+          $errors = @()
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "darkweb_collector/scripts/safe_upgrade_windows.ps1"), [ref]$null, [ref]$errors
+          ) | Out-Null
+          if ($errors.Count) { $errors | Format-List; exit 1 }
+
       - name: Build deterministic update assets
         shell: pwsh
         run: |
@@ -72,6 +90,7 @@ jobs:
 
           root = Path("dist-update")
           raw = json.loads((root / "latest-stable.json").read_text(encoding="utf-8"))
+          assert raw["minimum_updater_version"] == 2
           manifest = _validate_manifest_payload(
               raw,
               "https://github.com/${{ github.repository }}/releases/latest/download/latest-stable.json",
