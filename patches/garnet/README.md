@@ -1,6 +1,12 @@
-# Garnet 2.2.1-dwti.3
+# Garnet 2.2.1-dwti.4
 
 这是 DWTI 基于 Microsoft Garnet v2.2.1 编译并本地验证的项目补丁，不是微软官方发行二进制。组件与应用分别发布，服务器由操作者自行更新。
+
+dwti.4 修复对象检查点的保存与恢复契约：逐记录重置序列化字节计数，空对象显式写入一个字节的 Null 标记；溢出键配合内联值不会误写对象标记。恢复尊重页内起止边界，不再读取已经排除的页前半段。未注册对象类型明确失败，避免返回 null 后静默丢弃。
+
+旧检查点的零长度对象仅在重建索引链能证明存在同键、地址更高的有效版本时，才在恢复内存中废弃该历史版本。最新版本为空、无法验证替代版本、未知格式或实际截断仍阻止启动。此兼容处理不修改输入备份、不清队列，也不关闭 `fail-on-recovery-error`。
+
+此次故障检查点中发现三条已被替代的零长度对象。旧组件在未修改副本上重现原始恢复异常；候选组件恢复后的全部键、类型、值及队列顺序，与只废弃这三条历史记录的独立本地参考副本一致。这证明了直接失败条件；不能据此重建生产环境过去每一次写入的时序，也不能断言一切历史损坏都可自动修复。
 
 保留 dwti.1 的生产者通知锁序修复和 dwti.2 的会话生命周期修复：已超时的初始化事件不再访问旧存储会话、消费消息或删除同连接的新观察者；存储销毁先取消观察者，并及时清理所有键队列里的旧引用。阻塞读取和 AOF 提交等待检查客户端断开，覆盖明文 TCP、TLS、尚有后续命令的断连与输入半关闭。活连接仍在所需提交完成后才收到成功响应。
 
@@ -14,33 +20,31 @@ dwti.3 修复 AOF 事务写入与恢复：`RENAME` 源不存在和 `RENAMENX` �
 
 ## 构建
 
-使用现成 .NET SDK 10.0.400，将上述源码包解压到独立目录。在 PowerShell 中设置以下绝对路径后执行；`core.autocrlf=false` 保持源码 LF 换行，以便核对源码字节摘要。
+使用 .NET SDK 10.0.400、Python 3.11 或以上版本，以及上述原始源码 ZIP。构建工具先核对源码 ZIP、补丁和全部修改文件 SHA256，再以固定源码映射和确定性编译参数构建；输出目录必须尚不存在。运行时文件或最终 ZIP 与本地验证产物不一致时拒绝交付。
 
 ```powershell
-$garnetSourceRoot = 'D:\build\garnet-2.2.1'
-$garnetPatchPath = 'D:\repo\patches\garnet\garnet-v2.2.1-broker-lock-order.patch'
-$garnetSdkPath = 'D:\tools\dotnet-sdk-10.0.400\dotnet.exe'
-$garnetPublishPath = 'D:\build\garnet-2.2.1-dwti.3\net10.0'
-
-git -c core.autocrlf=false -C $garnetSourceRoot apply --check $garnetPatchPath
-if ($LASTEXITCODE -ne 0) { throw 'Garnet patch check failed' }
-git -c core.autocrlf=false -C $garnetSourceRoot apply $garnetPatchPath
-if ($LASTEXITCODE -ne 0) { throw 'Garnet patch apply failed' }
-
-& $garnetSdkPath publish (Join-Path $garnetSourceRoot 'main\GarnetServer\GarnetServer.csproj') `
-  -c Release -f net10.0 -r win-x64 --self-contained false `
-  -p:TargetFrameworks=net10.0 -p:VersionSuffix=dwti.3 `
-  -p:RestoreSources=https://api.nuget.org/v3/index.json -o $garnetPublishPath
-if ($LASTEXITCODE -ne 0) { throw 'Garnet build failed' }
+python scripts/build_garnet_component.py `
+  --source-archive 'D:\build\garnet-v2.2.1.zip' `
+  --sdk 'D:\tools\dotnet-sdk-10.0.400\dotnet.exe' `
+  --output-dir 'D:\build\garnet-2.2.1-dwti.4'
 ```
 
-补丁对未应用项目补丁的原始上游树使用。已验证补丁能够应用，应用后十二个文件的字节摘要均与实际构建源码一致。
+补丁对未应用项目补丁的原始上游树使用。已验证补丁能够应用，应用后十七个文件的字节摘要均与实际构建源码一致；在另一独立目录从原始 ZIP 重新构建，完整运行时和最终组件 ZIP 摘要一致。
 
-运行需要 .NET 10；本次验证使用 10.0.11。归档名为 `garnet-2.2.1-dwti.3-win-x64.zip`，根目录包含 `LICENSE.txt`、`README.txt`、`garnet-build.json` 和 `net10.0/`。完整复制运行时树；实际修复代码涉及 `Garnet.server.dll`、`Garnet.common.dll` 和 `Tsavorite.core.dll`，只替换 exe 无法交付修复。启动器分别校验 exe 与三个 DLL，拒绝旧 manifest、缺失、旧版或篡改的 DLL。打包排除 `testcert.pfx`、`.snk`、`.pdb`、源码、测试、日志和其他平台原生库。
+运行需要 .NET 10；本次验证使用 10.0.11。归档名为 `garnet-2.2.1-dwti.4-win-x64.zip`，根目录包含 `LICENSE.txt`、`README.txt`、`garnet-build.json` 和 `net10.0/`。完整复制运行时树；实际修复代码涉及 `Garnet.server.dll`、`Garnet.common.dll` 和 `Tsavorite.core.dll`，只替换 exe 无法交付修复。启动器分别校验 exe 与三个 DLL，拒绝旧 manifest、缺失、旧版或篡改的 DLL。打包排除 `testcert.pfx`、`.snk`、`.pdb`、源码、测试、日志和其他平台原生库。
 
 ## 本地验证
 
-所有测试使用新建的回环端口、合成 DB0 数据和隔离数据目录，未连接生产环境。
+测试进程使用新建的回环端口和隔离数据目录。生产备份通过只读诊断复制并核对摘要，始终只在本地副本上恢复；未修改生产服务、配置或数据。
+
+dwti.4 本地回归：
+
+- 序列化 Null 后再保存的确定性对照：旧版错误复用了前一个对象的长度；单对象夹具正常保存、退出、恢复后再保存，即把长度从 1 写成 0，再恢复出现原始异常，未使用强制终止。新版连续四轮保持一个字节。夹具验证存储/序列化契约，不声称复原完整生产 RESP 写入时序。最新零长度对象、未知类型、未注册自定义类型和实际截断四类输入均严格拒绝。
+- 六轮正常检查点/退出与强制中断恢复，逐轮比对全部类型和值、队列顺序和未确认索引；30 条已消费并确认的消息没有复活。32 MiB 内存配合磁盘分层存储的 92 MB 多页数据，2,380 个键连续三轮保存恢复一致。
+- 真实故障完整备份（检查点和 AOF）经归档 SHA256、全部 ZIP 条目 CRC 校验后，在未改输入副本上复现旧版异常；新版恢复与独立参考逐键、类型、完整值及队列顺序一致，连续三轮保存恢复通过。多轮重启仅允许绝对过期时间已到的 TTL 键自然消失，持久队列和未确认任务不允许消失。
+- 实际 Garnet 与活跃发布进程验证生产 PowerShell 停机逻辑：先停写入者、再确认提交、最后决定保留或终止队列进程。提交失败和停机失败不会清空队列或掩盖错误。
+- SQLite 和独立 PostgreSQL 更新/回滚验证使用真实签名清单、下载 ZIP、哈希和 HTTP 健康检查，服务启动故障由受控 fixture 注入。新版写入后健康检查失败，回滚仍保留新增情报。
+- 真实旧版及候选 API、各自构建的 Vite 前端、原生 Garnet 和 Kombu 集成：两次完整重启及生产回滚函数执行后，SQLite 新旧情报的检索、详情和 HTML 证据仍可读取，已确认消费项不复活，排队项及未确认项完整保留。实际提供旧版前端资源会被新版健康检查拒绝。该场景用自建进程替代启动器安装步骤，未注册用户环境、启动外网站点爬虫或进行浏览器渲染验收。
 
 dwti.3 本地回归：
 
@@ -56,6 +60,20 @@ dwti.3 本地回归：
 - 15 分钟持续事务收发、反复断连和定期检查点完成 82,620 条任务、31,184 次主动断连，零重复和未确认残留。线程采样峰值 42，空闲后降至 16；稳定阶段私有内存 66.5–88.6 MiB。AOF 恢复后整轮业务队列、元数据和未确认索引均无残留，待处理与未确认 canary 保留。
 - 二十二项启动器离线验证：完整候选包解压、三项哈希及 manifest 拒绝、旧 dwti.1 的所有权识别与并排制备、普通启动拒绝旧组件、有效 .NET 复用及损坏修复；不执行真实服务启动或停止。
 
-组件发布标签为 [garnet-2.2.1-dwti.3](https://github.com/Threat-Intelligence-monitor/Dark-Web-Threat-Intelligence-System/releases/tag/garnet-2.2.1-dwti.3)，不作为应用 latest。主程序启动器按固定 SHA256 自动下载，离线准备可通过 `DARKWEB_GARNET_ARCHIVE_PATH` 指定对应版本的完整 ZIP。测试脚本、数据库、日志与压测数据保留在本地输出目录，没有随生产源码发布；发布流程不自动部署或重启服务器。
+## 首次安全升级与后续回滚
 
-正常在线更新先制备新组件，再停止旧服务、切换应用并启动；不需要手工替换 DLL。旧组件 Release 保留供在线回滚使用。若设置了离线组件包覆盖路径，回滚旧应用时需要匹配旧组件包，不能宣称完全离线回滚。
+应用清单要求 `minimum_updater_version=2`。旧版更新器必须在停止服务前拒绝该清单；旧版正在运行的更新器不会因为下载了新包就自动变成新版。发布时应先发布摘要匹配的 `garnet-2.2.1-dwti.4` 组件，再发布使用协议 2 的应用包。应用 Release 工作流会下载并校验已发布组件，缺失或摘要不符时阻止应用发布。此分支本身不创建组件或应用 Release。
+
+首次从协议 1 迁移，待新应用 Release 发布后，将已校验应用包解压到受管的 `DataRoot\app\releases\<新版本目录>`，从该包执行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File 'D:\DarkWebThreatIntel\app\releases\<新版本目录>\darkweb_collector\scripts\safe_upgrade_windows.ps1' `
+  -DataRoot 'D:\DarkWebThreatIntel'
+```
+
+引导脚本核对当前安装记录和目录，先准备依赖，再由新更新器验证已发布清单、签名、版本和归档。目标仍使用旧协议时拒绝迁移，保留当前服务。后续协议 2 更新可继续使用页面更新入口。离线准备组件时，通过 `DARKWEB_GARNET_ARCHIVE_PATH` 指向对应完整 ZIP；首次引导的清单和应用包下载仍遵守原有验证规则，并非全离线安装器。
+
+新管理器停止旧版应用时也使用新停机逻辑；组件相同且健康时保留 Garnet 进程。组件升级需要重启时，所有写入进程退出且 AOF 提交地址覆盖日志尾部后才停止。更新失败先确认新应用已停，再恢复旧应用指针；使用新管理器和修复后的兼容队列运行时启动旧应用，不恢复旧 SQLite 快照覆盖新增记录。仅支持清单声明且通过校验的兼容数据结构；该流程不代替不兼容数据库迁移的独立恢复方案。
+
+回滚后注册的 `darkweb` 命令仍指向新管理器，并将旧应用目录作为服务根。不要直接运行旧 release 目录中的 `.\darkweb.cmd`，那个文件仍是旧管理器，无法靠新包反向修补。测试脚本、真实备份、数据库、日志和本地组件产物不随 Git 分支上传；合并、发布和生产部署分别执行。

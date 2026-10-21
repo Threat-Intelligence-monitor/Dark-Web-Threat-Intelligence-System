@@ -48,6 +48,7 @@ jobs:
         run: |
           $paths = @(
             "darkweb_collector/scripts/start_all_services_windows.ps1",
+            "darkweb_collector/scripts/safe_upgrade_windows.ps1",
             "darkweb_collector/scripts/configure_data_root_windows.ps1",
             "darkweb_collector/scripts/setup_postgresql_windows.ps1",
             "scripts/repair_v20260827_update.ps1"
@@ -60,6 +61,7 @@ jobs:
           & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -Command @'
           $paths = @(
             "darkweb_collector/scripts/start_all_services_windows.ps1",
+            "darkweb_collector/scripts/safe_upgrade_windows.ps1",
             "darkweb_collector/scripts/configure_data_root_windows.ps1",
             "darkweb_collector/scripts/setup_postgresql_windows.ps1",
             "scripts/repair_v20260827_update.ps1"
@@ -112,6 +114,7 @@ jobs:
 
           root = Path(os.environ["UPDATE_CANDIDATE"])
           raw = json.loads((root / "latest-stable.json").read_text(encoding="utf-8"))
+          assert raw["minimum_updater_version"] == 2
           manifest = _validate_manifest_payload(
               raw,
               "https://github.com/${{ github.repository }}/releases/latest/download/latest-stable.json",

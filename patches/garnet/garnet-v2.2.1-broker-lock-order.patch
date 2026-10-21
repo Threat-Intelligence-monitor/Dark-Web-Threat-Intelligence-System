@@ -681,3 +681,236 @@ diff --git a/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs b/l
 -}
 \ No newline at end of file
 +}
+diff --git a/libs/server/Objects/Types/GarnetObjectSerializer.cs b/libs/server/Objects/Types/GarnetObjectSerializer.cs
+--- a/libs/server/Objects/Types/GarnetObjectSerializer.cs
++++ b/libs/server/Objects/Types/GarnetObjectSerializer.cs
+@@ -96,7 +96,8 @@
+             if (type < CustomCommandManager.CustomTypeIdStartOffset)
+                 throw new GarnetException($"Unsupported object type id 0x{type:X2}; the data may have been written by an incompatible Garnet version (e.g. legacy custom objects that used a different type-id range).");
+ 
+-            if (!customCommandManager.TryGetCustomObjectCommand(type, out var cmd)) return null;
++            if (!customCommandManager.TryGetCustomObjectCommand(type, out var cmd))
++                throw new GarnetException($"No serializer is registered for object type id 0x{type:X2}; refusing to discard persisted object data.");
+             return cmd.factory.Deserialize(type, binaryReader);
+         }
+ 
+@@ -127,4 +128,4 @@
+                 obj.Serialize(binaryWriter);
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectAllocatorImpl.cs b/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectAllocatorImpl.cs
+--- a/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectAllocatorImpl.cs
++++ b/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectAllocatorImpl.cs
+@@ -965,7 +965,7 @@
+                                     // The main-log allocator page is left untouched by these calls.
+                                     logRecord.SetReuseObjectIdForSize();
+ 
+-                                    var valueObjectLength = logWriter.WriteRecordObjects(in keyOverflow, in valueOverflow, in valueObject);
++                                    var valueObjectLength = logWriter.WriteRecordObjects(in keyOverflow, in valueOverflow, in valueObject, logRecord.DataHeader.ValueIsObject);
+                                     logRecord.SetObjectLogRecordStartPositionAndLength(recordStartPosition, valueObjectLength);
+                                 }
+                                 else
+@@ -1322,12 +1322,13 @@
+         /// <param name="maxAddressOffsetOnPage">Maximum offset on the page (PageSize or less for partial pages)</param>
+         /// <param name="objectIdMap">The ObjectIdMap to use for deserialized objects</param>
+         /// <param name="readBuffers">The circular read buffers for object log reading</param>
+-        private void DeserializeObjectsOnPage(long pageStartPhysicalAddress, long maxAddressOffsetOnPage, ObjectIdMap objectIdMap, CircularDiskReadBuffer readBuffers)
++        private void DeserializeObjectsOnPage(long pageStartPhysicalAddress, long maxAddressOffsetOnPage, ObjectIdMap objectIdMap, CircularDiskReadBuffer readBuffers,
++                long minAddressOffsetOnPage = PageHeader.Size)
+         {
+             ObjectLogFilePositionInfo startPosition = new(), endPosition = new();
+             var endKeyLength = 0;
+             ulong endValueLength = 0;
+-            var recordAddress = pageStartPhysicalAddress + PageHeader.Size;
++            var recordAddress = pageStartPhysicalAddress + minAddressOffsetOnPage;
+             var endAddress = pageStartPhysicalAddress + maxAddressOffsetOnPage;
+ 
+             // First pass: determine the range of object log bytes to read
+@@ -1353,7 +1354,7 @@
+ 
+             // Second pass: deserialize objects
+             readBuffers.nextFileReadPosition = startPosition;
+-            recordAddress = pageStartPhysicalAddress + PageHeader.Size;
++            recordAddress = pageStartPhysicalAddress + minAddressOffsetOnPage;
+             var logReader = new ObjectLogReader<TStoreFunctions>(readBuffers, storeFunctions);
+             logReader.OnBeginReadRecords(startPosition, totalBytesToRead);
+ 
+@@ -1463,7 +1464,8 @@
+             var maxOffset = endAddress - GetLogicalAddressOfStartOfPage(page);
+             var objectIdMapToUse = objectPages[page % BufferSize].objectIdMap;
+             using var readBuffers = CreateCircularReadBuffers(objectLogDevice, logger);
+-            DeserializeObjectsOnPage(pagePhysicalAddress, maxOffset, objectIdMapToUse, readBuffers);
++            var minOffset = address - GetLogicalAddressOfStartOfPage(page);
++            DeserializeObjectsOnPage(pagePhysicalAddress, maxOffset, objectIdMapToUse, readBuffers, minOffset);
+         }
+ 
+         /// <inheritdoc/>
+@@ -1629,4 +1631,4 @@
+         }
+ 
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectSerialization/ObjectLogWriter.cs b/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectSerialization/ObjectLogWriter.cs
+--- a/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectSerialization/ObjectLogWriter.cs
++++ b/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectSerialization/ObjectLogWriter.cs
+@@ -105,8 +105,10 @@
+         /// field (low 12/22 bits) + the int* slot at keyAddress/valueAddress (next 32 bits) — see
+         /// <see cref="LogRecord.SetObjectLogRecordStartPositionAndLength"/>. The reader reconstructs the length from those fields.</para></remarks>
+         /// <returns>The number of bytes written for the value object, if any.</returns>
+-        public ulong WriteRecordObjects(in OverflowByteArray keyOverflow, in OverflowByteArray valueOverflow, in IHeapObject valueObject)
+-        {
++        public ulong WriteRecordObjects(in OverflowByteArray keyOverflow, in OverflowByteArray valueOverflow, in IHeapObject valueObject, bool valueIsObject)
++        {
++            valueObjectBytesWritten = 0;
++
+             // If the key is overflow, start with that.
+             if (!keyOverflow.IsEmpty)
+                 WriteDirect(keyOverflow);
+@@ -114,7 +116,7 @@
+             // Now do value overflow or object, if either is present.
+             if (!valueOverflow.IsEmpty)
+                 WriteDirect(valueOverflow);
+-            else if (valueObject is not null)
++            else if (valueIsObject)
+                 DoSerialize(valueObject);
+ 
+             // Signal completion.
+@@ -344,4 +346,4 @@
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectSerialization/ObjectLogReader.cs b/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectSerialization/ObjectLogReader.cs
+--- a/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectSerialization/ObjectLogReader.cs
++++ b/libs/storage/Tsavorite/cs/src/core/Allocator/ObjectSerialization/ObjectLogReader.cs
+@@ -94,12 +94,16 @@
+         {
+             Debug.Assert(logRecord.DataHeader.RecordHasObjects, "Inline records should have been checked by the caller");
+             Debug.Assert(logRecord.HasReuseObjectIdForSize, "ReadRecordObjects requires the ReuseObjectIdForSize flag to be set on the ObjectLogPosition");
++            if (!logRecord.HasReuseObjectIdForSize)
++                throw new TsavoriteException("Unsupported object length encoding");
+             if (readBuffers is null)
+                 throw new TsavoriteException("ReadBuffers are required to ReadRecordObjects");
+ 
+             // R11 encoding: lengths returned by GetObjectLogRecordStartPositionAndLengths combine the RDH low bits with the next 32 bits
+             // from the int* slot at keyAddress/valueAddress. No length prefix is in the object stream.
+             var positionWord = logRecord.GetObjectLogRecordStartPositionAndLengths(out var keyLength, out var valueLength);
++            if (logRecord.DataHeader.ValueIsObject && valueLength == 0)
++                throw new TsavoriteException("Zero-length object has not been verified as a superseded recovery record");
+             if (!readBuffers.OnBeginRecord(new ObjectLogFilePositionInfo(positionWord, segmentSizeBits)))
+                 throw new TsavoriteException("ReadRecordObjects found no data available in ReadBuffers");
+ 
+@@ -216,4 +220,4 @@
+             valueObjectSerializer?.EndDeserialize();
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/libs/storage/Tsavorite/cs/src/core/Index/Recovery/Recovery.cs b/libs/storage/Tsavorite/cs/src/core/Index/Recovery/Recovery.cs
+--- a/libs/storage/Tsavorite/cs/src/core/Index/Recovery/Recovery.cs
++++ b/libs/storage/Tsavorite/cs/src/core/Index/Recovery/Recovery.cs
+@@ -1065,6 +1065,8 @@
+             if (untilAddress > hlogBase.GetFirstValidLogicalAddressOnPage(endPage))
+                 endPage++;
+ 
++            ValidateEmptyObjectRecordsForRecovery(fromAddress, untilAddress, startPage, endPage);
++
+             // Load all objects from fromAddress to untilAddress with no eviction when there is no size tracker.
+             if (hlogBase.logSizeTracker is null)
+             {
+@@ -1166,6 +1168,80 @@
+                 if (recoveryStatus.headAddress >= hlogBase.GetFirstValidLogicalAddressOnPage(page))
+                     break;
+             }
++        }
++
++        private void ValidateEmptyObjectRecordsForRecovery(long fromAddress, long untilAddress, long startPage, long endPage)
++        {
++            var retired = 0;
++            for (var page = startPage; page < endPage; page++)
++            {
++                if (!hlogBase.IsAllocated(hlogBase.GetPageIndexForPage(page)))
++                    continue;
++
++                var address = Math.Max(fromAddress, hlogBase.GetFirstValidLogicalAddressOnPage(page));
++                var endAddress = Math.Min(untilAddress, hlogBase.GetLogicalAddressOfStartOfPage(page + 1));
++                while (address < endAddress)
++                {
++                    var record = new LogRecord(hlogBase.GetPhysicalAddress(address));
++                    var length = record.AllocatedSize;
++                    if (length <= 0 || length > endAddress - address)
++                        throw new TsavoriteException($"Invalid recovery record boundary at address {address}");
++
++                    if (record.Info.Valid && record.DataHeader.ValueIsObject)
++                    {
++                        if (!record.HasReuseObjectIdForSize)
++                            throw new TsavoriteException($"Unsupported object length encoding at recovery address {address}");
++                        _ = record.GetObjectLogRecordStartPositionAndLengths(out _, out var valueLength);
++                        if (valueLength == 0)
++                        {
++                            // Older writers omitted the Null marker for a superseded object. Do not
++                            // interpret an empty latest value as Null: only retire a proven old version.
++                            if (!record.DataHeader.KeyIsInline || !HasLaterRecoveryVersion(in record, address, fromAddress, untilAddress))
++                                throw new TsavoriteException($"Zero-length object at recovery address {address} has no verifiable later version; refusing to discard data");
++                            record.InfoRef.SetInvalid();
++                            retired++;
++                        }
++                    }
++                    address += length;
++                }
++            }
++            if (retired > 0)
++                logger?.LogWarning("Recovered {count} superseded legacy zero-length object records; latest values were preserved", retired);
++        }
++
++        private bool HasLaterRecoveryVersion(in LogRecord record, long address, long fromAddress, long untilAddress)
++        {
++            HashEntryInfo hei = new(storeFunctions.GetKeyHashCode64(record));
++            if (!FindTag(ref hei) || hei.IsReadCache)
++                return false;
++
++            var candidateAddress = hei.Address;
++            while (candidateAddress > address && candidateAddress >= fromAddress && candidateAddress < untilAddress)
++            {
++                var page = hlogBase.GetPage(candidateAddress);
++                if (!hlogBase.IsAllocated(hlogBase.GetPageIndexForPage(page)))
++                    return false;
++                var candidate = new LogRecord(hlogBase.GetPhysicalAddress(candidateAddress));
++                var endAddress = Math.Min(untilAddress, hlogBase.GetLogicalAddressOfStartOfPage(page + 1));
++                if (candidate.Info.IsNull || candidate.AllocatedSize <= 0 || candidate.AllocatedSize > endAddress - candidateAddress)
++                    return false;
++                if (candidate.Info.Valid && candidate.DataHeader.KeyIsInline && storeFunctions.KeysEqual(record, candidate))
++                {
++                    if (candidate.DataHeader.ValueIsObject)
++                    {
++                        if (!candidate.HasReuseObjectIdForSize)
++                            return false;
++                        _ = candidate.GetObjectLogRecordStartPositionAndLengths(out _, out var valueLength);
++                        return valueLength > 0;
++                    }
++                    return true;
++                }
++                var previousAddress = candidate.Info.PreviousAddress;
++                if (previousAddress >= candidateAddress)
++                    return false;
++                candidateAddress = previousAddress;
++            }
++            return false;
+         }
+ 
+         /// <summary>
+@@ -1518,4 +1594,4 @@
+             result.DisposeHandle();
+         }
+     }
+-}
+\ No newline at end of file
++}
