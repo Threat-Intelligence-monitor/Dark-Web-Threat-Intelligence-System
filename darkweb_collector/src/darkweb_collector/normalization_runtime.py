@@ -8,8 +8,8 @@ import time
 from typing import Any
 
 from darkweb_collector.db import get_db_connection
+from darkweb_collector.incremental_intelligence import refresh_incremental_intelligence
 import darkweb_collector.normalized_intelligence as normalized_intelligence
-from darkweb_collector.search_index import ensure_keyword_index_ready
 
 
 logger = logging.getLogger("darkweb_collector.normalization_runtime")
@@ -22,9 +22,14 @@ _state: dict[str, Any] = {
     "running": False,
     "last_started_at": "",
     "last_success_at": "",
+    "last_published_at": "",
     "last_error": "",
     "pending": False,
     "last_duration_seconds": 0.0,
+    "processed": 0,
+    "published": 0,
+    "removed": 0,
+    "bootstrap_pending": 0,
 }
 
 
@@ -64,40 +69,41 @@ def run_normalization_cycle() -> dict[str, Any]:
         if _state["running"]:
             already_running = True
         else:
-            _state.update(running=True, last_started_at=_now_utc_iso(), last_error="")
+            _state.update(running=True, last_started_at=_now_utc_iso(), last_error="",
+                          processed=0, published=0, removed=0)
     if already_running:
         return get_normalization_runtime_status()
-    pending = False
-    converged = False
+    release_local = False
     try:
+        result = None
         with get_db_connection() as connection:
             if getattr(connection, "backend_name", "") == "postgresql":
                 connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            pending = normalized_intelligence.should_refresh_normalized_intelligence(connection)
-            if pending:
-                normalized_intelligence.ensure_normalized_intelligence(
-                    connection,
-                    force=False,
-                    enrichment_budget=0,
-                    load_events=False,
-                )
-                pending = normalized_intelligence.should_refresh_normalized_intelligence(connection)
-                converged = not pending
-            if ensure_keyword_index_ready(connection):
-                logger.info("keyword search index backfill completed")
+            acquired, release_local = normalized_intelligence._try_acquire_normalized_refresh_lock(connection)
+            if acquired:
+                result = refresh_incremental_intelligence(connection)
             connection.commit()
-        if converged:
-            logger.info("normalized intelligence refresh converged in %.2fs", time.perf_counter() - started)
         with _state_lock:
-            _state["pending"] = pending
-            if converged:
-                _state["last_success_at"] = _now_utc_iso()
+            if result is None:
+                _state["pending"] = True
+            else:
+                _state.update(
+                    pending=bool(result["pending"]),
+                    processed=result["processed"],
+                    published=result["published"],
+                    removed=result["removed"],
+                    bootstrap_pending=result["bootstrap_pending"],
+                    last_success_at=_now_utc_iso(),
+                )
+                if result["published"] or result["removed"]:
+                    _state["last_published_at"] = _state["last_success_at"]
     except Exception as exc:
-        pending = True
         logger.exception("background normalized intelligence refresh failed")
         with _state_lock:
             _state.update(pending=True, last_error=str(exc))
     finally:
+        if release_local:
+            normalized_intelligence._NORMALIZED_REFRESH_LOCK.release()
         with _state_lock:
             _state.update(
                 running=False,
@@ -110,13 +116,17 @@ def _normalization_loop(stop_event: Event) -> None:
     if stop_event.wait(min(5, normalization_interval_seconds())):
         return
     while not stop_event.is_set():
-        run_normalization_cycle()
-        if stop_event.wait(normalization_interval_seconds()):
+        status = run_normalization_cycle()
+        delay = 1 if status["pending"] else normalization_interval_seconds()
+        if stop_event.wait(delay):
             break
 
 
 def start_normalization_worker() -> dict[str, Any]:
     global _stop_event, _worker_thread
+    from darkweb_collector.normalization_notifications import start_notification_worker
+
+    start_notification_worker()
     with _worker_lock:
         if _worker_thread is not None and _worker_thread.is_alive():
             return get_normalization_runtime_status()
@@ -138,6 +148,9 @@ def start_normalization_worker() -> dict[str, Any]:
 
 
 def stop_normalization_worker() -> dict[str, Any]:
+    from darkweb_collector.normalization_notifications import stop_notification_worker
+
+    stop_notification_worker()
     with _worker_lock:
         if _stop_event is not None:
             _stop_event.set()

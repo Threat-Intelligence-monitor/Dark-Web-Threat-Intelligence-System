@@ -1,7 +1,10 @@
 """DragonForceBlog site adapter for darkweb_collector."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from darkweb_collector.adapters.base import SiteAdapter
+from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 from darkweb_collector.db import get_db_connection, get_victim_snapshot, record_victim_detail
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
 from darkweb_collector.pipeline import persist_run
@@ -39,7 +42,7 @@ body.stop-scrolling {
 
 def _detail_artifacts_exist(output_dir, artifact_stem: str) -> bool:
     details_dir = output_dir / "details"
-    return all((details_dir / f"{artifact_stem}.{suffix}").exists() for suffix in ("html", "json", "png"))
+    return detail_artifacts_complete(details_dir, artifact_stem)
 
 
 class DragonforceblogAdapter(SiteAdapter):
@@ -145,6 +148,12 @@ class DragonforceblogAdapter(SiteAdapter):
                             "content_hash": victim.get("content_hash", ""),
                             "victim_data": victim,  # Pass the full victim data from list page
                             "artifact_stem": artifact_stem,
+                            "source_version": victim.get("content_hash", ""),
+                            "frontier_artifact_only": bool(
+                                snapshot and snapshot.get("content_hash") == victim.get("content_hash")
+                                and snapshot.get("last_detail_fetch_status") == "ok"
+                                and all((config.output_dir / "details" / f"{artifact_stem}.{suffix}").exists() for suffix in ("html", "json"))
+                            ),
                         },
                     )
                 )
@@ -169,6 +178,13 @@ class DragonforceblogAdapter(SiteAdapter):
         Returns:
             Parsed detail result.
         """
+        restored = restore_detail_artifacts(
+            detail_task, config, screenshot_selector=".publication",
+            hide_selectors=(".publications-list", ".header-promo", ".blog-layout__header", ".header-menu"),
+            screenshot_styles=DRAGONFORCE_SCREENSHOT_STYLES,
+        )
+        if restored is not None:
+            return restored
         html, screenshot_png = fetch_page_artifacts(
             url=detail_task.target_url,
             mode="tor_http",
@@ -185,7 +201,10 @@ class DragonforceblogAdapter(SiteAdapter):
             render_html_for_screenshot=True,
         )
 
+        raise_if_error_page(html)
         detail = parse_dragonforceblog_detail_page(detail_task.target_url, html)
+        if not detail.get("post_uuid") or not str(detail.get("content") or "").strip() or not detail.get("company_name"):
+            raise CollectionFailure("parse", "dragonforce detail has no recognized publication content")
         victim_data = detail_task.metadata.get("victim_data", {})
         detail["claimed_size"] = detail.get("claimed_size") or victim_data.get("claimed_size", "")
         detail["location"] = detail.get("location") or victim_data.get("location", "")
@@ -206,6 +225,7 @@ class DragonforceblogAdapter(SiteAdapter):
         run_ctx: RunContext,
         seed_result: SeedResult | None = None,
         detail_results: list[DetailResult] | None = None,
+        connection=None,
     ) -> None:
         """Persist results to storage.
 
@@ -235,7 +255,7 @@ class DragonforceblogAdapter(SiteAdapter):
             details_dir = config.output_dir / "details"
             details_dir.mkdir(parents=True, exist_ok=True)
 
-            with get_db_connection() as connection:
+            with (nullcontext(connection) if connection is not None else get_db_connection()) as detail_connection:
                 for detail_result in detail_results:
                     if detail_result is None:
                         continue
@@ -253,11 +273,11 @@ class DragonforceblogAdapter(SiteAdapter):
                         (details_dir / f"{artifact_stem}.png").write_bytes(detail_result.screenshot_png)
 
                     # Save parsed JSON
-                    dump_json(details_dir / f"{artifact_stem}.json", detail_result.payload)
+                    dump_json(details_dir / f"{artifact_stem}.json", {**detail_result.payload, "_collector_artifacts_complete": detail_result.screenshot_png is not None})
 
                     # Record in database
                     record_victim_detail(
-                        connection,
+                        detail_connection,
                         site_name=self.site_name,
                         source_url=str(detail_result.metadata.get("source_url", "")),
                         name=str(detail_result.metadata.get("name", "")),
@@ -266,4 +286,5 @@ class DragonforceblogAdapter(SiteAdapter):
                         detail_payload=detail_result.payload,
                     )
 
-                connection.commit()
+                if connection is None:
+                    detail_connection.commit()

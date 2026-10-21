@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from darkweb_collector.detail_lifecycle import eligible_detail_tasks
+
 import hashlib
 import re
 from html import unescape
@@ -128,7 +130,11 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
         )
 
     def candidate_count() -> int:
-        return len(plan_details(result(), config)) if plan_details is not None and sections else 0
+        if plan_details is None or not sections:
+            return 0
+        tasks = plan_details(result(), config)
+        with get_db_connection() as connection:
+            return len(eligible_detail_tasks(connection, site_name, tasks))
 
     def record_cursor(url: str, next_page: int, signature: str, completed: bool = False):
         # Preserve last-visit order so the next run starts with the least

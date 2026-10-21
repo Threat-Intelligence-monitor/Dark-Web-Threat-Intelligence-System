@@ -1040,6 +1040,7 @@ class ExposureScanRequest(BaseModel):
     file_types: list[str] = []
     page_limit: int | None = None
     detail_fetch: bool | None = None
+    document_library_candidate_limit: int | None = Field(None, ge=1, le=200)
 
 
 class DocumentExposureReviewRequest(BaseModel):
@@ -1605,6 +1606,7 @@ def exposure_watchlist_scan(watchlist_id: int, payload: ExposureScanRequest) -> 
             file_types=payload.file_types,
             page_limit=payload.page_limit,
             detail_fetch=payload.detail_fetch,
+            document_library_candidate_limit=payload.document_library_candidate_limit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

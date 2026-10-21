@@ -10,6 +10,7 @@ from threading import Lock
 import time
 
 from darkweb_collector.crawl_frontier import ensure_frontier_schema
+from darkweb_collector.detail_lifecycle import record_detail_write, reconcile_detail_owners, worker_alive
 from darkweb_collector.postgres_backend import connect_postgres
 from darkweb_collector.search_schema import REPORT_TIME, SEARCH_ORDER, SEVERITY_RANK, ensure_search_indexes, event_report_time
 from darkweb_collector.search_index import (
@@ -102,6 +103,8 @@ CREATE TABLE IF NOT EXISTS victim_details (
     outbound_link_count INTEGER,
     raw_json TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_victim_details_victim_id ON victim_details(victim_id, id);
 
 CREATE TABLE IF NOT EXISTS forum_topics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -696,6 +699,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
     _ensure_legacy_columns(connection)
     ensure_search_indexes(connection)
     ensure_keyword_index_schema(connection)
+    _ensure_intelligence_publication_schema(connection)
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_monitoring_keyword_notifications_event_key
@@ -709,6 +713,14 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         WHERE resource_fingerprint <> ''
         """
     )
+
+
+def _ensure_intelligence_publication_schema(connection) -> None:
+    from darkweb_collector.intelligence_changes import ensure_change_schema
+    from darkweb_collector.incremental_intelligence import ensure_incremental_projection_schema
+
+    ensure_change_schema(connection)
+    ensure_incremental_projection_schema(connection)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -750,6 +762,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
                             ensure_frontier_schema(connection)
                             ensure_search_indexes(connection)
                             ensure_keyword_index_schema(connection)
+                            _ensure_intelligence_publication_schema(connection)
                         else:
                             _ensure_schema(connection)
                         connection.commit()
@@ -912,6 +925,8 @@ def upsert_victim(connection: sqlite3.Connection, run_id: int, payload: dict) ->
 
 
 def insert_victim_detail(connection: sqlite3.Connection, victim_id: int, payload: dict) -> None:
+    previous = connection.execute("""SELECT raw_json FROM victim_details WHERE victim_id = ?
+        ORDER BY id DESC LIMIT 1""", (victim_id,)).fetchone()
     connection.execute(
         """
         INSERT INTO victim_details (
@@ -928,6 +943,13 @@ def insert_victim_detail(connection: sqlite3.Connection, victim_id: int, payload
             json.dumps(payload, ensure_ascii=False),
         ),
     )
+
+
+    def body_hash(value):
+        return json.dumps({key: value.get(key) for key in ("page_title", "content", "text_excerpt", "outbound_link_count")},
+                          sort_keys=True, ensure_ascii=False)
+    prior = body_hash(json.loads(previous[0])) if previous else None
+    record_detail_write(prior, body_hash(payload))
 
 
 def get_victim_snapshot(
@@ -1074,7 +1096,7 @@ def upsert_forum_detail(connection: sqlite3.Connection, **kwargs) -> int:
     """Upsert forum detail"""
     cursor = connection.execute(
         """
-        SELECT id
+        SELECT id, content_hash
         FROM forum_details
         WHERE site_name = ? AND section = ? AND topic_url = ?
         """,
@@ -1144,6 +1166,7 @@ def upsert_forum_detail(connection: sqlite3.Connection, **kwargs) -> int:
                 (detail_id, victim['name'], victim.get('industry'), victim.get('region'))
             )
         
+        record_detail_write(str(row[1]), str(kwargs["content_hash"]))
         return detail_id
 
     cursor = connection.execute(
@@ -1180,6 +1203,7 @@ def upsert_forum_detail(connection: sqlite3.Connection, **kwargs) -> int:
             (detail_id, victim['name'], victim.get('industry'), victim.get('region'))
         )
     
+    record_detail_write(None, str(kwargs["content_hash"]))
     return detail_id
 
 
@@ -1530,15 +1554,19 @@ def reconcile_stale_crawl_jobs(
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     observed_at = observed_at.astimezone(timezone.utc)
 
+    reconcile_detail_owners(connection, now=observed_at.timestamp())
     rows = connection.execute(
         """
-        SELECT job_id, job_type, status, enqueued_at, started_at
-        FROM crawl_jobs
-        WHERE status IN ('enqueued', 'running') AND finished_at IS NULL
+        SELECT j.job_id, j.job_type, j.status, j.enqueued_at, j.started_at,
+               c.worker_pid, c.worker_started
+        FROM crawl_jobs j LEFT JOIN crawl_detail_control c ON c.owner_token = j.job_id
+        WHERE j.status IN ('enqueued', 'running') AND j.finished_at IS NULL
         """
     ).fetchall()
     stale_jobs: list[tuple[str, str, str]] = []
     for row in rows:
+        if row["worker_pid"] and worker_alive(row["worker_pid"], row["worker_started"]):
+            continue
         status = str(row["status"] or "")
         timestamp = _parse_crawl_job_timestamp(row["started_at"] if status == "running" else row["enqueued_at"])
         timeout_minutes = running_timeout_minutes if status == "running" else enqueued_timeout_minutes
