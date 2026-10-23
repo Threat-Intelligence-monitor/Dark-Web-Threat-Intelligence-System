@@ -8,6 +8,7 @@ from html import unescape
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from darkweb_collector.crawl_frontier import count_frontier_pending, load_page_cursor
+from darkweb_collector.collection_errors import CollectionFailure, failure_details, has_forum_listing_html, raise_if_error_page, safe_failure_text, summarize_failures
 from darkweb_collector.db import get_db_connection
 from darkweb_collector.models import SeedResult, SiteConfig
 from darkweb_collector.utils import utc_now_iso
@@ -22,17 +23,11 @@ def forum_page_url(source_url: str, page: int) -> str:
 
 
 def is_forum_listing_html(html: str) -> bool:
-    lowered = str(html or "").lower()
-    if not lowered or any(marker in lowered for marker in (
-        "checking your browser", "cf-browser-verification", "verify you are human",
-    )):
+    try:
+        raise_if_error_page(html)
+    except CollectionFailure:
         return False
-    has_topics = "thread-" in lowered or "subject_new" in lowered or "subject_old" in lowered
-    empty_list = any(marker in lowered for marker in (
-        "forumdisplay_nothreads", "forumdisplay_no_threads", "there are no threads",
-        "there are either no threads", "no threads were found",
-    ))
-    return ("forum-" in lowered or "forumdisplay" in lowered) and (has_topics or empty_list)
+    return has_forum_listing_html(html)
 
 
 def _forum_pagination(html: str, url: str, page: int, source_count: int) -> bool:
@@ -77,14 +72,15 @@ def collect_forum_seed(adapter, config: SiteConfig, list_parser, section_name) -
     def fetch_page(source_url: str, page: int, collected_at: str):
         url = forum_page_url(source_url, page)
         html = adapter._fetch_html(url, config, config.seed_fetch_mode)
+        raise_if_error_page(html)
         if not is_forum_listing_html(html):
-            raise RuntimeError("forum listing is unavailable or contains no recognized list")
+            raise CollectionFailure("parse", "forum listing contains no recognized list")
         identifiers = sorted(set(re.findall(r'\bid=[\'"]tid_(\d+)[\'"]', html, re.IGNORECASE)))
         parsed = list_parser(url, html, max_topics=max(1, len(identifiers)))
         if identifiers and not parsed["topics"]:
-            raise RuntimeError("forum topic markers could not be parsed")
+            raise CollectionFailure("parse", "forum topic markers could not be parsed")
         if not identifiers and re.search(r'(?:Thread-|subject_(?:new|old))', html, re.IGNORECASE):
-            raise RuntimeError("forum listing has no recognized topic identifiers")
+            raise CollectionFailure("parse", "forum listing has no recognized topic identifiers")
         parsed["section"] = section_name(source_url)
         parsed["collected_at_utc"] = collected_at
         parsed["source_count"] = len(identifiers)
@@ -114,6 +110,7 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
     raw_pages: dict[str, str] = {}
     updates: dict[str, dict] = {}
     errors: list[dict] = []
+    failures: list[tuple[str, Exception]] = []
     blocked: set[str] = set()
     seen_topics: set[str] = set()
     signatures: dict[str, set[str]] = {url: set() for url in config.seed_urls}
@@ -123,7 +120,8 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
         return SeedResult(
             site_name=site_name, collected_at_utc=collected_at,
             payload={"site_name": site_name, "source_url": site_name, "collected_at_utc": collected_at,
-                     "section_count": len(sections), "topic_count": len(seen_topics), "sections": list(sections.values())},
+                     "section_count": len(sections), "topic_count": len(seen_topics), "sections": list(sections.values()),
+                     "pagination_errors": list(errors)},
             raw_html_by_url=raw_pages,
             metadata={"cursor_updates": list(updates.values()), "pagination_errors": errors,
                       "pages_scanned": pages_scanned, "backfill_paused": pending >= min(limit, config.frontier_dispatch_window)},
@@ -155,7 +153,8 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
             ):
                 raise RuntimeError("pagination returned a previously visited page")
         except Exception as exc:
-            errors.append({"source_url": url, "page": page, "lane": lane, "error_type": type(exc).__name__})
+            errors.append({"source_url": safe_failure_text(url), "page": page, "lane": lane, **failure_details(exc)})
+            failures.append((f"source {config.seed_urls.index(url) + 1} page {page} ({lane})", exc))
             blocked.add(url)
             return False
         pages_scanned += 1
@@ -212,7 +211,7 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
             discovered = candidate_count()
         active = following
     if not pages_scanned and errors:
-        raise RuntimeError(f"{site_name}: every listing request failed")
+        raise summarize_failures(f"{site_name}: every listing request failed", failures)
     seed_result = result()
     seed_result.metadata["backfill_paused"] = bool(recent_candidates or pending + discovered >= min(limit, config.frontier_dispatch_window))
     return seed_result

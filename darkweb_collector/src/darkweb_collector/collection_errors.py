@@ -6,6 +6,7 @@ from html import unescape
 from html.parser import HTMLParser
 import re
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 
 class CollectionFailure(RuntimeError):
@@ -16,6 +17,9 @@ class CollectionFailure(RuntimeError):
         self.kind = kind
         self.scope = scope
         self.retry_after = max(0.0, float(retry_after))
+
+    def __reduce__(self):
+        return CollectionFailure, (self.kind, str(self)), {"scope": self.scope, "retry_after": self.retry_after}
 
 
 _request_callback: ContextVar[Callable[[], None] | None] = ContextVar("collection_request", default=None)
@@ -59,13 +63,43 @@ class _ErrorTemplate(HTMLParser):
         self.password = False
         self.challenge = False
         self.login_form = False
+        self.listing = False
+        self.forum = False
+        self.main_text = []
+        self.primary_challenge = False
+        self.article_text = []
+        self.article_login = False
+
+    def _flags(self) -> set[str]:
+        return set().union(*(flags for _, flags in self.stack))
+
+    @property
+    def has_listing(self) -> bool:
+        text = " ".join(self.main_text).lower()
+        return self.listing or self.forum and any(marker in text for marker in (
+            "there are no threads", "there are currently no threads", "there are either no threads",
+            "no threads were found", "no threads to display", "no threads have been posted",
+        ))
 
     def handle_starttag(self, tag, attributes):
         attrs = dict(attributes)
         classes = set(str(attrs.get("class") or "").split())
-        if tag == "html":
+        identifier = str(attrs.get("id") or "")
+        parents = self._flags()
+        ancillary = tag in {"header", "footer", "nav", "aside", "script", "style", "template"} or bool(
+            classes & {"modal", "modal-dialog", "overlay", "sidebar", "p-nav", "p-footer"}
+            or identifier in {"header", "footer", "panel", "sidebar", "login-modal", "loginModal"}
+        ) or "hidden" in attrs or str(attrs.get("aria-hidden") or "").lower() == "true" or bool(
+            re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", str(attrs.get("style") or ""), re.I)
+        )
+        parent_ignored = "ancillary" in parents
+        ignored = ancillary or parent_ignored
+        in_post = "post" in parents
+        in_error = "error" in parents
+        quoted = tag in {"blockquote", "pre", "code"} or "quote" in parents
+        if tag == "html" and not self.stack:
             self.template = str(attrs.get("data-template") or "")
-        self.challenge = self.challenge or (
+        challenge = (
             (tag == "form" and str(attrs.get("id") or "") == "challenge-form")
             or str(attrs.get("id") or "").startswith("cf-challenge")
             or "cf-turnstile" in classes
@@ -73,14 +107,34 @@ class _ErrorTemplate(HTMLParser):
                 "/cdn-cgi/challenge-platform/", "challenges.cloudflare.com/",
             )))
         )
+        if not parent_ignored and (not ancillary or tag == "script") and not in_post and not quoted:
+            self.challenge = self.challenge or challenge
+            self.primary_challenge = self.primary_challenge or (
+                identifier.startswith("cf-challenge") or tag == "form" and identifier == "challenge-form"
+            )
         if tag == "input" and str(attrs.get("type") or "").lower() == "password":
             self.password = True
-        if tag == "form" and re.search(r"(login|sign.?in|member\.php)", str(attrs.get("action") or ""), re.I):
-            self.login_form = True
-        error = bool(classes & {"error", "blockMessage", "blockMessage--error"})
-        post = bool(classes & {"post_body", "message-body", "message-userContent"})
+        login_form = tag == "form" and bool(re.search(r"(login|sign.?in|member\.php)", str(attrs.get("action") or ""), re.I))
+        self.login_form = self.login_form or login_form and not ignored and not quoted
+        self.article_login = self.article_login or login_form and not ignored and not quoted and "article" in parents
+        error = not ignored and not in_post and not quoted and bool(classes & {"error", "blockMessage", "blockMessage--error"})
+        post = not ignored and not in_error and bool(classes & {"post_body", "post_content", "message-body", "message-userContent"})
+        topic = not ignored and not in_error and not quoted and bool(re.fullmatch(r"tid_\d+", identifier) or "structItem--thread" in classes)
+        topic_link = not ignored and not in_error and tag == "a" and "topic" in parents and bool(
+            re.search(r"(?:Thread-|showthread\.php|/threads/)", str(attrs.get("href") or ""), re.I)
+        )
+        self.forum = self.forum or self.template == "forum_view" or bool(
+            not ignored and not quoted and not in_error and (
+                "forumdisplay" in identifier.lower() or "structItemContainer" in classes
+                or tag == "a" and "Forum-" in str(attrs.get("href") or "")
+            )
+        )
         if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
-            self.stack.append((tag, error, post))
+            flags = {name for name, present in (
+                ("error", error), ("post", post), ("ancillary", ancillary), ("topic", topic),
+                ("topic_link", topic_link), ("login_form", login_form), ("article", tag == "article"), ("quote", quoted),
+            ) if present}
+            self.stack.append((tag, flags))
 
     def handle_endtag(self, tag):
         for index in range(len(self.stack) - 1, -1, -1):
@@ -89,10 +143,26 @@ class _ErrorTemplate(HTMLParser):
                 break
 
     def handle_data(self, data):
-        if any(item[1] for item in self.stack) and len(self.error_text) < 100:
+        flags = self._flags()
+        if "ancillary" in flags:
+            return
+        if "error" in flags and "quote" not in flags and len(self.error_text) < 100:
             self.error_text.append(data)
-        if any(item[2] for item in self.stack) and len(self.post_text) < 100:
+        if "post" in flags and len(self.post_text) < 100:
             self.post_text.append(data)
+        if "topic_link" in flags and data.strip():
+            self.listing = True
+        if "error" not in flags and "login_form" not in flags and "quote" not in flags and len(self.main_text) < 1000:
+            self.main_text.append(data[:256])
+        if "article" in flags and "error" not in flags and "login_form" not in flags and len(self.article_text) < 100:
+            self.article_text.append(data[:256])
+
+
+def has_forum_listing_html(html: str) -> bool:
+    template = _ErrorTemplate()
+    template.feed(str(html or ""))
+    return template.has_listing
+
 
 def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> None:
     """Recognize error templates, not keywords quoted in a legitimate post."""
@@ -104,15 +174,19 @@ def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> 
     template = _ErrorTemplate()
     template.feed(html)
     has_post = bool("".join(template.post_text).strip())
-    if not has_post and (template.challenge or title in {
+    has_content = has_post or template.has_listing or bool("".join(template.article_text).strip())
+    if template.primary_challenge or (not has_content and (template.challenge or title in {
         "just a moment...", "checking your browser", "attention required! | cloudflare", "verify you are human",
-    }):
+    })):
         raise CollectionFailure("blocked", "browser verification page returned", scope="site")
-    login_title = bool(re.search(r"(^|[-|:])\s*(log[ -]?in|sign[ -]?in|登录)\s*$", title))
-    if template.password and not has_post and (login_title or template.template == "login" or template.login_form):
+    login_title = bool(re.search(r"(^|[-|:])\s*(log[ -]?in|sign[ -]?in|登录)\s*($|[-|:])", title))
+    if template.password and not has_post and (
+        (login_title and not template.has_listing) or template.template == "login"
+        or template.article_login or (template.login_form and not has_content)
+    ):
         raise CollectionFailure("auth_required", "source returned its login form", scope="site")
     panel = " ".join(template.error_text).lower()
-    if not "".join(template.post_text).strip():
+    if not has_post:
         if any(phrase in panel for phrase in (
             "do not have permission", "you must be logged", "you must be registered",
             "not have permission", "insufficient privileges",
@@ -148,3 +222,52 @@ def classify_failure(error: Exception) -> CollectionFailure:
     if isinstance(error, OSError):
         return CollectionFailure("infrastructure", "collection runtime or artifact storage failed", scope="site")
     return CollectionFailure("unknown", "collection failed without a confirmed availability reason")
+
+
+def safe_failure_text(value: str, *, limit: int = 480) -> str:
+    """Keep diagnostics useful without persisting credentials or URL queries."""
+    text = str(value)[:4096]
+    text = re.sub(r"(?im)([\"']?(?:authorization|proxy-authorization|cookie|set-cookie)[\"']?\s*[:=]\s*)[^\r\n]+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)\b(Bearer|Basic)\s+[^\s,;]+", r"\1 [REDACTED]", text)
+    text = re.sub(
+        r"(?i)([\"']?(?:password|passwd|pass2|pwd|secret|token|api[_-]?key|access[_-]?(?:key|token)|mybbuser|session[_-]?id|auth[_-]?key|sid)[\"']?\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)", r"\1[REDACTED]", text,
+    )
+    def public_url(match):
+        try:
+            url = urlsplit(match.group(0))
+            host = url.hostname or ""
+            if ":" in host:
+                host = f"[{host}]"
+            authority = host + (f":{url.port}" if url.port else "")
+            return urlunsplit((url.scheme, authority, url.path, "", ""))
+        except ValueError:
+            return "[URL]"
+    text = re.sub(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\"']+", public_url, text)
+    return " ".join(text.split()).encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+
+def failure_details(error: Exception) -> dict:
+    failure = classify_failure(error)
+    return {
+        "error_type": type(error).__name__, "kind": failure.kind, "scope": failure.scope,
+        "retry_after": failure.retry_after, "error_message": safe_failure_text(str(failure)),
+    }
+
+
+def summarize_failures(message: str, failures: list[tuple[str, Exception]]) -> CollectionFailure:
+    if not failures:
+        return CollectionFailure("unknown", safe_failure_text(message))
+    priority = ("retry_budget", "rate_limited", "infrastructure", "blocked", "auth_required", "restricted", "timeout", "network", "parse", "unavailable", "unknown")
+    details = [(safe_failure_text(label)[:80], failure_details(error)) for label, error in failures]
+    selected = min(details, key=lambda item: (
+        priority.index(item[1]["kind"]) if item[1]["kind"] in priority else len(priority),
+        item[1]["scope"] != "site", -item[1]["retry_after"],
+    ))
+    primary = selected[1]
+    ordered = [selected] + [item for item in details if item is not selected]
+    reasons = "; ".join(f"{context}: {item['kind']}: {item['error_message']}" for context, item in ordered[:8])
+    summary = f"{safe_failure_text(message)}; {reasons}".encode("utf-8")[:3600].decode("utf-8", errors="ignore")
+    failure = CollectionFailure(primary["kind"], summary, scope=primary["scope"], retry_after=primary["retry_after"])
+    failure.__cause__ = CollectionFailure(primary["kind"], primary["error_message"], scope=primary["scope"], retry_after=primary["retry_after"])
+    return failure

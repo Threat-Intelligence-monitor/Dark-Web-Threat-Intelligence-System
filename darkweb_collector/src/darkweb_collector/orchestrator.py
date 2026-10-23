@@ -263,7 +263,8 @@ def execute_seed_job(
     for error in pagination_errors:
         logger.warning(
             "%s listing page %s (%s) failed: %s; successful pages and retry position retained",
-            site_name, error.get("page"), error.get("lane"), error.get("error_type"),
+            site_name, error.get("page"), error.get("lane"),
+            f"{error.get('kind', error.get('error_type'))}: {error.get('error_message', '')}",
         )
     if uses_frontier:
         with get_db_connection() as connection:

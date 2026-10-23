@@ -246,12 +246,14 @@ def fetch_via_tor_curl(
         if marker and code.strip().isdigit():
             raise_for_http_status(int(code.strip()))
         if result.returncode == 0:
-            return body if marker else output
+            content = body if marker else output
+            raise_if_error_page(content)
+            return content
 
         if attempt < attempts:
             time.sleep(backoff_seconds * attempt)
 
-    raise TorFetchError("curl fetch failed", kind="timeout" if result.returncode == 28 else "network")
+    raise TorFetchError(f"curl fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
 
 def fetch_with_cloudflare_bypass(
     url: str,
@@ -511,7 +513,7 @@ def fetch_via_http_proxy(
         if attempt < attempts:
             time.sleep(backoff_seconds * attempt)
     
-    raise ProxyFetchError("proxy fetch failed", kind="timeout" if result.returncode == 28 else "network")
+    raise ProxyFetchError(f"proxy fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
 
 
 def fetch_with_proxy_bypass(

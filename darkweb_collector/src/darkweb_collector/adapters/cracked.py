@@ -16,7 +16,7 @@ from darkweb_collector.browser_client import (
     fetch_page_artifacts_with_browser,
     screenshot_html_with_browser,
 )
-from darkweb_collector.collection_errors import CollectionFailure, classify_failure, raise_if_error_page
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, summarize_failures
 from darkweb_collector.db import (
     get_db_connection,
     get_forum_detail_snapshot,
@@ -144,24 +144,24 @@ class CrackedAdapter(SiteAdapter):
         if cookie_header:
             routes.append(("browser_cookie", lambda: browser_route(cookie_header)))
 
-        last_failure = None
-        for index, (_route_name, fetcher) in enumerate(routes):
+        failures: list[tuple[str, Exception]] = []
+        for index, (route_name, fetcher) in enumerate(routes):
             try:
                 html, screenshot = fetcher()
                 raise_if_error_page(html)
                 if validator(html):
                     return html, screenshot
-                last_failure = CollectionFailure("parse", "cracked detail has no recognized post structure")
+                raise CollectionFailure("parse", "cracked response has no recognized content structure")
             except CollectionFailure as exc:
                 if exc.kind in {"retry_budget", "unavailable", "rate_limited", "restricted"}:
                     raise
-                last_failure = exc
+                failures.append((route_name, exc))
             except Exception as exc:
-                last_failure = classify_failure(exc)
+                failures.append((route_name, exc))
             close_browser_client()
             if index + 1 < len(routes):
                 time.sleep(1)
-        raise last_failure or CollectionFailure("unknown", "cracked fetch routes exhausted")
+        raise summarize_failures("cracked fetch routes failed", failures)
 
     def _fetch_html(self, url: str, config: SiteConfig, mode: str) -> str:
         del mode
