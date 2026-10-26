@@ -68,6 +68,25 @@ export function useDocumentExposureApi() {
         limit: params.limit,
       })}`)
     },
+    loadContinuousStatus(params = {}) {
+      return requestJson(`/api/document-exposures/continuous-status${buildQuery({
+        watchlist_id: params.watchlistId,
+      })}`)
+    },
+    startContinuous(payload) {
+      return requestJson('/api/document-exposures/continuous/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+    },
+    stopContinuous(payload) {
+      return requestJson('/api/document-exposures/continuous/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+    },
     loadNetdiskContinuousStatus(params = {}) {
       return requestJson(`/api/document-exposures/netdisk/continuous-status${buildQuery({
         watchlist_id: params.watchlistId,
