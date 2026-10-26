@@ -18,18 +18,25 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, parse_qsl, quote_plus, urlencode, unquote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+from darkweb_collector.code_monitoring import (
+    _derived_search_terms_from_profile,
+    _find_domain_anchor_matches,
+    _metadata_enterprise_profile,
+)
 from darkweb_collector.db import (
     add_document_hit_review,
     delete_exposure_watchlist,
     ensure_netdisk_source_health_records,
     get_db_connection,
     get_document_hit,
+    get_code_watchlist,
     get_exposure_watchlist,
     insert_exposure_scan_run,
     insert_document_hit_snapshot,
     list_document_hit_reviews,
     list_document_hit_snapshots,
     list_document_hits,
+    list_code_watchlists,
     list_exposure_scan_runs,
     list_exposure_watch_terms,
     list_exposure_watchlists,
@@ -146,40 +153,6 @@ SENSITIVE_CONTEXT_SIGNALS = (
     "财务",
     "设计文件",
 )
-CONTEXTUAL_TERM_TYPES = {
-    "sensitive_keyword",
-    "leak_keyword",
-    "risk_keyword",
-    "confidential_keyword",
-    "credential_keyword",
-    "internal_keyword",
-    "file_leak",
-}
-ENTITY_TOKEN_STOPWORDS = {
-    "and",
-    "or",
-    "the",
-    "data",
-    "file",
-    "files",
-    "document",
-    "documents",
-    "report",
-    "reports",
-    "annual",
-    "internal",
-    "confidential",
-    "secret",
-    "leak",
-    "leaked",
-    "leaks",
-    "leakage",
-    "breach",
-    "breached",
-    "exposed",
-    "exposure",
-    "disclosure",
-}
 FILE_NAME_EXTENSIONS = r"pdf|docx?|xlsx?|pptx?|zip|rar|7z|csv|txt|jpe?g|png|gif|webp|bmp|mov|mp4|m4v|avi|mkv|mp3|m4a|wav"
 FILE_NAME_RE = re.compile(rf"\b[\w\-. ]+\.(?:{FILE_NAME_EXTENSIONS})\b", re.IGNORECASE)
 LOOSE_FILE_NAME_RE = re.compile(rf"[^\n\r|｜<>\"']{{1,180}}\.(?:{FILE_NAME_EXTENSIONS})", re.IGNORECASE)
@@ -388,6 +361,68 @@ def _parse_json(value: Any, default: Any) -> Any:
 def _watchlist_metadata(payload: dict[str, Any] | None) -> dict[str, Any]:
     data = _parse_json((payload or {}).get("metadata_json"), {})
     return data if isinstance(data, dict) else {}
+
+
+def _exposure_enterprise_profile(
+    connection, watchlist: dict[str, Any], terms: list[dict[str, Any]], code_watchlists=None,
+) -> tuple[dict[str, Any], int | None]:
+    metadata = _watchlist_metadata(watchlist)
+    linked_id = metadata.get("code_watchlist_id")
+    if linked_id is not None:
+        owner = get_code_watchlist(connection, int(linked_id))
+        if owner is None or not owner.get("enabled"):
+            return {}, int(linked_id)
+    else:
+        owners = code_watchlists if code_watchlists is not None else list_code_watchlists(connection)
+        matches = [item for item in owners
+                   if _normalize_text(item.get("name")) == _normalize_text(watchlist.get("name"))
+                   and _normalize_text(item.get("organization_name")) == _normalize_text(watchlist.get("organization_name"))]
+        owner = matches[0] if len(matches) == 1 else None
+        if owner is not None:
+            linked_id = int(owner["id"])
+            if not owner.get("enabled"):
+                return {}, linked_id
+    if owner is not None:
+        # Supplemental product/project words must never become enterprise aliases.
+        profile = _metadata_enterprise_profile(
+            _watchlist_metadata(owner), organization_name=str(owner.get("organization_name") or ""), terms=[],
+        )
+    else:
+        identity_terms = [item for item in terms if item.get("term_type") in {"company_name", "domain"}]
+        profile = _metadata_enterprise_profile(
+            {}, organization_name=str(watchlist.get("organization_name") or ""), terms=identity_terms,
+        )
+    return profile, int(linked_id) if linked_id is not None else None
+
+
+def _enterprise_search_terms(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    identity = {**profile, "internal_system_keywords": []}
+    identity["root_domains"] = list(profile.get("root_domains") or []) + [
+        value[2:] for value in profile.get("trusted_subdomain_patterns") or [] if value.startswith("*.")
+    ]
+    excluded = {_normalize_text(value).casefold() for value in profile.get("negative_aliases") or []}
+    return [row for row in _derived_search_terms_from_profile(identity)
+            if _normalize_text(row["term"]).casefold() not in excluded]
+
+
+def _exposure_search_configuration(connection, watchlist, terms, code_watchlists=None) -> dict[str, Any]:
+    profile, linked_id = _exposure_enterprise_profile(connection, watchlist, terms, code_watchlists)
+    derived = _enterprise_search_terms(profile)
+    queries = list(derived)
+    seen = {row["term"].casefold() for row in derived}
+    for extension in terms:
+        value = _normalize_text(extension.get("term"))
+        if not value or not bool(extension.get("enabled", True)) or value.casefold() in seen:
+            continue
+        for identity in derived:
+            query = f"{identity['term']} {value}"
+            if query.casefold() in seen:
+                continue
+            seen.add(query.casefold())
+            queries.append({**extension, "term": query, "extension_term": value,
+                            "identity_term": identity["term"], "source": "profile_extension"})
+    return {"enterprise_profile": profile, "code_watchlist_id": linked_id,
+            "derived_terms": derived, "effective_terms": queries}
 
 
 def _is_seed_placeholder_watchlist(payload: dict[str, Any] | None) -> bool:
@@ -1704,11 +1739,15 @@ def _append_api_candidate(
             return
         seen.add(candidate_url)
         title = _api_candidate_title(row, fallback_title)
+        evidence_title = next((_normalize_text(row.get(key)) for key in ("work_title", "title", "name")
+                               if _normalize_text(row.get(key))), "")
         password = _normalize_text(row.get("password") or row.get("pwd") or row.get("code"))
         candidates.append(
             {
                 "url": candidate_url,
                 "title": title or candidate_url,
+                "title_is_fallback": not bool(evidence_title),
+                "evidence_title": evidence_title,
                 "source": source.key,
                 "source_detail": _normalize_text(row.get("source") or row.get("channel") or cloud_type),
                 "share_code": password,
@@ -1825,75 +1864,6 @@ def _contains_context_token(haystack: str, compact_haystack: str, token: str) ->
     return normalized in haystack or compact_token in compact_haystack
 
 
-def _context_signal_hits(value: str) -> list[str]:
-    haystack = _normalize_text(value).lower()
-    compact_haystack = _compact_match_text(value)
-    hits: list[str] = []
-    seen: set[str] = set()
-    for signal in SENSITIVE_CONTEXT_SIGNALS:
-        normalized = _normalize_text(signal).lower()
-        if normalized and normalized not in seen and _contains_context_token(haystack, compact_haystack, normalized):
-            seen.add(normalized)
-            hits.append(signal)
-    return hits
-
-
-def _strip_context_signals(value: str) -> str:
-    text = _normalize_text(value).lower()
-    for signal in sorted(SENSITIVE_CONTEXT_SIGNALS, key=len, reverse=True):
-        normalized = _normalize_text(signal).lower()
-        if not normalized:
-            continue
-        text = text.replace(normalized, " ")
-        compact_signal = re.sub(r"\s+", "", normalized)
-        if compact_signal != normalized:
-            text = text.replace(compact_signal, " ")
-    return text
-
-
-def _entity_tokens_from_value(value: str) -> list[str]:
-    stripped = _strip_context_signals(value)
-    tokens: list[str] = []
-    seen: set[str] = set()
-    for token in re.findall(r"[a-z0-9][a-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}", stripped, re.IGNORECASE):
-        normalized = _normalize_text(token).lower().strip("._-")
-        if not normalized or normalized in seen or normalized in ENTITY_TOKEN_STOPWORDS:
-            continue
-        if normalized.isdigit():
-            continue
-        seen.add(normalized)
-        tokens.append(normalized)
-    return tokens
-
-
-def _watchlist_entity_tokens(organization_name: str, terms: list[dict[str, Any]]) -> list[str]:
-    tokens: list[str] = []
-    seen: set[str] = set()
-    values = [_normalize_text(organization_name)]
-    values.extend(_normalize_text(item.get("term")) for item in terms)
-    for value in values:
-        for token in _entity_tokens_from_value(value):
-            if token not in seen:
-                seen.add(token)
-                tokens.append(token)
-    return tokens
-
-
-def _context_entity_hits(haystack: str, compact_haystack: str, entity_tokens: list[str]) -> list[str]:
-    hits: list[str] = []
-    for token in entity_tokens:
-        if _contains_context_token(haystack, compact_haystack, token):
-            hits.append(token)
-    return hits
-
-
-def _is_contextual_monitor_term(term: dict[str, Any]) -> bool:
-    term_type = _normalize_text(term.get("term_type")).lower()
-    if term_type in CONTEXTUAL_TERM_TYPES:
-        return True
-    return bool(_context_signal_hits(_normalize_text(term.get("term"))))
-
-
 def _matched_terms(
     title: str,
     preview_text: str,
@@ -1901,47 +1871,203 @@ def _matched_terms(
     terms: list[dict[str, Any]],
     *,
     organization_name: str = "",
+    enterprise_profile: dict[str, Any] | None = None,
+    evidence_units: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    haystack = " ".join([title, preview_text, " ".join(file_names)]).lower()
-    compact_haystack = _compact_match_text(haystack)
-    entity_tokens = _watchlist_entity_tokens(organization_name, terms)
+    profile = enterprise_profile if enterprise_profile is not None else _metadata_enterprise_profile(
+        {}, organization_name=organization_name,
+        terms=[row for row in terms if row.get("term_type") in {"company_name", "domain"}],
+    )
+    identities = _enterprise_search_terms(profile)
+    if not identities:
+        return []
+    units = evidence_units if evidence_units is not None else [
+        {"title": title, "preview_text": preview_text},
+        *({"title": name} for name in file_names),
+    ]
     matches = []
     seen: set[str] = set()
-    for term in terms:
-        value = _normalize_text(term.get("term"))
-        if not value:
+    guarded = {_normalize_text(value).casefold() for value in profile.get("short_alias_guard") or []}
+    official = {_normalize_text(value).casefold() for value in profile.get("official_names") or []}
+    for unit in units:
+        haystack = " ".join([str(unit.get("title") or ""), str(unit.get("preview_text") or ""),
+                             " ".join(unit.get("file_names") or [])]).lower()
+        compact_haystack = _compact_match_text(haystack)
+
+        def occurs(row):
+            value = _normalize_text(row.get("term"))
+            if row.get("term_type") == "domain":
+                return bool(_find_domain_anchor_matches(haystack, value))
+            return _contains_context_token(haystack, compact_haystack, value)
+
+        identity_hits = [row for row in identities if occurs(row)]
+        if not any(row.get("term_type") == "domain" or row["term"].casefold() in official
+                   or row["term"].casefold() not in guarded for row in identity_hits):
             continue
-        lowered = value.lower()
-        compact_lowered = re.sub(r"\s+", "", lowered)
-        if (lowered in haystack or compact_lowered in compact_haystack) and lowered not in seen:
-            if _is_contextual_monitor_term(term) and entity_tokens and not _context_entity_hits(haystack, compact_haystack, entity_tokens):
+        entities = [row["term"] for row in identity_hits]
+        for term in terms:
+            value = _normalize_text(term.get("term"))
+            if not value or value.casefold() in seen or not bool(term.get("enabled", True)) or not occurs(term):
                 continue
-            seen.add(lowered)
+            seen.add(value.casefold())
             matches.append(
                 {
                     "term": value,
                     "term_type": str(term.get("term_type") or "custom"),
                     "weight": int(term.get("weight") or 0),
-                }
-            )
-            continue
-        if lowered in seen or not _is_contextual_monitor_term(term):
-            continue
-        entity_hits = _context_entity_hits(haystack, compact_haystack, entity_tokens or _entity_tokens_from_value(value))
-        signal_hits = _context_signal_hits(haystack)
-        if entity_hits and signal_hits:
-            seen.add(lowered)
-            matches.append(
-                {
-                    "term": value,
-                    "term_type": str(term.get("term_type") or "custom"),
-                    "weight": int(term.get("weight") or 0),
-                    "match_type": "contextual_sensitive",
-                    "matched_entities": entity_hits[:5],
-                    "matched_signals": signal_hits[:8],
+                    "match_type": "enterprise_identity" if term.get("source") == "enterprise_profile" else "enterprise_and_extension",
+                    "matched_entities": entities,
+                    "matched_file": _normalize_text(unit.get("title")),
                 }
             )
     return matches
+
+
+class _DocumentBodyParser(HTMLParser):
+    _VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    _SKIP_TAGS = {"script", "style", "noscript", "template", "nav", "header", "footer", "aside", "form", "iframe", "object"}
+    _SKIP_WORDS = {"nav", "header", "footer", "aside", "recommend", "recommended", "recommendation", "recommendations", "related", "search", "sidebar"}
+
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+        self.scopes = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        labels = " ".join(str(attrs.get(key) or "") for key in ("id", "class", "role"))
+        words = set(re.sub(r"([a-z])([A-Z])", r"\1 \2", labels).lower().replace("_", "-").replace("-", " ").split())
+        style = re.sub(r"\s+", "", str(attrs.get("style") or "")).lower()
+        blocked = bool(self.stack and self.stack[-1][1]) or tag in self._SKIP_TAGS
+        blocked = blocked or bool(words & self._SKIP_WORDS) or any(word in labels for word in ("推荐", "相关", "搜索"))
+        blocked = blocked or "hidden" in attrs or str(attrs.get("aria-hidden") or "").lower() == "true"
+        blocked = blocked or "display:none" in style or "visibility:hidden" in style
+        priority = 0
+        if not blocked:
+            if "articlebody" in str(attrs.get("itemprop") or "").lower().split():
+                priority = 3
+            elif tag == "article":
+                priority = 2
+            elif tag == "main" or "main" in str(attrs.get("role") or "").lower().split():
+                priority = 1
+        scope = None
+        if priority:
+            scope = len(self.scopes)
+            self.scopes.append({"priority": priority, "parts": [], "closed": False})
+        if tag not in self._VOID_TAGS:
+            self.stack.append((tag, blocked, scope))
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self._VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                scope = self.stack[index][2]
+                if scope is not None:
+                    self.scopes[scope]["closed"] = True
+                del self.stack[index:]
+                break
+
+    def handle_data(self, data):
+        if not self.stack or self.stack[-1][1]:
+            return
+        for _, _, scope in self.stack:
+            if scope is not None:
+                self.scopes[scope]["parts"].append(data)
+
+
+def _document_evidence_text(html: str) -> str:
+    parser = _DocumentBodyParser()
+    parser.feed(str(html or ""))
+    parser.close()
+    scopes = [scope for scope in parser.scopes if scope["closed"] and _normalize_text(" ".join(scope["parts"]))]
+    if not scopes:
+        return ""
+    priority = max(scope["priority"] for scope in scopes)
+    selected = [scope for scope in scopes if scope["priority"] == priority]
+    # Sibling articles/main regions may describe different files. Do not join them.
+    return _normalize_text(" ".join(selected[0]["parts"])) if len(selected) == 1 else ""
+
+
+def _document_url_identity(url: str) -> tuple[str, str, tuple[tuple[str, str], ...]] | None:
+    try:
+        parsed = urlparse(str(url or ""))
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.port not in {None, 80, 443}:
+            return None
+        query = tuple(sorted((key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                             if not key.lower().startswith("utm_") and key.lower() not in {"spm", "from"}))
+        return parsed.hostname.lower(), unquote(parsed.path).rstrip("/") or "/", query
+    except ValueError:
+        return None
+
+
+def _document_is_detail_url(url: str, platform: ExposurePlatform) -> bool:
+    identity = _document_url_identity(url)
+    if identity is None:
+        return False
+    host, path, query = identity
+    domains = getattr(platform, "domains", ())
+    if not any(host == domain or host.endswith("." + domain) for domain in domains):
+        return False
+    path = path.lower()
+    if path == "/" or any(key.lower() in {"q", "query", "keyword", "keywords", "word", "wd", "nkey", "search", "key"} for key, _ in query):
+        return False
+    if re.search(r"(?:^|/)(?:index|home|search|so|s|category|categories|catalog|class|list|tag|tags|login|user|auth|passport)(?:[./_-]|$)", path):
+        return False
+    if NETDISK_FILE_SUFFIX_RE.search(path) and NETDISK_FILE_SUFFIX_RE.search(path).end() == len(path):
+        return True
+    # Conservative resource forms; unknown routes remain candidates, not file evidence.
+    return bool(re.search(r"/(?:p[-/]|view/|paper/|doc/|document/|f/|html/|detail/|details/).+", path)
+                or re.search(r"/[^/]*\d[^/]*\.(?:html?|shtml)$", path)
+                or any(key.lower() in {"id", "docid", "document_id", "paperid"} and value for key, value in query))
+
+
+def _document_match_units(detail: dict[str, Any], candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    platform = detail.get("platform")
+    platform_type = getattr(platform, "platform_type", "")
+    if platform_type == "netdisk_share":
+        entries = detail.get("evidence_file_entries", detail.get("file_entries")) or []
+        units = []
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("source") != "share_listing" or entry.get("inferred") is not False:
+                continue
+            if entry.get("is_dir") or entry.get("isDir"):
+                continue
+            name = _normalize_text(entry.get("name"))
+            path = _normalize_text(entry.get("path")) or name
+            if not name or not path or path.casefold() in seen:
+                continue
+            seen.add(path.casefold())
+            units.append({"title": name, "preview_text": "", "file_names": [path]})
+        if entries:
+            return units
+        title = _normalize_text(candidate.get("evidence_title", candidate.get("title")))
+        suffixes = list(NETDISK_FILE_SUFFIX_RE.finditer(title))
+        if (candidate.get("title_is_fallback") is False and len(suffixes) == 1
+                and suffixes[0].end() == len(title) and not re.search(r"[\r\n,，;；|｜<>?]", str(candidate.get("evidence_title", candidate.get("title")) or ""))
+                and not title.lower().startswith(("http://", "https://"))):
+            return [{"title": title, "preview_text": "", "file_names": [title]}]
+        return []
+    if platform_type != "document_library":
+        return []
+    requested_url = str(candidate.get("url") or "")
+    page_url = str(detail.get("page_url") or requested_url)
+    source_url = str(candidate.get("_source_url") or detail.get("source_url") or "")
+    if not _document_is_detail_url(page_url, platform) or not _document_is_detail_url(requested_url, platform):
+        return []
+    if _document_url_identity(page_url) != _document_url_identity(requested_url):
+        return []
+    if source_url and _document_url_identity(page_url) == _document_url_identity(source_url):
+        return []
+    title = _normalize_text(candidate.get("title")) if candidate.get("title_is_fallback") is False else ""
+    text = _normalize_text(detail.get("document_text"))
+    if not title and not text:
+        return []
+    return [{"title": title, "preview_text": text, "file_names": []}]
 
 
 def _score_document_hit(title: str, preview_text: str, file_names: list[str], matches: list[dict[str, Any]], access_state: str) -> tuple[int, int, str]:
@@ -2466,7 +2592,11 @@ def _search_candidates_for_source(source: DiscoverySource, url: str, term: str) 
     block_reason = _detect_search_block_reason(source, search_html, url)
     if block_reason:
         raise RuntimeError(block_reason)
-    return _parse_candidates_from_html(source, search_html, url)
+    candidates = _parse_candidates_from_html(source, search_html, url)
+    for candidate in candidates:
+        title = _normalize_text(candidate.get("title"))
+        candidate.setdefault("title_is_fallback", not title or title == candidate.get("url"))
+    return candidates
 
 
 def _search_candidate_pages_for_source(
@@ -2615,6 +2745,7 @@ def _detail_payload_from_page(
     parser = _AnchorParser()
     parser.feed(html)
     preview_text = parser.text[:PREVIEW_TEXT_LIMIT]
+    document_text = _document_evidence_text(html)[:PREVIEW_TEXT_LIMIT]
     file_names = _extract_file_names(preview_text, parser.anchors)
     file_sizes = _extract_file_sizes(preview_text)
     access_state = _detect_access_state(platform, html, str(artifacts["url"]))
@@ -2626,6 +2757,7 @@ def _detail_payload_from_page(
         "html": html,
         "screenshot_png": artifacts["screenshot_png"],
         "preview_text": preview_text,
+        "document_text": document_text,
         "ocr_text": preview_text,
         "file_names": file_names,
         "file_sizes": file_sizes,
@@ -2855,6 +2987,7 @@ def list_watchlists_payload() -> list[dict[str, Any]]:
     ensure_default_watchlist()
     with get_db_connection() as connection:
         rows = list_exposure_watchlists(connection)
+        code_watchlists = list_code_watchlists(connection)
         terms_by_watchlist = {
             int(row["id"]): list_exposure_watch_terms(connection, int(row["id"]))
             for row in rows
@@ -2881,6 +3014,7 @@ def list_watchlists_payload() -> list[dict[str, Any]]:
                     "name": public_name,
                     "organization_name": public_organization,
                     "terms": terms,
+                    **_exposure_search_configuration(connection, row, terms, code_watchlists),
                     "source_families": source_families,
                     "file_types": metadata.get("file_types") or list(DEFAULT_FILE_TYPES),
                     "page_limit": int(metadata.get("page_limit") or _default_page_limit_for_source_families(source_families)),
@@ -2913,6 +3047,15 @@ def save_watchlist_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if source_family in source_policies
     )
     with get_db_connection() as connection:
+        existing = get_exposure_watchlist(connection, int(payload["id"])) if payload.get("id") else None
+        metadata = _watchlist_metadata(existing)
+        linked_id = payload.get("code_watchlist_id")
+        if linked_id is None:
+            linked_id = metadata.get("code_watchlist_id")
+        if linked_id is not None:
+            if get_code_watchlist(connection, int(linked_id)) is None:
+                raise ValueError("linked monitoring object not found")
+            metadata["code_watchlist_id"] = int(linked_id)
         watchlist_id = upsert_exposure_watchlist(
             connection,
             {
@@ -2923,6 +3066,7 @@ def save_watchlist_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "notes": payload.get("notes", ""),
                 "metadata_json": _json_dumps(
                     {
+                        **metadata,
                         "source_families": source_families,
                         "file_types": file_types,
                         "page_limit": page_limit,
@@ -2955,9 +3099,11 @@ def save_watchlist_payload(payload: dict[str, Any]) -> dict[str, Any]:
         metadata = _watchlist_metadata(watchlist or {})
         saved_source_families = _normalize_source_families(metadata.get("source_families"))
         saved_source_policies = _normalized_source_policies(metadata)
+        saved_terms = list_exposure_watch_terms(connection, watchlist_id)
         return {
             **(watchlist or {}),
-            "terms": list_exposure_watch_terms(connection, watchlist_id),
+            "terms": saved_terms,
+            **_exposure_search_configuration(connection, watchlist or {}, saved_terms),
             "source_families": saved_source_families,
             "file_types": metadata.get("file_types") or list(DEFAULT_FILE_TYPES),
             "page_limit": int(metadata.get("page_limit") or _default_page_limit_for_source_families(saved_source_families)),
@@ -2994,7 +3140,9 @@ def scan_watchlist_once(
             raise ValueError(f"watchlist not found: {watchlist_id}")
         if not bool(watchlist.get("enabled")):
             return {"watchlist_id": watchlist_id, "scanned_terms": 0, "candidates": 0, "hits": 0, "message": "watchlist disabled"}
-        terms = [item for item in list_exposure_watch_terms(connection, watchlist_id) if bool(item.get("enabled"))]
+        supplemental_terms = list_exposure_watch_terms(connection, watchlist_id)
+        search_configuration = _exposure_search_configuration(connection, watchlist, supplemental_terms)
+        terms = search_configuration["effective_terms"]
     watchlist_meta = _watchlist_metadata(watchlist)
     source_policies = _normalized_source_policies(watchlist_meta)
     explicit_source_family_request = bool(source_families)
@@ -3209,6 +3357,7 @@ def scan_watchlist_once(
                                 else [] if access_state_override in {"removed", "forbidden"} else candidate.get("file_sizes") or _extract_file_sizes(candidate_preview)
                             ),
                             "file_entries": file_entries or preview_file_entries,
+                            "evidence_file_entries": file_entries,
                             "share_code": share_code,
                             "share_type": "password_share" if share_code else "public_share",
                             "access_state": access_state,
@@ -3268,8 +3417,11 @@ def scan_watchlist_once(
                     detail["page_title"],
                     detail["preview_text"],
                     detail["file_names"],
-                    terms,
+                    [{**term_row, "term": term_row["extension_term"]}]
+                    if term_row.get("extension_term") else search_configuration["derived_terms"] + supplemental_terms,
                     organization_name=str(watchlist.get("organization_name") or ""),
+                    enterprise_profile=search_configuration["enterprise_profile"],
+                    evidence_units=_document_match_units(detail, candidate),
                 )
                 if not matches:
                     continue
@@ -4013,7 +4165,7 @@ def build_document_exposure_summary(source_family: str | None = None) -> dict[st
     enabled_term_count = sum(
         1
         for watchlist in watchlists
-        for term in (watchlist.get("terms") or [])
+        for term in (watchlist.get("effective_terms") or [])
         if bool(term.get("enabled"))
     )
     sessions = build_platform_session_payloads(module="document_exposure", manageable_only=True)

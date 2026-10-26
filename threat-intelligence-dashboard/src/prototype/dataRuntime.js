@@ -801,6 +801,7 @@ function installActionGuard(root, state) {
     if (!target || !root.contains(target)) return
 
     const handled = target.dataset.runtimeExport
+      || target.dataset.runtimeCodeExport
       || target.dataset.runtimeRefresh
       || target.dataset.runtimeFilter
       || target.dataset.runtimeReviewStatus
@@ -821,7 +822,9 @@ function installActionGuard(root, state) {
       return
     }
     try {
-      if (target.dataset.runtimeExport) {
+      if (target.dataset.runtimeCodeExport) {
+        await exportCodeHits(root, state, target)
+      } else if (target.dataset.runtimeExport) {
         exportTable(state.tables.get(target.dataset.runtimeExport))
       } else if (target.dataset.runtimeRefresh) {
         await state.refresh?.()
@@ -1953,6 +1956,73 @@ function codeHitPageUrl(root, codeState, bucket) {
   return `/api/code-monitoring/hits/page?${params.toString()}`
 }
 
+async function exportCodeHits(root, state, button) {
+  if (state.codeExportPending) return
+  state.codeExportPending = true
+  const controls = queryAll(root, '[data-runtime-code-export]').map((control) => ({
+    control, disabled: control.disabled, text: control.textContent,
+  }))
+  controls.forEach(({ control }) => { control.disabled = true })
+  button.textContent = '正在导出…'
+  try {
+    const clickedAt = Date.now()
+    const bucket = button.dataset.runtimeCodeExport
+    const params = new URLSearchParams({ bucket })
+    queryAll(root, '[data-code-hit-filter]').forEach((control) => {
+      const value = String(control.value || '').trim()
+      if (value) params.set(control.dataset.codeHitFilter, value)
+    })
+    const signal = root.__dataRuntimeAbort?.signal
+    const payload = await requestJson(`/api/code-monitoring/hits/export?${params}`, { signal })
+    const items = payload?.items
+    if (!Array.isArray(items) || !Number.isSafeInteger(payload.total) || payload.total !== items.length) {
+      throw new Error('导出数据不完整，请重试')
+    }
+    const ids = new Set()
+    items.forEach((item) => {
+      const id = String(item?.id ?? '')
+      if (!id || ids.has(id)) throw new Error('导出结果重复或缺少标识，请重试')
+      ids.add(id)
+    })
+    if (signal?.aborted || !root.isConnected) throw new Error('页面已切换，导出已取消')
+    const headers = ['记录ID', '监测对象', '所属机构', '结果分组', '是否压制', '压制原因', '来源平台',
+      '仓库名称', '分支', '文件路径', '代码链接', '仓库链接', '敏感类型', '检索命中词', '命中层级',
+      '风险级别', '审核状态', '首次发现时间', '最近发现时间', '详情链接']
+    const rows = items.map((item) => {
+      const suppressed = Boolean(item.suppressed) || item.displayBucket === 'suppressed'
+      const repositoryUrl = /^https?:\/\//i.test(item.repositoryUrl || '') ? item.repositoryUrl.trim() : ''
+      const fileUrl = /^https?:\/\//i.test(item.fileUrl || '') ? item.fileUrl.trim() : ''
+      const repositoryPage = fileUrl.split(/[?#]/)[0].replace(/\/+$/, '') === repositoryUrl.split(/[?#]/)[0].replace(/\/+$/, '')
+      return [item.id, item.watchlistName, item.organizationName, suppressed ? '压制线索' : '主列表',
+        suppressed ? '是' : '否', (item.suppressionReasons || []).join('；'), item.platformLabel || item.platform,
+        item.repositoryFullName || item.repositoryName, item.branch, item.filePath, repositoryPage ? '' : fileUrl,
+        repositoryUrl, item.sensitiveLabel || item.sensitiveType, item.matchedTerm,
+        item.resultLayerLabel || item.resultLayer, severityLabel(severityOf(item)), reviewStatusLabel(item.reviewStatus),
+        item.firstSeenAt || '', item.lastSeenAt || '',
+        new URL(`/document-exposure/code-monitoring/detail/${encodeURIComponent(item.id)}`, window.location.origin).href]
+    })
+    const csvCell = (value) => {
+      const text = String(value ?? '')
+      const safe = /^[\s\uFEFF]*[=+\-@]|^[\t\r\n]/.test(text) ? `'${text}` : text
+      return `"${safe.replaceAll('"', '""')}"`
+    }
+    const csv = [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n')
+    const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `代码监测${bucket === 'suppressed' ? '压制线索' : '全部结果'}-${new Date(clickedAt).toISOString().replace(/[:.]/g, '-')}.csv`
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    showToast(`已导出 ${items.length} 条${bucket === 'suppressed' ? '压制线索' : '代码监测结果'}`)
+  } finally {
+    state.codeExportPending = false
+    controls.forEach(({ control, disabled, text }) => {
+      control.disabled = disabled
+      control.textContent = text
+    })
+  }
+}
+
 function setCodeServerPage(table, payload) {
   if (!table) return
   const total = Math.max(0, Number(payload.total || 0))
@@ -2041,7 +2111,6 @@ async function reloadCodeMonitoringData(root, state, codeState, resetPages = fal
     setConicChart(query(root, '.code-risk-donut'), repositoryRisk.map((item) => item.value), ['var(--danger)', 'var(--warning)', 'var(--secondary)'])
     fillNamedRows(query(root, '.code-secret-rank'), summary.sensitiveTypeTop || [])
     renderCodeTrend(root, summary.trend || [])
-    markExports(root, state, ['#code-table'])
   } finally {
     codeState.loading = false
   }

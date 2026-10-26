@@ -172,8 +172,14 @@ const filteredScanRuns = computed(() => {
     return finished >= start && finished <= end
   })
 })
-const enabledTermCount = computed(() => (selectedWatchlist.value?.terms || [])
-  .filter((term) => term.enabled == null || Boolean(term.enabled)).length)
+const enabledTermCount = computed(() => {
+  const watchlist = selectedWatchlist.value || {}
+  const terms = 'effective_terms' in watchlist
+    ? watchlist.effective_terms
+    : [...(watchlist.derived_terms || []), ...(watchlist.terms || [])]
+  return (Array.isArray(terms) ? terms : [])
+    .filter((term) => String(term.term || '').trim() && (term.enabled == null || Boolean(term.enabled))).length
+})
 const resultsHref = computed(() => isDocumentLibraryOnly(scanForm.sourceFamilies)
   ? '/document-exposure/document-library'
   : '/document-exposure/netdisk')

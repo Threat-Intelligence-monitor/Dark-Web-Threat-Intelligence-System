@@ -5289,7 +5289,7 @@ def paginate_code_hits_payloads(
     seen_after: str = "",
     seen_before: str = "",
     offset: int = 0,
-    limit: int = 50,
+    limit: int | None = 50,
 ) -> dict[str, Any]:
     normalized_query = _normalize_text(query).casefold()
     normalized_severity = _normalize_text(severity).lower()
@@ -5333,9 +5333,10 @@ def paginate_code_hits_payloads(
                 continue
         filtered.append(item)
     safe_offset = max(0, int(offset or 0))
-    safe_limit = min(200, max(1, int(limit or 50)))
+    safe_limit = None if limit is None else min(200, max(1, int(limit or 50)))
+    end = None if safe_limit is None else safe_offset + safe_limit
     return {
-        "items": [dict(item) for item in filtered[safe_offset : safe_offset + safe_limit]],
+        "items": [dict(item) for item in filtered[safe_offset:end]],
         "total": len(filtered),
         "offset": safe_offset,
         "limit": safe_limit,
@@ -5354,7 +5355,7 @@ def search_code_hits_page(
     seen_before: str = "",
     recent_hours: int | None = None,
     offset: int = 0,
-    limit: int = 50,
+    limit: int | None = 50,
 ) -> dict[str, Any]:
     if recent_hours is not None:
         if recent_hours <= 0 or recent_hours > 24 * 365:
