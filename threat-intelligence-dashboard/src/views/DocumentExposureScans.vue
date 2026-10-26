@@ -8,19 +8,19 @@
       <h1 id="scan-scope-heading">扫描范围</h1>
       <section class="scope-object">
         <div class="scope-heading"><label for="scan-watchlist">监测对象</label><a href="/settings?tab=objects" aria-label="管理监测对象" title="管理监测对象"><el-icon><Setting /></el-icon></a></div>
-        <el-select id="scan-watchlist" v-model="scanForm.watchlistId" aria-label="监测对象" placeholder="选择监测对象" :loading="loadingWatchlists" :disabled="scanLoading || continuousLoading">
+        <el-select id="scan-watchlist" v-model="scanForm.watchlistId" aria-label="监测对象" placeholder="选择监测对象" :loading="loadingWatchlists" :disabled="scanLoading">
           <el-option v-for="item in watchlists" :key="item.id" :label="item.name" :value="item.id" />
         </el-select>
         <a v-if="selectedWatchlist && !enabledTermCount" class="scope-warning" href="/settings?tab=objects">尚未配置检索词 <el-icon><ArrowRight /></el-icon></a>
       </section>
 
-      <fieldset class="scope-sources" :disabled="scanLoading">
+      <fieldset class="scope-sources" :disabled="scanLoading || continuousLoading || continuousScopeLocked" :title="continuousScopeLocked ? '修改持续监测范围前请先停止任务' : ''">
         <legend>数据来源</legend>
         <label><input v-model="scanForm.sourceFamilies" type="checkbox" value="netdisk_aggregator"><el-icon><Cloudy /></el-icon><span>网盘监测</span></label>
         <label><input v-model="scanForm.sourceFamilies" type="checkbox" value="document_library"><el-icon><Document /></el-icon><span>文库监测</span></label>
       </fieldset>
 
-      <fieldset class="scope-file-types" :disabled="scanLoading">
+      <fieldset class="scope-file-types" :disabled="scanLoading || continuousLoading || continuousScopeLocked" :title="continuousScopeLocked ? '修改持续监测范围前请先停止任务' : ''">
         <legend>文件类型</legend>
         <div class="file-type-grid"><label v-for="type in fileTypeOptions" :key="type" class="file-type-chip"><input v-model="scanForm.fileTypes" type="checkbox" :value="type" :aria-label="type"><span>{{ type }}</span></label></div>
       </fieldset>
@@ -29,8 +29,8 @@
         <summary><el-icon><ArrowDown /></el-icon>高级设置</summary>
         <div class="advanced-fields">
           <label for="scan-candidate-limit">文库候选上限</label>
-          <input id="scan-candidate-limit" v-model.number="scanForm.pageLimit" type="number" aria-label="文库候选上限" min="1" max="200" step="1" :disabled="!hasLibrarySource || scanLoading" @change="normalizeCandidateLimit">
-          <label class="advanced-switch" for="scan-library-detail"><span>文库详情抓取</span><input id="scan-library-detail" v-model="scanForm.detailFetch" type="checkbox" role="switch" aria-label="文库详情抓取" :disabled="!hasLibrarySource || scanLoading"></label>
+          <input id="scan-candidate-limit" v-model.number="scanForm.pageLimit" type="number" aria-label="文库候选上限" min="1" max="200" step="1" :disabled="!hasLibrarySource || scanLoading || continuousLoading || continuousScopeLocked" @change="normalizeCandidateLimit">
+          <label class="advanced-switch" for="scan-library-detail"><span>文库详情抓取</span><input id="scan-library-detail" v-model="scanForm.detailFetch" type="checkbox" role="switch" aria-label="文库详情抓取" :disabled="!hasLibrarySource || scanLoading || continuousLoading || continuousScopeLocked"></label>
         </div>
       </details>
     </aside>
@@ -39,23 +39,24 @@
       <header class="workbench-toolbar">
         <div class="scan-mode-tabs" role="tablist" aria-label="扫描模式">
           <button id="single-scan-tab" role="tab" :aria-selected="activeMode === 'single'" aria-controls="scan-mode-panel" :class="{ active: activeMode === 'single' }" @click="activeMode = 'single'">单次扫描</button>
-          <button id="continuous-scan-tab" role="tab" :aria-selected="activeMode === 'continuous'" aria-controls="scan-mode-panel" :class="{ active: activeMode === 'continuous' }" title="按当前对象的已保存配置执行网盘定时扫描" @click="activeMode = 'continuous'">持续监测</button>
+          <button id="continuous-scan-tab" role="tab" :aria-selected="activeMode === 'continuous'" aria-controls="scan-mode-panel" :class="{ active: activeMode === 'continuous' }" title="按当前对象启用的来源执行定时扫描" @click="activeMode = 'continuous'">持续监测</button>
         </div>
         <el-button v-if="activeMode === 'single'" class="scan-primary-action" :loading="scanLoading" :disabled="!scanReady" @click="runScan"><el-icon><CaretRight /></el-icon>立即扫描</el-button>
-        <el-button v-else-if="!continuousStatus.enabled" class="scan-primary-action" :loading="continuousLoading" :disabled="continuousStartDisabled" @click="startContinuousScan"><el-icon><CaretRight /></el-icon>开启监测</el-button>
-        <el-button v-else class="scan-primary-action stop" :loading="continuousLoading" :disabled="continuousStopDisabled" @click="stopContinuousScan"><el-icon><VideoPause /></el-icon>停止监测</el-button>
+        <el-button v-else-if="!continuousActive" class="scan-primary-action" :loading="continuousLoading" :disabled="continuousStartDisabled" @click="startContinuousScan()"><el-icon><CaretRight /></el-icon>开启监测</el-button>
+        <el-button v-else class="scan-primary-action stop" :loading="continuousLoading" :disabled="continuousStopDisabled" @click="stopContinuousScan"><el-icon><VideoPause /></el-icon>{{ continuousStopping ? '停止中' : '停止监测' }}</el-button>
       </header>
 
       <div class="workbench-content">
         <section id="scan-mode-panel" class="scan-readiness" :class="{ busy: scanLoading || continuousStatus.running }" role="tabpanel" :aria-labelledby="activeMode === 'single' ? 'single-scan-tab' : 'continuous-scan-tab'">
           <div class="readiness-label" role="status"><i></i><strong>{{ readyLabel }}</strong></div>
-          <div class="scan-plan"><span><el-icon><Clock /></el-icon>计划任务</span><el-select :model-value="continuousStatus.enabled ? continuousIntervalHours : 0" aria-label="计划任务" :disabled="!canSchedule || loadingContinuousStatus || continuousLoading" @change="changeSchedule"><el-option label="关闭" :value="0" /><el-option label="每 1 小时" :value="1" /><el-option label="每 4 小时" :value="4" /><el-option label="每 8 小时" :value="8" /></el-select></div>
+          <div class="scan-plan"><span><el-icon><Clock /></el-icon>计划任务</span><el-select :model-value="continuousStatus.enabled ? continuousIntervalHours : 0" aria-label="计划任务" :disabled="continuousPlanDisabled" @change="changeSchedule"><el-option label="关闭" :value="0" /><el-option label="每 1 小时" :value="1" /><el-option label="每 4 小时" :value="4" /><el-option label="每 8 小时" :value="8" /></el-select></div>
         </section>
 
-        <div v-if="lastRunMessage || lastRunErrors.length || continuousStatus.last_error" class="scan-feedback" role="status">
+        <div v-if="lastRunMessage || lastRunErrors.length || continuousStatus.last_error || continuousError" class="scan-feedback" role="status">
           <p v-if="lastRunMessage"><el-icon><CircleCheck /></el-icon>{{ lastRunMessage }}</p>
           <p v-if="lastRunErrors.length" class="scan-error">{{ lastRunErrors.slice(0, 3).join('；') }}</p>
           <p v-if="continuousStatus.last_error" class="scan-error">{{ continuousStatus.last_error }}</p>
+          <p v-if="continuousError" class="scan-error">{{ continuousError }}</p>
         </div>
 
         <section class="scan-history" aria-labelledby="scan-history-heading">
@@ -111,13 +112,20 @@ const activeMode = ref('single')
 const detailsOpen = ref(false)
 const selectedRun = ref(null)
 const loadingContinuousStatus = ref(false)
+const continuousStatusLoaded = ref(false)
+const continuousError = ref('')
 const headerReady = ref(false)
 const lastRunMessage = ref('')
 const lastRunErrors = ref([])
 const continuousIntervalHours = ref(1)
-const continuousStatus = ref({
+const initialContinuousStatus = {
   enabled: false,
   running: false,
+  stopping: false,
+  source_families: [],
+  file_types: null,
+  detail_fetch: null,
+  document_library_candidate_limit: null,
   started_at: '',
   last_tick_at: '',
   last_success_at: '',
@@ -130,8 +138,11 @@ const continuousStatus = ref({
   target_watchlist_id: 0,
   target_watchlist_name: '',
   active_watchlist_count: 0,
-})
+}
+const continuousStatus = ref({ ...initialContinuousStatus })
 let continuousTimer = null
+let objectVersion = 0
+let singleDraft = null
 const fileTypeOptions = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'zip', 'rar', '7z', 'txt', 'csv']
 
 const statusLabelMap = {
@@ -158,10 +169,6 @@ const selectedWatchlist = computed(() => {
   return watchlists.value.find((item) => Number(item.id || 0) === selectedId) || null
 })
 
-const isSelectedNetdiskWatchlist = computed(() => {
-  return Array.isArray(scanForm.sourceFamilies) && scanForm.sourceFamilies.includes('netdisk_aggregator')
-})
-
 const latestRun = computed(() => scanRuns.value[0] || null)
 const filteredScanRuns = computed(() => {
   if (!dateRange.value?.length) return scanRuns.value
@@ -186,19 +193,41 @@ const resultsHref = computed(() => isDocumentLibraryOnly(scanForm.sourceFamilies
 const hasLibrarySource = computed(() => scanForm.sourceFamilies.includes('document_library'))
 const scanReady = computed(() => Boolean(selectedWatchlist.value?.enabled)
   && enabledTermCount.value > 0 && scanForm.sourceFamilies.length > 0 && scanForm.fileTypes.length > 0)
-const canSchedule = computed(() => scanReady.value && isSelectedNetdiskWatchlist.value
-  && selectedWatchlist.value?.source_families?.includes('netdisk_aggregator'))
+const unsupportedSources = computed(() => scanForm.sourceFamilies
+  .filter((family) => !selectedWatchlist.value?.source_families?.includes(family)))
+const continuousActive = computed(() => continuousStatus.value.enabled || continuousStatus.value.running || continuousStatus.value.stopping)
+const continuousStopping = computed(() => continuousStatus.value.stopping
+  || (continuousStatus.value.running && !continuousStatus.value.enabled))
+const continuousSourceFamilies = computed(() => {
+  const status = continuousStatus.value
+  if (status.running && status.running_source_families?.length) return status.running_source_families
+  return status.source_families?.length ? status.source_families : status.running_source_families || []
+})
+const continuousScopeLocked = computed(() => activeMode.value === 'continuous'
+  && (continuousActive.value || loadingContinuousStatus.value))
+const canSchedule = computed(() => scanReady.value && !unsupportedSources.value.length)
+const continuousPlanDisabled = computed(() => !continuousStatusLoaded.value || loadingContinuousStatus.value
+  || continuousLoading.value || continuousStopping.value || (!continuousStatus.value.enabled && !canSchedule.value))
 const readyLabel = computed(() => {
   if (scanLoading.value) return '正在扫描'
   if (loadingWatchlists.value) return '正在加载配置'
+  if (activeMode.value === 'continuous') {
+    if (loadingContinuousStatus.value) return '正在加载持续监测状态'
+    if (!continuousStatusLoaded.value && continuousError.value) return '持续监测状态加载失败'
+    if (continuousActive.value) {
+      const label = monitoringSourceLabel(continuousSourceFamilies.value)
+      if (continuousStopping.value) return `${label}持续监测停止中`
+      return `${label}持续监测${continuousStatus.value.running ? '执行中' : '已启用'}`
+    }
+  }
   if (!scanForm.watchlistId) return '请选择监测对象'
   if (!selectedWatchlist.value?.enabled) return '监测对象已停用'
   if (!enabledTermCount.value) return '请配置检索词'
   if (!scanForm.sourceFamilies.length) return '请选择数据来源'
   if (!scanForm.fileTypes.length) return '请选择文件类型'
   if (activeMode.value === 'continuous') {
-    if (!canSchedule.value) return '文库暂不支持持续监测'
-    return continuousStatus.value.running ? '网盘扫描执行中' : continuousStatus.value.enabled ? '网盘持续监测已启用' : '网盘持续监测未启用'
+    if (unsupportedSources.value.length) return `当前对象未启用${monitoringSourceLabel(unsupportedSources.value)}来源，请先保存配置`
+    return `${monitoringSourceLabel(scanForm.sourceFamilies)}持续监测未启用`
   }
   return '扫描范围已就绪'
 })
@@ -217,8 +246,7 @@ async function changeSchedule(value) {
   if (Number(value) === 0) {
     await stopContinuousScan()
   } else {
-    continuousIntervalHours.value = Number(value)
-    await startContinuousScan()
+    await startContinuousScan(Number(value))
   }
 }
 
@@ -232,11 +260,49 @@ function sourceLink(value) {
 }
 
 const continuousStartDisabled = computed(() => {
-  if (!canSchedule.value || loadingContinuousStatus.value) return true
-  return Boolean(continuousStatus.value.enabled)
+  return !canSchedule.value || !continuousStatusLoaded.value || loadingContinuousStatus.value
+    || continuousLoading.value || continuousActive.value
 })
 
-const continuousStopDisabled = computed(() => !continuousStatus.value.enabled || loadingContinuousStatus.value)
+const continuousStopDisabled = computed(() => !continuousActive.value || loadingContinuousStatus.value
+  || continuousLoading.value || continuousStopping.value)
+
+function monitoringSourceLabel(families) {
+  if (families.includes('netdisk_aggregator') && families.includes('document_library')) return '网盘与文库'
+  if (families.includes('document_library')) return '文库'
+  if (families.includes('netdisk_aggregator')) return '网盘'
+  return ''
+}
+
+function isCurrentObject(id, version) {
+  return scanForm.watchlistId === id && objectVersion === version
+}
+
+function captureSingleDraft() {
+  singleDraft = { sourceFamilies: [...scanForm.sourceFamilies], fileTypes: [...scanForm.fileTypes],
+    pageLimit: scanForm.pageLimit, detailFetch: scanForm.detailFetch }
+}
+
+function syncContinuousScope() {
+  if (activeMode.value !== 'continuous' || !continuousActive.value) return
+  const status = continuousStatus.value
+  scanForm.sourceFamilies = [...continuousSourceFamilies.value]
+  scanForm.fileTypes = [...(status.file_types ?? selectedWatchlist.value?.file_types ?? [])]
+  scanForm.pageLimit = Number(status.document_library_candidate_limit
+    ?? selectedWatchlist.value?.source_policies?.document_library?.candidate_limit
+    ?? selectedWatchlist.value?.page_limit ?? defaultPageLimit(scanForm.sourceFamilies))
+  scanForm.detailFetch = Boolean(status.detail_fetch
+    ?? selectedWatchlist.value?.source_policies?.document_library?.detail_fetch
+    ?? selectedWatchlist.value?.detail_fetch ?? true)
+}
+
+function applyContinuousStatus(payload) {
+  continuousStatus.value = { ...initialContinuousStatus, ...payload }
+  continuousStatusLoaded.value = true
+  continuousError.value = ''
+  if (payload.interval_seconds) continuousIntervalHours.value = Number(payload.interval_seconds) / 3600
+  syncContinuousScope()
+}
 
 function formatDateTime(value) {
   return formatShanghaiDateTime(value)
@@ -290,29 +356,35 @@ async function loadWatchlists() {
 
 async function loadScans() {
   const targetId = scanForm.watchlistId
+  const version = objectVersion
+  if (!targetId) return
   loadingScans.value = true
   try {
     const rows = await api.loadScans({ limit: 50, watchlistId: targetId || undefined })
-    if (scanForm.watchlistId === targetId) scanRuns.value = rows
+    if (isCurrentObject(targetId, version)) scanRuns.value = rows
   } catch (error) {
-    ElMessage.error(error.message || '加载扫描历史失败')
+    if (isCurrentObject(targetId, version)) ElMessage.error(error.message || '加载扫描历史失败')
   } finally {
-    if (scanForm.watchlistId === targetId) loadingScans.value = false
+    if (isCurrentObject(targetId, version)) loadingScans.value = false
   }
 }
 
 async function loadContinuousStatus() {
   const targetId = scanForm.watchlistId
+  const version = objectVersion
+  if (!targetId || continuousLoading.value || loadingContinuousStatus.value) return
   loadingContinuousStatus.value = true
   try {
-    const payload = await api.loadNetdiskContinuousStatus({ watchlistId: targetId || undefined })
-    if (scanForm.watchlistId !== targetId) return
-    continuousStatus.value = payload
-    if (payload.interval_seconds) continuousIntervalHours.value = Number(payload.interval_seconds) / 3600
+    const payload = await api.loadContinuousStatus({ watchlistId: targetId })
+    if (!isCurrentObject(targetId, version)) return
+    applyContinuousStatus(payload)
   } catch (error) {
-    ElMessage.error(error.message || '加载网盘长期扫描状态失败')
+    if (isCurrentObject(targetId, version)) {
+      continuousStatusLoaded.value = false
+      continuousError.value = error.message || '加载持续监测状态失败'
+    }
   } finally {
-    if (scanForm.watchlistId === targetId) loadingContinuousStatus.value = false
+    if (isCurrentObject(targetId, version)) loadingContinuousStatus.value = false
   }
 }
 
@@ -322,6 +394,8 @@ async function runScan() {
     return
   }
   scanLoading.value = true
+  const targetId = scanForm.watchlistId
+  const version = objectVersion
   lastRunMessage.value = ''
   lastRunErrors.value = []
   try {
@@ -333,39 +407,56 @@ async function runScan() {
     if (hasLibrarySource.value) {
       requestPayload.document_library_candidate_limit = scanForm.pageLimit
     }
-    const payload = await api.runScan(scanForm.watchlistId, requestPayload)
+    const payload = await api.runScan(targetId, requestPayload)
+    if (!isCurrentObject(targetId, version)) return
     lastRunMessage.value = `扫描完成 · 候选 ${payload.candidates || 0} · 命中 ${payload.hits || 0}`
     lastRunErrors.value = payload.errors || []
     await loadScans()
     ElMessage.success('扫描任务已执行')
   } catch (error) {
-    ElMessage.error(error.message || '执行扫描失败')
+    if (isCurrentObject(targetId, version)) ElMessage.error(error.message || '执行扫描失败')
   } finally {
-    scanLoading.value = false
+    if (isCurrentObject(targetId, version)) scanLoading.value = false
   }
 }
 
-async function startContinuousScan() {
+async function startContinuousScan(intervalHours = continuousIntervalHours.value) {
   if (!scanForm.watchlistId) {
     ElMessage.error('请先选择监测对象')
     return
   }
-  if (!canSchedule.value) {
-    ElMessage.error('请先为当前对象配置网盘来源和检索词')
+  if (continuousLoading.value || loadingContinuousStatus.value || !continuousStatusLoaded.value || continuousStopping.value) return
+  if (!continuousStatus.value.enabled && !canSchedule.value) {
+    ElMessage.error(readyLabel.value)
     return
   }
   continuousLoading.value = true
+  const targetId = scanForm.watchlistId
+  const version = objectVersion
+  const scope = continuousStatus.value.enabled ? {
+    source_families: [...(continuousStatus.value.source_families || [])],
+    file_types: continuousStatus.value.file_types == null ? null : [...continuousStatus.value.file_types],
+    detail_fetch: continuousStatus.value.detail_fetch,
+    document_library_candidate_limit: continuousStatus.value.document_library_candidate_limit,
+  } : {
+    source_families: [...scanForm.sourceFamilies], file_types: [...scanForm.fileTypes],
+    detail_fetch: hasLibrarySource.value && scanForm.detailFetch,
+    document_library_candidate_limit: scanForm.pageLimit,
+  }
   try {
-    const payload = await api.startNetdiskContinuous({
-      interval_seconds: Number(continuousIntervalHours.value || 1) * 3600,
-      watchlist_id: scanForm.watchlistId,
+    const payload = await api.startContinuous({
+      ...scope, interval_seconds: Number(intervalHours || 1) * 3600, watchlist_id: targetId,
     })
-    continuousStatus.value = payload
-    ElMessage.success(payload.message || '已开启网盘长期扫描')
+    if (!isCurrentObject(targetId, version)) return
+    applyContinuousStatus(payload)
+    ElMessage.success(payload.message || '持续监测已启用')
   } catch (error) {
-    ElMessage.error(error.message || '开启网盘长期扫描失败')
+    if (isCurrentObject(targetId, version)) {
+      continuousError.value = error.message || '开启持续监测失败'
+      ElMessage.error(continuousError.value)
+    }
   } finally {
-    continuousLoading.value = false
+    if (isCurrentObject(targetId, version)) continuousLoading.value = false
   }
 }
 
@@ -374,26 +465,40 @@ async function stopContinuousScan() {
     ElMessage.error('请先选择监测对象')
     return
   }
+  if (continuousLoading.value || loadingContinuousStatus.value || continuousStopping.value) return
   continuousLoading.value = true
+  const targetId = scanForm.watchlistId
+  const version = objectVersion
   try {
-    const payload = await api.stopNetdiskContinuous({
-      watchlist_id: scanForm.watchlistId,
-    })
-    continuousStatus.value = payload
-    ElMessage.success(payload.message || '已停止网盘长期扫描')
+    const payload = await api.stopContinuous({ watchlist_id: targetId })
+    if (!isCurrentObject(targetId, version)) return
+    applyContinuousStatus(payload)
+    ElMessage.success(payload.message || (continuousStopping.value ? '持续监测停止中' : '持续监测已停止'))
   } catch (error) {
-    ElMessage.error(error.message || '停止网盘长期扫描失败')
+    if (isCurrentObject(targetId, version)) {
+      continuousError.value = error.message || '停止持续监测失败'
+      ElMessage.error(continuousError.value)
+    }
   } finally {
-    continuousLoading.value = false
+    if (isCurrentObject(targetId, version)) continuousLoading.value = false
   }
 }
 
 watch(
   () => scanForm.watchlistId,
   async (watchlistId) => {
+    objectVersion++
+    continuousStatus.value = { ...initialContinuousStatus }
+    continuousStatusLoaded.value = false
+    continuousLoading.value = false
+    loadingContinuousStatus.value = false
+    continuousIntervalHours.value = 1
+    continuousError.value = ''
+    singleDraft = null
     if (!watchlistId) return
     const target = watchlists.value.find((item) => item.id === watchlistId)
     if (target) applyWatchlist(target)
+    if (activeMode.value === 'continuous') captureSingleDraft()
     dateRange.value = null
     lastRunMessage.value = ''
     lastRunErrors.value = []
@@ -402,6 +507,17 @@ watch(
     await Promise.all([loadScans(), loadContinuousStatus()])
   }
 )
+
+watch(activeMode, (mode) => {
+  if (mode === 'continuous') {
+    captureSingleDraft()
+    syncContinuousScope()
+  }
+  else if (singleDraft) {
+    Object.assign(scanForm, singleDraft)
+    singleDraft = null
+  }
+})
 
 onMounted(async () => {
   headerReady.value = true
@@ -414,6 +530,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  objectVersion++
   if (continuousTimer) {
     window.clearInterval(continuousTimer)
     continuousTimer = null

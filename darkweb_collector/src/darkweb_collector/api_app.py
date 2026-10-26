@@ -6,6 +6,7 @@ import os
 import secrets
 import time
 from pathlib import Path
+from typing import Literal
 from threading import Lock, Thread
 
 from fastapi import FastAPI, Query
@@ -63,17 +64,20 @@ from darkweb_collector.api_actions import (
     dispatch_run_vulnerability_sync_once,
     get_code_monitoring_continuous_status,
     get_continuous_dispatch_status,
+    get_document_exposure_monitoring_continuous_status,
     get_netdisk_monitoring_continuous_status,
     probe_site_connectivity,
     get_ransomware_sync_status,
     get_vulnerability_sync_status,
     start_code_monitoring_dispatch,
+    start_document_exposure_monitoring_dispatch,
     start_netdisk_monitoring_dispatch,
     start_ransomware_sync_dispatch,
     start_site_connectivity_monitor,
     start_continuous_dispatch,
     start_vulnerability_sync_dispatch,
     stop_code_monitoring_dispatch,
+    stop_document_exposure_monitoring_dispatch,
     stop_netdisk_monitoring_dispatch,
     stop_ransomware_sync_dispatch,
     stop_continuous_dispatch,
@@ -1050,6 +1054,19 @@ class DocumentExposureReviewRequest(BaseModel):
     note: str = ""
 
 
+class DocumentExposureMonitoringContinuousStartRequest(BaseModel):
+    interval_seconds: int = Field(default=3600, gt=0)
+    watchlist_id: int = Field(..., gt=0)
+    source_families: list[Literal["netdisk_aggregator", "document_library"]] | None = Field(default=None, min_length=1)
+    file_types: list[str] | None = Field(default=None, min_length=1)
+    detail_fetch: bool | None = None
+    document_library_candidate_limit: int | None = Field(default=None, ge=1, le=200)
+
+
+class DocumentExposureMonitoringContinuousStopRequest(BaseModel):
+    watchlist_id: int = Field(..., gt=0)
+
+
 class NetdiskMonitoringContinuousStartRequest(BaseModel):
     interval_seconds: int = 3600
     watchlist_id: int = Field(..., gt=0)
@@ -1685,6 +1702,34 @@ def netdisk_source_health(source_family: str | None = None) -> list[dict]:
 @app.post("/api/document-exposures/netdisk/source-states/reset")
 def netdisk_source_states_reset(payload: NetdiskSourceStateResetRequest) -> dict:
     return reset_netdisk_source_states_payload(payload.model_dump())
+
+
+@app.get("/api/document-exposures/continuous-status")
+def document_exposure_monitoring_continuous_status(watchlist_id: int | None = Query(default=None, gt=0)) -> dict:
+    return get_document_exposure_monitoring_continuous_status(watchlist_id=watchlist_id)
+
+
+@app.post("/api/document-exposures/continuous/start")
+def document_exposure_monitoring_continuous_start(payload: DocumentExposureMonitoringContinuousStartRequest) -> dict:
+    try:
+        return start_document_exposure_monitoring_dispatch(
+            interval_seconds=payload.interval_seconds,
+            watchlist_id=payload.watchlist_id,
+            source_families=payload.source_families,
+            file_types=payload.file_types,
+            detail_fetch=payload.detail_fetch,
+            document_library_candidate_limit=payload.document_library_candidate_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/document-exposures/continuous/stop")
+def document_exposure_monitoring_continuous_stop(payload: DocumentExposureMonitoringContinuousStopRequest) -> dict:
+    try:
+        return stop_document_exposure_monitoring_dispatch(watchlist_id=payload.watchlist_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/document-exposures/netdisk/continuous-status")

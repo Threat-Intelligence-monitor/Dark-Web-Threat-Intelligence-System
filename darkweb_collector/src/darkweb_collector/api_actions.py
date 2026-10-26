@@ -22,7 +22,12 @@ from darkweb_collector.db import (
     get_site_connectivity_probe_map,
     upsert_site_connectivity_probe,
 )
-from darkweb_collector.document_exposure import list_watchlists_payload, scan_watchlist_once
+from darkweb_collector.document_exposure import (
+    SUPPORTED_SOURCE_FAMILIES,
+    _watchlist_metadata as _exposure_watchlist_metadata,
+    list_watchlists_payload,
+    scan_watchlist_once,
+)
 from darkweb_collector.changan_auto_login import changan_auto_login_available
 from darkweb_collector.job_diagnostics import consecutive_failures, failure_cooldown_until
 from darkweb_collector.orchestrator import dispatch_seed_job, is_site_due
@@ -1303,6 +1308,12 @@ def _netdisk_monitoring_task_snapshot(
     return {
         "enabled": bool(enabled),
         "running": bool(running),
+        "stopping": False,
+        "source_families": ["netdisk_aggregator"],
+        "file_types": None,
+        "detail_fetch": None,
+        "document_library_candidate_limit": None,
+        "running_source_families": [],
         "started_at": started_at,
         "last_tick_at": last_tick_at,
         "last_success_at": last_success_at,
@@ -1315,6 +1326,7 @@ def _netdisk_monitoring_task_snapshot(
         "target_watchlist_id": int(watchlist_id or 0),
         "target_watchlist_name": watchlist_name,
         "stop_event": stop_event,
+        "wake_event": None,
         "thread": thread,
     }
 
@@ -1323,19 +1335,27 @@ def _active_netdisk_monitoring_task_count() -> int:
     return sum(
         1
         for task in _netdisk_monitoring_tasks.values()
-        if bool(task.get("enabled")) and bool(task.get("thread")) and task["thread"].is_alive()
+        if bool(task.get("thread")) and task["thread"].is_alive()
     )
 
 
 def _netdisk_monitoring_task_status_payload(watchlist_id: int, task: dict[str, Any] | None = None) -> dict[str, Any]:
-    task = task or _netdisk_monitoring_tasks.get(int(watchlist_id or 0)) or _netdisk_monitoring_task_snapshot(
-        int(watchlist_id or 0),
-        watchlist_name=_resolve_netdisk_monitoring_watchlist_name(int(watchlist_id or 0)),
-    )
+    task = task or _netdisk_monitoring_tasks.get(int(watchlist_id or 0))
+    if task is None:
+        task = _netdisk_monitoring_task_snapshot(
+            int(watchlist_id or 0), watchlist_name=_resolve_netdisk_monitoring_watchlist_name(int(watchlist_id or 0)),
+        )
+        task["source_families"] = []
     thread_alive = bool(task.get("thread") and task["thread"].is_alive())
     return {
         "enabled": bool(task.get("enabled") and thread_alive),
         "running": bool(task.get("running")),
+        "stopping": bool(task.get("stopping") and thread_alive),
+        "source_families": list(task.get("source_families") or []),
+        "file_types": list(task["file_types"]) if task.get("file_types") is not None else None,
+        "detail_fetch": task.get("detail_fetch"),
+        "document_library_candidate_limit": task.get("document_library_candidate_limit"),
+        "running_source_families": list(task.get("running_source_families") or []),
         "started_at": str(task.get("started_at") or ""),
         "last_tick_at": str(task.get("last_tick_at") or ""),
         "last_success_at": str(task.get("last_success_at") or ""),
@@ -1351,26 +1371,69 @@ def _netdisk_monitoring_task_status_payload(watchlist_id: int, task: dict[str, A
     }
 
 
+def _document_exposure_monitoring_watchlist(watchlist_id: int, source_families=None):
+    watchlist = next((item for item in list_watchlists_payload() if int(item.get("id") or 0) == watchlist_id), None)
+    if watchlist is None or not watchlist.get("enabled"):
+        raise ValueError(f"monitoring object not found or disabled: {watchlist_id}")
+    metadata = _exposure_watchlist_metadata(watchlist)
+    saved_sources = metadata.get("source_families", _netdisk_watchlist_source_families(watchlist))
+    configured = [value for value in saved_sources if isinstance(value, str) and value in SUPPORTED_SOURCE_FAMILIES] if isinstance(saved_sources, list) else []
+    selected = configured if source_families is None else source_families
+    if not isinstance(selected, list) or not selected or any(not isinstance(value, str) or value not in SUPPORTED_SOURCE_FAMILIES for value in selected):
+        raise ValueError("source_families must select supported document monitoring sources")
+    selected = list(dict.fromkeys(selected))
+    if any(value not in configured for value in selected):
+        raise ValueError("selected monitoring source is not enabled for this object")
+    if not any(isinstance(term, dict) and term.get("enabled", True) and str(term.get("term") or "").strip()
+               for term in watchlist.get("derived_terms") or []):
+        raise ValueError("monitoring object has no effective enterprise search terms")
+    return watchlist, selected
+
+
+def _run_document_exposure_monitoring_tick(watchlist_id: int, *, task=None, scan_options=None):
+    with _netdisk_monitoring_lock:
+        current = _netdisk_monitoring_tasks.get(watchlist_id)
+        if task is not None and (current is not task or not task.get("enabled") or task["stop_event"].is_set()):
+            return None
+        if current is not None and (current.get("running") or current.get("stopping")):
+            return None
+        task = current or _netdisk_monitoring_task_snapshot(watchlist_id)
+        _netdisk_monitoring_tasks[watchlist_id] = task
+        options = dict(scan_options) if scan_options is not None else {
+            key: task.get(key) for key in ("source_families", "file_types", "detail_fetch", "document_library_candidate_limit")
+        }
+        options["source_families"] = list(options["source_families"])
+        if options.get("file_types") is not None:
+            options["file_types"] = list(options["file_types"])
+        task.update(running=True, running_source_families=list(options["source_families"]),
+                    last_tick_at=utc_now_iso(), last_error="")
+    try:
+        watchlist, _ = _document_exposure_monitoring_watchlist(watchlist_id, options["source_families"])
+        result = scan_watchlist_once(watchlist_id, **options)
+        errors = list(result.get("errors") or [])
+        with _netdisk_monitoring_lock:
+            if _netdisk_monitoring_tasks.get(watchlist_id) is task:
+                task.update(target_watchlist_name=str(watchlist.get("name") or ""),
+                            watchlist_count=1, candidate_count=int(result.get("candidates") or 0),
+                            hit_count=int(result.get("hits") or 0), error_count=len(errors),
+                            last_error="；".join(str(value) for value in errors[:3]), last_success_at=utc_now_iso())
+        return result
+    except Exception as exc:
+        with _netdisk_monitoring_lock:
+            if _netdisk_monitoring_tasks.get(watchlist_id) is task:
+                task.update(last_error=str(exc), watchlist_count=0, candidate_count=0, hit_count=0, error_count=1)
+        raise
+    finally:
+        with _netdisk_monitoring_lock:
+            if _netdisk_monitoring_tasks.get(watchlist_id) is task:
+                task.update(running=False, running_source_families=[])
+
+
 def _run_netdisk_monitoring_once_for_watchlist(watchlist_id: int | None) -> dict[str, Any]:
     global _netdisk_monitoring_once_running
     selected_watchlist_id = int(watchlist_id or 0)
-    tick_at = utc_now_iso()
     with _netdisk_monitoring_lock:
-        if selected_watchlist_id > 0:
-            existing_task = _netdisk_monitoring_tasks.get(selected_watchlist_id)
-            _netdisk_monitoring_tasks[selected_watchlist_id] = {
-                **(
-                    existing_task
-                    or _netdisk_monitoring_task_snapshot(
-                        selected_watchlist_id,
-                        watchlist_name=_resolve_netdisk_monitoring_watchlist_name(selected_watchlist_id),
-                    )
-                ),
-                "running": True,
-                "last_tick_at": tick_at,
-                "last_error": "",
-            }
-        else:
+        if not selected_watchlist_id:
             _netdisk_monitoring_once_running = True
     try:
         watchlists = _enabled_netdisk_monitoring_watchlists()
@@ -1388,10 +1451,11 @@ def _run_netdisk_monitoring_once_for_watchlist(watchlist_id: int | None) -> dict
         }
         for watchlist in watchlists:
             try:
-                result = scan_watchlist_once(
-                    int(watchlist["id"]),
-                    source_families=["netdisk_aggregator"],
+                result = _run_document_exposure_monitoring_tick(
+                    int(watchlist["id"]), scan_options={"source_families": ["netdisk_aggregator"]},
                 )
+                if result is None:
+                    continue
                 errors = list(result.get("errors") or [])
                 aggregate["candidate_count"] += int(result.get("candidates") or 0)
                 aggregate["hit_count"] += int(result.get("hits") or 0)
@@ -1401,42 +1465,10 @@ def _run_netdisk_monitoring_once_for_watchlist(watchlist_id: int | None) -> dict
             except Exception as exc:
                 aggregate["error_count"] += 1
                 aggregate["errors"].append(f"watchlist:{watchlist.get('id')}:{exc}")
-        last_error = "；".join(str(item) for item in aggregate["errors"][:3])
-        with _netdisk_monitoring_lock:
-            if selected_watchlist_id > 0:
-                existing_task = _netdisk_monitoring_tasks.get(selected_watchlist_id) or _netdisk_monitoring_task_snapshot(
-                    selected_watchlist_id,
-                    watchlist_name=_resolve_netdisk_monitoring_watchlist_name(selected_watchlist_id),
-                )
-                _netdisk_monitoring_tasks[selected_watchlist_id] = {
-                    **existing_task,
-                    "last_success_at": utc_now_iso(),
-                    "last_error": last_error,
-                    "watchlist_count": aggregate["watchlist_count"],
-                    "candidate_count": aggregate["candidate_count"],
-                    "hit_count": aggregate["hit_count"],
-                    "error_count": aggregate["error_count"],
-                }
         return aggregate
-    except Exception as exc:
-        with _netdisk_monitoring_lock:
-            if selected_watchlist_id > 0:
-                existing_task = _netdisk_monitoring_tasks.get(selected_watchlist_id) or _netdisk_monitoring_task_snapshot(
-                    selected_watchlist_id,
-                    watchlist_name=_resolve_netdisk_monitoring_watchlist_name(selected_watchlist_id),
-                )
-                _netdisk_monitoring_tasks[selected_watchlist_id] = {
-                    **existing_task,
-                    "last_error": str(exc),
-                }
-        raise
     finally:
         with _netdisk_monitoring_lock:
-            if selected_watchlist_id > 0:
-                existing_task = _netdisk_monitoring_tasks.get(selected_watchlist_id)
-                if existing_task is not None:
-                    _netdisk_monitoring_tasks[selected_watchlist_id] = {**existing_task, "running": False}
-            else:
+            if not selected_watchlist_id:
                 _netdisk_monitoring_once_running = False
 
 
@@ -1468,56 +1500,88 @@ def dispatch_run_netdisk_monitoring_once() -> dict[str, Any]:
 
 
 def _netdisk_monitoring_loop(watchlist_id: int, stop_event: Event) -> None:
-    while not stop_event.is_set():
-        loop_started_at = time.monotonic()
-        try:
-            _run_netdisk_monitoring_once_for_watchlist(watchlist_id)
-        except Exception:
-            pass
-        with _netdisk_monitoring_lock:
-            task = _netdisk_monitoring_tasks.get(watchlist_id) or {}
-            interval_seconds = int(task.get("interval_seconds") or DEFAULT_NETDISK_MONITORING_INTERVAL_SECONDS)
-        if stop_event.wait(_remaining_interval_seconds(interval_seconds, loop_started_at)):
-            break
     with _netdisk_monitoring_lock:
         task = _netdisk_monitoring_tasks.get(watchlist_id)
-        if task is not None:
-            _netdisk_monitoring_tasks[watchlist_id] = {**task, "enabled": False, "running": False, "stop_event": None}
+        if task is None or task.get("stop_event") is not stop_event:
+            return
+        wake_event = task["wake_event"]
+    try:
+        while not stop_event.is_set():
+            loop_started_at = time.monotonic()
+            try:
+                _run_document_exposure_monitoring_tick(watchlist_id, task=task)
+            except Exception:
+                pass
+            while not stop_event.is_set():
+                with _netdisk_monitoring_lock:
+                    if _netdisk_monitoring_tasks.get(watchlist_id) is not task:
+                        return
+                    wake_event.clear()
+                    interval_seconds = task["interval_seconds"]
+                remaining = _remaining_interval_seconds(interval_seconds, loop_started_at)
+                if stop_event.is_set() or remaining <= 0:
+                    break
+                wake_event.wait(remaining)
+    finally:
+        with _netdisk_monitoring_lock:
+            if _netdisk_monitoring_tasks.get(watchlist_id) is task:
+                task.update(enabled=False, running=False, stopping=False, running_source_families=[],
+                            stop_event=None, wake_event=None)
 
 
-def start_netdisk_monitoring_dispatch(
+def start_document_exposure_monitoring_dispatch(
     interval_seconds: int = DEFAULT_NETDISK_MONITORING_INTERVAL_SECONDS,
     *,
     watchlist_id: int | None = None,
+    source_families: list[str] | None = None,
+    file_types: list[str] | None = None,
+    detail_fetch: bool | None = None,
+    document_library_candidate_limit: int | None = None,
 ) -> dict[str, Any]:
-    if interval_seconds <= 0:
-        interval_seconds = DEFAULT_NETDISK_MONITORING_INTERVAL_SECONDS
+    if isinstance(interval_seconds, bool) or not isinstance(interval_seconds, int) or interval_seconds <= 0:
+        raise ValueError("interval_seconds must be a positive integer")
     selected_watchlist_id = int(watchlist_id or 0)
     if selected_watchlist_id <= 0:
-        raise ValueError("watchlist_id is required for netdisk monitoring continuous scan")
-    enabled_watchlists = _enabled_netdisk_monitoring_watchlists()
-    target_watchlist = next((item for item in enabled_watchlists if int(item.get("id") or 0) == selected_watchlist_id), None)
-    if target_watchlist is None:
-        raise ValueError(f"watchlist not found, disabled, or not netdisk enabled: {selected_watchlist_id}")
+        raise ValueError("watchlist_id is required for document monitoring continuous scan")
+    if file_types is not None:
+        if not isinstance(file_types, list) or not file_types or any(not isinstance(value, str) or not value.strip().lstrip(".") for value in file_types):
+            raise ValueError("file_types must be a non-empty list when provided")
+        file_types = list(dict.fromkeys(value.strip().lower().lstrip(".") for value in file_types))
+    if detail_fetch is not None and not isinstance(detail_fetch, bool):
+        raise ValueError("detail_fetch must be a boolean when provided")
+    if document_library_candidate_limit is not None and (
+        isinstance(document_library_candidate_limit, bool) or not isinstance(document_library_candidate_limit, int)
+        or not 1 <= document_library_candidate_limit <= 200
+    ):
+        raise ValueError("document_library_candidate_limit must be between 1 and 200")
+    target_watchlist, source_families = _document_exposure_monitoring_watchlist(selected_watchlist_id, source_families)
     target_watchlist_name = str(target_watchlist.get("name") or "")
+    options = {"source_families": list(source_families), "file_types": file_types,
+               "detail_fetch": detail_fetch, "document_library_candidate_limit": document_library_candidate_limit}
     with _netdisk_monitoring_lock:
         existing_task = _netdisk_monitoring_tasks.get(selected_watchlist_id)
-        if existing_task and bool(existing_task.get("enabled")) and bool(existing_task.get("thread")) and existing_task["thread"].is_alive():
-            _netdisk_monitoring_tasks[selected_watchlist_id] = {
-                **existing_task,
-                "interval_seconds": interval_seconds,
-                "target_watchlist_name": target_watchlist_name,
-            }
+        if existing_task and existing_task.get("thread") and existing_task["thread"].is_alive():
+            if not existing_task.get("enabled") or existing_task.get("stopping"):
+                raise ValueError("previous document monitoring task is still stopping")
+            existing_task.update(**options, interval_seconds=interval_seconds, target_watchlist_name=target_watchlist_name)
+            existing_task["wake_event"].set()
             return {
                 **_netdisk_monitoring_task_status_payload(selected_watchlist_id),
-                "message": "该监测对象的网盘长期任务已在运行",
+                "message": "已更新该监测对象的长期扫描配置，当前轮次结束后使用新范围",
             }
+        if existing_task and existing_task.get("running"):
+            raise ValueError("previous document monitoring scan is still running")
         stop_event = Event()
-        thread = Thread(target=_netdisk_monitoring_loop, args=(selected_watchlist_id, stop_event), daemon=True)
-        _netdisk_monitoring_tasks[selected_watchlist_id] = {
+        wake_event = Event()
+        thread = Thread(target=_netdisk_monitoring_loop, args=(selected_watchlist_id, stop_event), daemon=True,
+                        name=f"document-exposure-{selected_watchlist_id}")
+        task = {
             **(existing_task or _netdisk_monitoring_task_snapshot(selected_watchlist_id, watchlist_name=target_watchlist_name)),
+            **options,
             "enabled": True,
             "running": False,
+            "stopping": False,
+            "running_source_families": [],
             "started_at": utc_now_iso(),
             "last_tick_at": "",
             "last_error": "",
@@ -1525,42 +1589,47 @@ def start_netdisk_monitoring_dispatch(
             "target_watchlist_id": selected_watchlist_id,
             "target_watchlist_name": target_watchlist_name,
             "stop_event": stop_event,
+            "wake_event": wake_event,
             "thread": thread,
         }
-        thread.start()
+        _netdisk_monitoring_tasks[selected_watchlist_id] = task
+        try:
+            thread.start()
+        except Exception:
+            task.update(enabled=False, stopping=False, thread=None, stop_event=None, wake_event=None)
+            raise
         payload = _netdisk_monitoring_task_status_payload(selected_watchlist_id)
     return {
         **payload,
-        "message": "已开启该监测对象的网盘长期后台扫描",
+        "message": "已开启该监测对象的文档长期后台扫描",
     }
 
 
-def stop_netdisk_monitoring_dispatch(*, watchlist_id: int | None = None) -> dict[str, Any]:
+def stop_document_exposure_monitoring_dispatch(*, watchlist_id: int | None = None) -> dict[str, Any]:
     selected_watchlist_id = int(watchlist_id or 0)
     if selected_watchlist_id <= 0:
-        raise ValueError("watchlist_id is required for netdisk monitoring continuous stop")
+        raise ValueError("watchlist_id is required for document monitoring continuous stop")
     with _netdisk_monitoring_lock:
         existing_task = _netdisk_monitoring_tasks.get(selected_watchlist_id)
-        if existing_task is None or not bool(existing_task.get("enabled")) or existing_task.get("stop_event") is None:
+        if existing_task is None or existing_task.get("stop_event") is None:
             return {
                 **_netdisk_monitoring_task_status_payload(selected_watchlist_id),
-                "message": "该监测对象的网盘长期任务当前未运行",
+                "message": "该监测对象的长期任务当前未运行",
             }
         stop_event = existing_task.get("stop_event")
         if stop_event is not None:
             stop_event.set()
-        _netdisk_monitoring_tasks[selected_watchlist_id] = {
-            **existing_task,
-            "enabled": False,
-        }
+        existing_task.update(enabled=False, stopping=bool(existing_task.get("thread") and existing_task["thread"].is_alive()))
+        if existing_task.get("wake_event") is not None:
+            existing_task["wake_event"].set()
         payload = _netdisk_monitoring_task_status_payload(selected_watchlist_id)
     return {
         **payload,
-        "message": "已停止该监测对象的网盘长期后台扫描",
+        "message": "已停止后续扫描，当前轮次完成后退出",
     }
 
 
-def get_netdisk_monitoring_continuous_status(*, watchlist_id: int | None = None) -> dict[str, Any]:
+def get_document_exposure_monitoring_continuous_status(*, watchlist_id: int | None = None) -> dict[str, Any]:
     selected_watchlist_id = int(watchlist_id or 0)
     if selected_watchlist_id > 0:
         with _netdisk_monitoring_lock:
@@ -1569,14 +1638,32 @@ def get_netdisk_monitoring_continuous_status(*, watchlist_id: int | None = None)
     with _netdisk_monitoring_lock:
         active_tasks = [
             task for task in _netdisk_monitoring_tasks.values()
-            if bool(task.get("enabled")) and bool(task.get("thread")) and task["thread"].is_alive()
+            if bool(task.get("thread")) and task["thread"].is_alive()
         ]
         if active_tasks:
             task = sorted(active_tasks, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
             payload = _netdisk_monitoring_task_status_payload(int(task.get("target_watchlist_id") or 0), task)
             payload["target_watchlist_name"] = task.get("target_watchlist_name") or "多个监测对象"
             return payload
-    return _netdisk_monitoring_task_status_payload(0)
+        return _netdisk_monitoring_task_status_payload(0)
+
+
+def start_netdisk_monitoring_dispatch(
+    interval_seconds: int = DEFAULT_NETDISK_MONITORING_INTERVAL_SECONDS,
+    *, watchlist_id: int | None = None,
+) -> dict[str, Any]:
+    return start_document_exposure_monitoring_dispatch(
+        interval_seconds if interval_seconds > 0 else DEFAULT_NETDISK_MONITORING_INTERVAL_SECONDS,
+        watchlist_id=watchlist_id, source_families=["netdisk_aggregator"],
+    )
+
+
+def stop_netdisk_monitoring_dispatch(*, watchlist_id: int | None = None) -> dict[str, Any]:
+    return stop_document_exposure_monitoring_dispatch(watchlist_id=watchlist_id)
+
+
+def get_netdisk_monitoring_continuous_status(*, watchlist_id: int | None = None) -> dict[str, Any]:
+    return get_document_exposure_monitoring_continuous_status(watchlist_id=watchlist_id)
 
 
 def update_site_enabled(site_name: str, enabled: bool) -> dict[str, Any]:
