@@ -2051,9 +2051,13 @@ export function initializePrototype() {
 
     function documentWatchlistFor(codeWatchlist) {
       if (!codeWatchlist) return null
-      return documentConfigState.watchlists.find((item) =>
-        item.organization_name && item.organization_name === codeWatchlist.organization_name,
-      ) || documentConfigState.watchlists.find((item) => item.name === codeWatchlist.name) || null
+      const linked = documentConfigState.watchlists.filter((item) => item.code_watchlist_id != null
+        && String(item.code_watchlist_id) === String(codeWatchlist.id))
+      if (linked.length) return linked.length === 1 ? linked[0] : null
+      const legacy = documentConfigState.watchlists.filter((item) => item.code_watchlist_id == null)
+      const exact = legacy.filter((item) => item.name && item.name === codeWatchlist.name
+        && item.organization_name && item.organization_name === codeWatchlist.organization_name)
+      return exact.length === 1 ? exact[0] : null
     }
 
     function applyDocumentWatchlist(item = null) {
@@ -3234,16 +3238,21 @@ export function initializePrototype() {
         return void runAction(button, saveWatchlistNotificationProfile, '当前对象情报监控关键词已保存')
       }
       if (codeAction === 'watchlist-save') return void runAction(button, async () => {
-        const saved = await request('/api/code-monitoring/watchlists', { method: 'POST', body: JSON.stringify(codeWatchlistPayload()) })
+        const codePayload = codeWatchlistPayload()
+        const documentPayload = documentWatchlistPayload()
+        const saved = await request('/api/code-monitoring/watchlists', { method: 'POST', body: JSON.stringify(codePayload) })
         if (saved) {
           const currentIndex = codeConfigState.watchlists.findIndex((item) => String(item.id) === String(saved.id))
           if (currentIndex >= 0) codeConfigState.watchlists.splice(currentIndex, 1, saved)
           else codeConfigState.watchlists.push(saved)
-          applyCodeWatchlist(saved)
+          codeConfigState.selectedWatchlistId = saved.id
+          documentPayload.code_watchlist_id = saved.id
+          fillWatchlistSelectors()
+          syncObjectScopedControls()
         }
         let savedDocument
         try {
-          savedDocument = await request('/api/exposure-watchlists', { method: 'POST', body: JSON.stringify(documentWatchlistPayload()) })
+          savedDocument = await request('/api/exposure-watchlists', { method: 'POST', body: JSON.stringify(documentPayload) })
         } catch (error) {
           throw new Error(`代码配置已保存，暴露策略保存失败，可直接重试：${error.message}`)
         }
@@ -3252,7 +3261,7 @@ export function initializePrototype() {
           if (documentIndex >= 0) documentConfigState.watchlists.splice(documentIndex, 1, savedDocument)
           else documentConfigState.watchlists.push(savedDocument)
           documentConfigState.selectedWatchlistId = savedDocument.id
-          applyDocumentWatchlist(savedDocument)
+          applyCodeWatchlist(saved)
         }
       }, '监测对象与暴露监测配置已保存')
       if (codeAction === 'watchlist-delete') {

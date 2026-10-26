@@ -992,6 +992,7 @@ class ExposureWatchTermRequest(BaseModel):
 
 class ExposureWatchlistRequest(BaseModel):
     id: int | None = None
+    code_watchlist_id: int | None = Field(default=None, ge=1)
     name: str
     organization_name: str
     enabled: bool = True
@@ -1562,7 +1563,10 @@ def exposure_watchlists() -> list[dict]:
 
 @app.post("/api/exposure-watchlists")
 def save_exposure_watchlist(payload: ExposureWatchlistRequest) -> dict:
-    return save_watchlist_payload(payload.model_dump())
+    try:
+        return save_watchlist_payload(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.delete("/api/exposure-watchlists/{watchlist_id}")
@@ -1985,6 +1989,36 @@ def code_monitoring_hits_page(
             recent_hours=recent_hours,
             offset=offset,
             limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/code-monitoring/hits/export")
+def code_monitoring_hits_export(
+    query: str = "",
+    watchlist_id: int | None = None,
+    platform: str = "",
+    severity: str = "",
+    result_layer: str = "",
+    bucket: str = "all",
+    seen_after: str = "",
+    seen_before: str = "",
+    recent_hours: int | None = None,
+) -> dict:
+    try:
+        return search_code_hits_page(
+            query=query,
+            watchlist_id=watchlist_id,
+            platform=platform,
+            severity=severity,
+            result_layer=result_layer,
+            bucket=bucket,
+            seen_after=seen_after,
+            seen_before=seen_before,
+            recent_hours=recent_hours,
+            offset=0,
+            limit=None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

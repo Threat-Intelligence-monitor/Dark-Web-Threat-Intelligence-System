@@ -62,7 +62,7 @@
             </section>
 
             <section class="object-config-section" data-od-id="code-enterprise-profile">
-              <div class="object-section-head"><div class="settings-heading"><span class="settings-section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/><circle cx="12" cy="12" r="9"/></svg></span><div><h2>企业画像</h2><p>名称锚点、技术锚点与误报控制均随当前对象保存</p></div></div></div>
+              <div class="object-section-head"><div class="settings-heading"><span class="settings-section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/><circle cx="12" cy="12" r="9"/></svg></span><div><h2>企业画像</h2><p>自动生成网盘、文库基础检索词，随当前对象保存</p></div></div></div>
               <div class="profile-groups">
                 <section class="profile-group" data-od-id="profile-name-anchors"><div class="profile-group-head"><strong>名称锚点</strong><span>识别企业、品牌及英文别名</span></div><div class="settings-form-grid settings-form-grid-3"><label class="field"><span>企业全称</span><textarea class="textarea compact-textarea" data-code-profile="official_names" placeholder="每行一个企业全称"></textarea></label><label class="field"><span>品牌别名</span><textarea class="textarea compact-textarea" data-code-profile="brand_aliases" placeholder="每行一个品牌或历史名称"></textarea></label><label class="field"><span>英文简称</span><textarea class="textarea compact-textarea" data-code-profile="english_aliases" placeholder="每行一个英文名或缩写"></textarea></label></div></section>
                 <section class="profile-group" data-od-id="profile-technical-anchors"><div class="profile-group-head"><strong>技术锚点</strong><span>定位域名、子域名与内部系统特征</span></div><div class="settings-form-grid settings-form-grid-3"><label class="field"><span>根域名</span><textarea class="textarea compact-textarea" data-code-profile="root_domains" placeholder="例如：example.com"></textarea></label><label class="field"><span>可信子域名规则</span><textarea class="textarea compact-textarea" data-code-profile="trusted_subdomain_patterns" placeholder="例如：*.example.com"></textarea></label><label class="field"><span>内部系统关键词</span><textarea class="textarea compact-textarea" data-code-profile="internal_system_keywords" placeholder="每行一个系统或项目标识"></textarea></label></div></section>
@@ -85,12 +85,12 @@
             </section>
 
             <section class="object-config-section document-term-section" data-od-id="document-profile-terms">
-              <div class="object-section-head"><div class="settings-heading"><span class="settings-section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M5 6h14M5 12h14M5 18h8"/><circle cx="18" cy="18" r="3"/></svg></span><div><h2>画像扩展</h2><p>补充产品、项目、自定义词与敏感词；统一随当前对象保存</p></div></div><button class="btn btn-secondary" type="button" data-document-term-add>添加词条</button></div>
+              <div class="object-section-head"><div class="settings-heading"><span class="settings-section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M5 6h14M5 12h14M5 18h8"/><circle cx="18" cy="18" r="3"/></svg></span><div><h2>画像扩展</h2><p>扩展词须同时匹配当前企业名称或域名；统一随当前对象保存</p></div></div><button class="btn btn-secondary" type="button" data-document-term-add>添加词条</button></div>
               <div class="document-term-grid" role="table" aria-label="对象画像扩展词条">
                 <div class="document-term-head" role="row"><span>词条</span><span>类型</span><span>状态</span><span>操作</span></div>
                 <div id="document-term-list"></div>
               </div>
-              <div class="document-term-empty" data-document-term-empty>暂无扩展词条，保存对象前可按需添加。</div>
+              <div class="document-term-empty" data-document-term-empty>基础检索词由企业画像自动生成，可按需添加扩展词。</div>
             </section>
             </article>
           </div>
