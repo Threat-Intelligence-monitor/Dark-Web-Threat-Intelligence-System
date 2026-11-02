@@ -152,11 +152,17 @@ def claim_detail(connection, config, task, token: str, *, now=None) -> str:
     if int(active) >= config.max_concurrent_details:
         return "busy"
     process = psutil.Process()
+    reset_missing = changed and row["failure_kind"] == "not_found"
     cursor = connection.execute("""UPDATE crawl_detail_control SET source_version = ?, owner_token = ?,
-        owner_until = ?, worker_pid = ?, worker_started = ?, activity_path = ?, updated_at = ?
+        owner_until = ?, worker_pid = ?, worker_started = ?, activity_path = ?, updated_at = ?,
+        failure_count = CASE WHEN ? THEN 0 ELSE failure_count END,
+        failure_kind = CASE WHEN ? THEN '' ELSE failure_kind END,
+        next_retry = CASE WHEN ? THEN 0 ELSE next_retry END,
+        last_error = CASE WHEN ? THEN '' ELSE last_error END
         WHERE site_name = ? AND target_url = ? AND (owner_token = '' OR owner_token = ?)""",
         (version, token, timestamp + detail_timeout(config) + 60, os.getpid(), process.create_time(),
          os.environ.get("DARKWEB_WORKER_ACTIVITY_FILE", ""), timestamp,
+         reset_missing, reset_missing, reset_missing, reset_missing,
          config.site_name, task.target_url, token))
     return "claimed" if cursor.rowcount == 1 else "busy"
 
@@ -192,13 +198,16 @@ def owns_detail(connection, site_name: str, target_url: str, token: str) -> bool
 def fail_detail(connection, site_name: str, target_url: str, token: str, error: Exception, *, now=None) -> float:
     timestamp = time.time() if now is None else float(now)
     failure = classify_failure(error)
-    row = connection.execute("""SELECT failure_count FROM crawl_detail_control
+    row = connection.execute("""SELECT failure_count, failure_kind FROM crawl_detail_control
         WHERE site_name = ? AND target_url = ? AND owner_token = ?""",
         (site_name, target_url, token)).fetchone()
     if row is None:
         return 0.0
     count = int(row[0]) + 1
-    if failure.kind in {"unavailable", "restricted"}:
+    if failure.kind == "not_found":
+        count = count if row[1] == "not_found" else 1
+        delay = (3600, 21600, 86400)[min(count, 3) - 1]
+    elif failure.kind in {"unavailable", "restricted"}:
         delay = 86400
     elif failure.kind in {"auth_required", "blocked", "rate_limited"}:
         delay = 1800

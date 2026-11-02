@@ -109,6 +109,9 @@ class _ErrorTemplate(HTMLParser):
             or (tag in {"script", "iframe"} and any(marker in str(attrs.get("src") or "") for marker in (
                 "/cdn-cgi/challenge-platform/", "challenges.cloudflare.com/",
             )))
+            or (tag == "script" and bool(re.match(
+                r"^(?:https?:)?//check\.ddos-guard\.net(?:[/:?]|$)", str(attrs.get("src") or ""), re.I,
+            )))
         )
         if not parent_ignored and (not ancillary or tag == "script") and not in_post and not quoted:
             self.challenge = self.challenge or challenge
@@ -198,6 +201,8 @@ def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> 
         if (re.search(r"\b(?:browser check|browser verification|checking your browser)\b", title)
                 and re.search(r"\b(?:browser check in progress|pending verification|verifying your browser|dnsproxy antibot)\b", service_text)):
             raise CollectionFailure("blocked", "source returned a browser-verification page", scope="site", retry_after=900)
+    if not has_content and title == "ddos-guard" and "checking your browser" in service_text:
+        raise CollectionFailure("blocked", "source returned a DDoS-Guard browser-verification page", scope="site")
     if template.primary_challenge or (not has_content and (template.challenge or title in {
         "just a moment...", "checking your browser", "attention required! | cloudflare", "verify you are human",
     })):
@@ -281,9 +286,16 @@ def failure_details(error: Exception) -> dict:
 def summarize_failures(message: str, failures: list[tuple[str, Exception]]) -> CollectionFailure:
     if not failures:
         return CollectionFailure("unknown", safe_failure_text(message))
-    priority = ("retry_budget", "rate_limited", "infrastructure", "source_moved", "source_closed", "blocked", "auth_required", "restricted", "timeout", "network", "parse", "unavailable", "unknown")
+    priority = ("retry_budget", "rate_limited", "infrastructure", "source_moved", "source_closed", "blocked", "auth_required", "restricted", "unavailable", "timeout", "network", "not_found", "parse", "unknown")
     details = [(safe_failure_text(label)[:80], failure_details(error)) for label, error in failures]
-    selected = min(details, key=lambda item: (
+    candidates = details
+    last_route, last_failure = details[-1]
+    if last_failure["kind"] == "not_found" and (last_route == "browser" or last_route.startswith("browser_")):
+        # A final browser response may have cleared the earlier HTTP login or
+        # verification wall. Keep those diagnostics, without pausing the site
+        # for a gate that the browser has already passed.
+        candidates = [item for item in details if item[1]["kind"] not in {"blocked", "auth_required"}]
+    selected = min(candidates, key=lambda item: (
         priority.index(item[1]["kind"]) if item[1]["kind"] in priority else len(priority),
         item[1]["scope"] != "site", -item[1]["retry_after"],
     ))

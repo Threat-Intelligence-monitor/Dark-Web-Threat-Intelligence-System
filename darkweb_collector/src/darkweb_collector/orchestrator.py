@@ -31,7 +31,7 @@ from darkweb_collector.db import (
     reconcile_stale_crawl_jobs,
     upsert_crawl_job,
 )
-from darkweb_collector.collection_errors import CollectionFailure, classify_failure, has_detail_body, request_budget
+from darkweb_collector.collection_errors import CollectionFailure, classify_failure, has_detail_body, request_budget, safe_failure_text
 from darkweb_collector.detail_lifecycle import (
     claim_detail, complete_detail, consume_request, count_detail_writes, detail_timeout,
     fail_detail, owns_detail, reconcile_detail_owners, release_detail, reset_site_failures, site_retry_at, source_version,
@@ -392,7 +392,8 @@ def execute_detail_job(
                     upsert_crawl_job(connection, job_id=token, site_name=site_name, job_type="detail",
                                     queue_name=queue_name, target=detail_task.target_url,
                                     status="partial" if artifacts_pending else "succeeded",
-                                    finished_at=utc_now_iso(), duration_ms=int((time.perf_counter() - start_perf) * 1000))
+                                    finished_at=utc_now_iso(), duration_ms=int((time.perf_counter() - start_perf) * 1000),
+                                    error_message=safe_failure_text(detail_result.metadata.get("artifact_error") or "") if artifacts_pending else "")
                     connection.commit()
                     result.update(artifacts_pending=artifacts_pending, **counts)
             except Exception as error:

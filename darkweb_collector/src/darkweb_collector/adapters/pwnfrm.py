@@ -6,8 +6,9 @@ from urllib.parse import urlparse
 
 from darkweb_collector.adapters.base import SiteAdapter
 from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
-from darkweb_collector.adapters.pagination import collect_forum_seed
-from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
+from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
+from darkweb_collector.browser_client import fetch_html_with_browser, fetch_page_artifacts_with_browser, screenshot_html_with_browser
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, safe_failure_text
 from darkweb_collector.db import (
     get_db_connection,
     get_forum_detail_snapshot,
@@ -16,9 +17,9 @@ from darkweb_collector.db import (
     upsert_forum_topic,
 )
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
-from darkweb_collector.session_cookies import resolve_session_cookie
+from darkweb_collector.source_sessions import browser_session_options, http_session_options
 from darkweb_collector.sites.pwnfrm import parse_pwnfrm_detail, parse_pwnfrm_list
-from darkweb_collector.tor_fetch import fetch_page_artifacts, fetch_url
+from darkweb_collector.tor_fetch import browser_proxy_server_for_url, fetch_url
 from darkweb_collector.utils import dump_json, dump_text, safe_stem
 
 
@@ -45,15 +46,28 @@ class PwnfrmAdapter(SiteAdapter):
     supports_frontier = True
 
     def _fetch_html(self, url: str, config: SiteConfig, mode: str) -> str:
-        # pwnfrm sits behind tor; cookie header is optional (only used if the
-        # site config declares a session_cookie* in extras).
+        proxy_server = browser_proxy_server_for_url(url)
+        if mode == "browser":
+            def validate(html):
+                raise_if_error_page(html)
+                if not is_forum_listing_html(html):
+                    raise CollectionFailure("parse", "pwnfrm response has no recognized forum listing")
+                parse_pwnfrm_list(url, html)
+                return True
+            options = browser_session_options(config, url, proxy_server)
+            options["browser_engine"] = str(config.extras.get("browser_engine") or "firefox")
+            return fetch_html_with_browser(
+                url, wait_seconds=config.render_wait_seconds,
+                timeout_seconds=config.fetch_timeout_seconds, proxy_server=proxy_server,
+                validate_html=validate, **options,
+            )
         return fetch_url(
             url=url,
             mode=mode,
             timeout_seconds=config.fetch_timeout_seconds,
             render_wait_seconds=config.render_wait_seconds,
             retries=1,
-            cookie_header=resolve_session_cookie(config),
+            **http_session_options(config, url, proxy_server),
         )
 
     @staticmethod
@@ -145,26 +159,58 @@ class PwnfrmAdapter(SiteAdapter):
         )
         if restored is not None:
             return restored
-        cookie_header = resolve_session_cookie(config)
-        html, screenshot_png = fetch_page_artifacts(
-            url=detail_task.target_url,
-            mode=config.detail_fetch_mode,
-            timeout_seconds=config.fetch_timeout_seconds,
-            render_wait_seconds=config.render_wait_seconds,
-            screenshot_selectors=("#thread-info", ".post.classic"),
-            hide_selectors=("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
-            render_html_for_screenshot=True,
-            cookie_header=cookie_header,
-        )
-        raise_if_error_page(html)
-        if not self._is_valid_detail_html(html):
-            raise CollectionFailure("parse", "pwnfrm detail has no recognized post structure")
-        detail = parse_pwnfrm_detail(detail_task.target_url, html)
-        if not self._is_valid_detail_payload(detail):
-            raise CollectionFailure("parse", "pwnfrm detail has no visible post content")
+        url = detail_task.target_url
+        proxy_server = browser_proxy_server_for_url(url)
+        detail, parsed_html = {}, None
+        def validate(html):
+            nonlocal detail, parsed_html
+            if html == parsed_html:
+                return True
+            raise_if_error_page(html)
+            if not self._is_valid_detail_html(html):
+                raise CollectionFailure("parse", "pwnfrm detail has no recognized post structure")
+            parsed = parse_pwnfrm_detail(url, html)
+            if not self._is_valid_detail_payload(parsed):
+                raise CollectionFailure("parse", "pwnfrm detail has no visible post content")
+            detail, parsed_html = parsed, html
+            return True
+        capture_options = {
+            "wait_seconds": config.render_wait_seconds, "timeout_seconds": config.fetch_timeout_seconds,
+            "proxy_server": proxy_server, "screenshot_selectors": ("#thread-info", ".post.classic"),
+            "hide_selectors": ("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
+        }
+        artifact_error = ""
+        if config.detail_fetch_mode == "browser":
+            options = browser_session_options(config, url, proxy_server)
+            options["browser_engine"] = str(config.extras.get("browser_engine") or "firefox")
+            html, screenshot_png = fetch_page_artifacts_with_browser(
+                url, validate_html=validate, **capture_options, **options,
+            )
+        else:
+            http_options = http_session_options(config, url, proxy_server)
+            html = fetch_url(
+                url, mode=config.detail_fetch_mode, timeout_seconds=config.fetch_timeout_seconds,
+                retries=1, **http_options,
+            )
+            validate(html)
+            try:
+                options = browser_session_options(config, url, proxy_server)
+                screenshot_png = screenshot_html_with_browser(
+                    html, url, browser_engine=str(config.extras.get("browser_engine") or "firefox"),
+                    storage_state_path=options["storage_state_path"], cookie_header=options["cookie_header"],
+                    user_agent=http_options["user_agent"], **capture_options,
+                )
+            except Exception as exc:
+                screenshot_png = None
+                artifact_error = safe_failure_text(f"artifact: forum evidence capture failed ({type(exc).__name__}): {exc}")
+        metadata = dict(detail_task.metadata)
+        metadata.pop("artifact_error", None)
+        if not screenshot_png:
+            metadata["artifact_error"] = artifact_error or "artifact: forum evidence capture produced no image"
+            detail["_collector_artifact_error"] = metadata["artifact_error"]
         return DetailResult(
             site_name=self.site_name, target_url=detail_task.target_url, payload=detail,
-            raw_html=html, screenshot_png=screenshot_png, metadata=detail_task.metadata,
+            raw_html=html, screenshot_png=screenshot_png or None, metadata=metadata,
         )
 
     def persist(
