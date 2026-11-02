@@ -8,10 +8,17 @@ import re
 from urllib.parse import urljoin, urlparse, parse_qs
 
 from darkweb_collector.normalize import content_hash
+from darkweb_collector.collection_errors import raise_if_error_page
 
 
 TITLE_RE = re.compile(r"<title>\s*(.*?)\s*</title>", re.IGNORECASE | re.DOTALL)
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+
+
+def _class_attribute(name: str) -> str:
+    token = re.escape(name)
+    return (r'\bclass\s*=\s*(?:"(?:[^"<>]*\s)?' + token + r'(?:\s[^"<>]*)?"'
+            r"|'(?:[^'<>]*\s)?" + token + r"(?:\s[^'<>]*)?'|" + token + r'(?=\s|>))')
 
 
 def _clean_html_text(value: str) -> str:
@@ -30,7 +37,7 @@ def _extract_publication_block(block_html: str, base_url: str) -> dict | None:
     # Extract website/victim domain
     # Support both: class="list-publication__website" and class=list-publication__website
     domain = ""
-    victim_match = re.search(r'class="list-publication__website"[^>]*>([^<]+)', block_html, re.IGNORECASE)
+    victim_match = re.search(_class_attribute("list-publication__website") + r'[^>]*>([^<]+)', block_html, re.IGNORECASE)
     if victim_match:
         domain = _clean_html_text(victim_match.group(1))
 
@@ -39,7 +46,7 @@ def _extract_publication_block(block_html: str, base_url: str) -> dict | None:
 
     # Extract victim name (company name) - look for list-publication__name
     name = ""
-    name_match = re.search(r'class="list-publication__name"[^>]*>([^<]+)', block_html, re.IGNORECASE)
+    name_match = re.search(_class_attribute("list-publication__name") + r'[^>]*>([^<]+)', block_html, re.IGNORECASE)
     if name_match:
         name = _clean_html_text(name_match.group(1))
 
@@ -50,7 +57,7 @@ def _extract_publication_block(block_html: str, base_url: str) -> dict | None:
     # Extract description - look for longer text content
     description = ""
     # Try to find description in the block
-    desc_match = re.search(r'class="list-publication__description"[^>]*>([^<]+)', block_html, re.IGNORECASE)
+    desc_match = re.search(_class_attribute("list-publication__description") + r'[^>]*>([^<]+)', block_html, re.IGNORECASE)
     if desc_match:
         description = _clean_html_text(desc_match.group(1))
     
@@ -67,19 +74,19 @@ def _extract_publication_block(block_html: str, base_url: str) -> dict | None:
 
     # Extract publication date
     published_at = ""
-    date_match = re.search(r'class="publication-footer__date"[^>]*>.*?mdi-creation[^<]*</span>\s*([^<]+)</span>', block_html, re.IGNORECASE)
+    date_match = re.search(_class_attribute("publication-footer__date") + r'[^>]*>.*?mdi-creation[^<]*</span>\s*([^<]+)</span>', block_html, re.IGNORECASE)
     if date_match:
         published_at = _clean_html_text(date_match.group(1))
 
     # Extract claimed size
     claimed_size = ""
-    size_match = re.search(r'class="list-publication__size"[^>]*>([^<]+)', block_html, re.IGNORECASE)
+    size_match = re.search(_class_attribute("list-publication__size") + r'[^>]*>([^<]+)', block_html, re.IGNORECASE)
     if size_match:
         claimed_size = _clean_html_text(size_match.group(1))
 
     # Extract location
     location = ""
-    location_match = re.search(r'class="list-publication__location"[^>]*>([^<]+)', block_html, re.IGNORECASE)
+    location_match = re.search(_class_attribute("list-publication__location") + r'[^>]*>([^<]+)', block_html, re.IGNORECASE)
     if location_match:
         location = _clean_html_text(location_match.group(1))
 
@@ -270,6 +277,7 @@ def _extract_post_uuid_from_payload(html: str, name: str, website: str) -> str:
 
 def parse_dragonforceblog_list_page(url: str, html: str) -> dict:
     """Parse DragonForceBlog list page HTML and extract topic information."""
+    raise_if_error_page(html)
     title_match = TITLE_RE.search(html)
     page_title = _clean_html_text(title_match.group(1)) if title_match else ""
 
@@ -277,7 +285,7 @@ def parse_dragonforceblog_list_page(url: str, html: str) -> dict:
 
     # Split HTML by publication blocks
     # Pattern: <div class="publications-list__publication" data-v-950956cb="">
-    publication_blocks = re.split(r'<div[^>]*class="publications-list__publication"[^>]*>', html, flags=re.IGNORECASE)
+    publication_blocks = re.split(r'<div\b[^>]*' + _class_attribute("publications-list__publication") + r'[^>]*>', html, flags=re.IGNORECASE)
 
     # Skip the first block (header/content before first publication)
     for block in publication_blocks[1:]:
@@ -316,6 +324,7 @@ def parse_dragonforceblog_detail_page(url: str, html: str) -> dict:
     - Publication timer
     - Attachments download links
     """
+    raise_if_error_page(html)
     title_match = TITLE_RE.search(html)
     page_title = _clean_html_text(title_match.group(1)) if title_match else ""
     post_uuid = _extract_post_uuid_from_url(url)

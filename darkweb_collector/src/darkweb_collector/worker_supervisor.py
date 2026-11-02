@@ -53,7 +53,7 @@ class _JobAccounting(ctypes.Structure):
 class _WorkerJob:
     """Keep all Windows browser descendants owned even after their Python parent exits."""
 
-    def __init__(self, name: str, *, existing: bool = False):
+    def __init__(self, name: str, *, existing: bool = False, query_only: bool = False):
         if not re.fullmatch(r"Local\\dwti-worker-[a-z0-9-]+-[0-9a-f]{32}", name):
             raise ValueError("invalid worker job ownership")
         self.api = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -74,7 +74,7 @@ class _WorkerJob:
             function = getattr(self.api, method)
             function.argtypes, function.restype = arguments, result
         self.name = name
-        self.handle = (self.api.OpenJobObjectW(0x0004 | 0x0008, False, name) if existing
+        self.handle = (self.api.OpenJobObjectW(0x0004 if query_only else 0x0004 | 0x0008, False, name) if existing
                        else self.api.CreateJobObjectW(None, name))
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -130,6 +130,12 @@ class _WorkerJob:
                 return False
             time.sleep(0.05)
 
+    def active_processes(self) -> int:
+        accounting = _JobAccounting()
+        if not self.api.QueryInformationJobObject(self.handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(accounting.active_processes)
+
     def close(self) -> None:
         if self.handle:
             self.api.CloseHandle(self.handle)
@@ -144,6 +150,109 @@ def _warn_resource_error(message: str, exc: Exception) -> None:
 
 def _health_directory() -> Path:
     return Path(__file__).resolve().parents[2] / ".runtime" / "windows" / "worker-health"
+
+
+def _managed_activity_path(raw: str) -> Path:
+    from darkweb_collector.storage_paths import app_root
+
+    path = Path(raw)
+    if not path.is_absolute() or not re.fullmatch(r"worker-[a-z0-9-]+\.activity", path.name) or path.is_symlink():
+        raise ValueError("unmanaged worker activity path")
+    resolved = path.resolve(strict=True)
+    if resolved.parent != _health_directory().resolve():
+        relative = resolved.relative_to((app_root() / "releases").resolve())
+        if (len(relative.parts) != 6 or not re.fullmatch(r"v[0-9][a-zA-Z0-9._-]*", relative.parts[0])
+                or relative.parts[1:5] != ("darkweb_collector", ".runtime", "windows", "worker-health")):
+            raise ValueError("activity does not belong to a managed release")
+    snapshot = resolved.with_suffix(".json")
+    if snapshot.is_symlink() or snapshot.resolve(strict=True).parent != resolved.parent:
+        raise ValueError("unsafe worker supervision snapshot")
+    return resolved
+
+
+def _orphan_tree_stopped(state: dict, payload: dict) -> bool:
+    if _process_alive(int(state["supervisor_pid"]), float(state["supervisor_started"])):
+        return False
+    if _process_alive(int(state["worker_pid"]), float(state["worker_started"])):
+        return False
+    if _process_alive(payload["worker_pid"], payload["worker_started"]):
+        return False
+    same_process = (state["worker_pid"] == payload["worker_pid"]
+                    and state["worker_started"] == payload["worker_started"])
+    same_job = bool(payload.get("worker_job") and payload["worker_job"] == state.get("worker_job"))
+    if not (same_process or same_job) or os.name != "nt" or not state.get("worker_job"):
+        return False
+    try:
+        job = _WorkerJob(state["worker_job"], existing=True, query_only=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 2:
+            return True
+        raise
+    try:
+        return job.active_processes() == 0
+    finally:
+        job.close()
+
+
+def recover_orphaned_activities(worker_name: str | None = None) -> dict[str, int]:
+    """Adopt stopped managed journals across releases; never terminate a live owner."""
+    from darkweb_collector.db import get_db_connection
+
+    result = {"recovered": 0, "blocked": 0, "errors": 0}
+    try:
+        with get_db_connection() as connection:
+            paths = {row[0] for row in connection.execute(
+                "SELECT DISTINCT activity_path FROM crawl_detail_control WHERE activity_path <> ''"
+            ).fetchall()}
+        paths.update(str(path) for path in _health_directory().glob("*.activity"))
+    except Exception as exc:
+        _warn_resource_error("Cannot inspect previous worker journals", exc)
+        result["errors"] += 1
+        return result
+    for raw in sorted(paths):
+        if worker_name is not None and Path(raw).stem != worker_name:
+            continue
+        try:
+            try:
+                Path(raw).stat()
+            except FileNotFoundError:
+                continue
+            path = _managed_activity_path(raw)
+            payload = read_activity(path)
+            if payload is None:
+                continue
+            state = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+            if not _orphan_tree_stopped(state, payload):
+                result["blocked"] += 1
+                continue
+            with get_db_connection() as connection:
+                job = connection.execute("SELECT site_name FROM crawl_jobs WHERE job_id = ?", (payload["job_id"],)).fetchone()
+                if job is None or job["site_name"] != payload["site_name"]:
+                    raise ValueError("orphan journal does not match its stored job")
+            if _recover_activity(path, payload, "worker_lost"):
+                result["recovered"] += 1
+            else:
+                result["errors"] += 1
+        except Exception as exc:
+            _warn_resource_error("Previous worker journal could not be recovered; retaining ownership", exc)
+            result["errors"] += 1
+    return result
+
+
+def get_worker_capacity() -> int | None:
+    workers, known = set(), False
+    for path in _health_directory().glob("*.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if time.time() - float(state["updated_at"]) > 60 or not set(state["queues"]) & set(QUEUE_CONCURRENCY):
+                continue
+            known = True
+            if (state["status"] == "running" and _process_alive(state["supervisor_pid"], state["supervisor_started"])
+                    and _process_alive(state["worker_pid"], state["worker_started"])):
+                workers.add((state["worker_pid"], state["worker_started"]))
+        except (OSError, psutil.Error, ValueError, KeyError, TypeError):
+            continue
+    return len(workers) if known else None
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -291,6 +400,7 @@ def _recover_activity(path: Path, payload: dict | None, reason: str) -> bool:
 
 def supervise(name: str, queues: list[str], hostname: str, workdir: str | None = None) -> None:
     workdir = str(Path(workdir or Path(__file__).resolve().parents[2]).resolve())
+    recover_orphaned_activities(worker_name=name)
     path = _health_directory() / f"{name}.json"
     ready_path = path.with_suffix(".ready")
     activity_path = path.with_suffix(".activity")
@@ -408,6 +518,7 @@ def supervise(name: str, queues: list[str], hostname: str, workdir: str | None =
                         try:
                             if os.name == "nt":
                                 job = _WorkerJob(f"Local\\dwti-{name}-{uuid4().hex}")
+                                env["DARKWEB_WORKER_JOB"] = job.name
                             flags = (subprocess.CREATE_NO_WINDOW | 0x00000004) if os.name == "nt" else 0  # CREATE_SUSPENDED
                             worker = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                                       creationflags=flags)
@@ -486,11 +597,18 @@ def supervise(name: str, queues: list[str], hostname: str, workdir: str | None =
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--queues", required=True)
-    parser.add_argument("--hostname", required=True)
+    parser.add_argument("--name")
+    parser.add_argument("--queues")
+    parser.add_argument("--hostname")
+    parser.add_argument("--recover-orphans", action="store_true")
     parser.add_argument("--workdir", default=str(Path(__file__).resolve().parents[2]))
     args = parser.parse_args()
+    if args.recover_orphans:
+        result = recover_orphaned_activities()
+        print(json.dumps(result))
+        raise SystemExit(1 if result["errors"] or result["blocked"] else 0)
+    if not args.name or not args.queues or not args.hostname:
+        parser.error("--name, --queues and --hostname are required to supervise a worker")
     queues = args.queues.split(",")
     if not re.fullmatch(r"worker-[a-z0-9-]+", args.name) or any(q not in QUEUE_CONCURRENCY for q in queues):
         parser.error("invalid worker name or queues")

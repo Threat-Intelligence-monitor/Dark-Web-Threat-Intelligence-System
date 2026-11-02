@@ -721,6 +721,8 @@ def _ensure_intelligence_publication_schema(connection) -> None:
 
     ensure_change_schema(connection)
     ensure_incremental_projection_schema(connection)
+    from darkweb_collector.collector_metrics import ensure_metrics_schema
+    ensure_metrics_schema(connection)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -1622,6 +1624,8 @@ def replace_normalized_intelligence_events(
     connection: sqlite3.Connection,
     rows: Iterable[dict],
 ) -> int:
+    from darkweb_collector.collector_metrics import record_visible_rebuild
+    record_visible_rebuild(connection, baseline=True)
     connection.execute("DELETE FROM normalized_intelligence_events")
     statement = """
         INSERT INTO normalized_intelligence_events (
@@ -1678,6 +1682,7 @@ def replace_normalized_intelligence_events(
             batch_characters = 0
     if batch:
         connection.executemany(statement, batch)
+    record_visible_rebuild(connection)
     sync_search_documents(connection)
     return count
 

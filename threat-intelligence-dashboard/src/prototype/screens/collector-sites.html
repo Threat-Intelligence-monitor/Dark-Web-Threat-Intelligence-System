@@ -22,6 +22,11 @@
       </header>
 
       <main class="app-main collector-main collector-page" id="content" data-collector-surface data-needs-jobs data-needs-platform-access data-od-id="collector-sites-main">
+        <nav class="collector-overview-navigation" aria-label="采集页面">
+          <a href="/collector-control/overview">总览</a>
+          <a href="/collector-control/sites" aria-current="page">站点状态</a>
+          <a href="/collector-control/tasks">任务历史</a>
+        </nav>
         <section class="section collector-site-nav-section" data-od-id="collector-sites-navigation">
           <div class="tabs settings-tabs collector-site-tabs" data-panels="collector-sites" role="tablist" aria-label="站点管理页面">
             <button class="tab active" data-tab="sites" role="tab" aria-selected="true" data-od-id="collector-sites-tab-sites"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14M8 16h8M12 5v11M7 10l5-5 5 5"/></svg><span>站点运行</span></button>
@@ -70,7 +75,7 @@
             </table>
           </div>
           <div class="collector-table-empty" data-table-empty="collector-health-table">没有符合当前筛选条件的站点。</div>
-          <footer class="site-workbench-foot"><span>最近失败 <b class="num" data-bind="failure-total">0</b></span><a href="collector-failures.html">查看任务列表</a></footer>
+          <footer class="site-workbench-foot"><span>最近失败 <b class="num" data-bind="failure-total">0</b></span><a href="/collector-control/tasks">查看任务历史</a></footer>
         </section>
 
         <section class="site-workbench cursor-workbench" data-od-id="netdisk-cursor-section" data-settings-module-card="netdisk">

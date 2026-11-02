@@ -6,6 +6,7 @@ import time
 import uuid
 
 from darkweb_collector.celery_app import app
+from darkweb_collector.collection_errors import CollectionFailure, safe_failure_text
 from darkweb_collector.detail_lifecycle import pause_site
 from darkweb_collector.config import get_site_config
 from darkweb_collector.crawl_frontier import (
@@ -294,7 +295,7 @@ def crawl_seed(self, site_name: str, force: bool = False) -> dict[str, object]:
             target=site_name,
             status="skipped",
             duration_ms=duration_ms,
-            error_message=str(exc),
+            error_message=f"auth_required: {safe_failure_text(str(exc), limit=3500)}",
         )
         return {
             "site_name": site_name,
@@ -304,6 +305,21 @@ def crawl_seed(self, site_name: str, force: bool = False) -> dict[str, object]:
         }
     except Exception as exc:
         duration_ms = int((time.perf_counter() - start_perf) * 1000)
+        failure = None
+        if isinstance(exc, CollectionFailure):
+            failure = CollectionFailure(
+                exc.kind, safe_failure_text(str(exc), limit=3500), scope=exc.scope, retry_after=exc.retry_after,
+            )
+        if failure is not None and failure.scope == "site":
+            cooldown = {"source_closed": 3600, "source_moved": 21600, "blocked": 900,
+                        "auth_required": 1800, "rate_limited": 1800}.get(failure.kind, 60)
+            with get_db_connection() as connection:
+                pause_site(connection, site_name, failure.kind, max(cooldown, failure.retry_after))
+                connection.commit()
+            mark_job_finished(job_id=self.request.id, site_name=site_name, job_type="seed",
+                              queue_name=queue_name, target=site_name, status="failed", duration_ms=duration_ms,
+                              error_message=f"{failure.kind}: {failure}")
+            raise failure from None
         if self.request.retries < MAX_RETRIES:
             _mark_retry_enqueued(
                 job_id=self.request.id,
@@ -312,7 +328,10 @@ def crawl_seed(self, site_name: str, force: bool = False) -> dict[str, object]:
                 queue_name=queue_name,
                 target=site_name,
             )
-            raise self.retry(exc=exc, countdown=retry_backoff_seconds(self.request.retries))
+            countdown = retry_backoff_seconds(self.request.retries)
+            if failure is not None:
+                countdown = max(countdown, failure.retry_after)
+            raise self.retry(exc=failure or exc, countdown=countdown)
         mark_job_finished(
             job_id=self.request.id,
             site_name=site_name,
@@ -321,8 +340,10 @@ def crawl_seed(self, site_name: str, force: bool = False) -> dict[str, object]:
             target=site_name,
             status="failed",
             duration_ms=duration_ms,
-            error_message=str(exc),
+            error_message=f"{failure.kind}: {failure}" if failure is not None else str(exc),
         )
+        if failure is not None:
+            raise failure from None
         raise
     duration_ms = int((time.perf_counter() - start_perf) * 1000)
     mark_job_finished(
@@ -361,9 +382,7 @@ def crawl_detail(self, site_name: str, detail_task_payload: dict[str, object], f
         except Exception as error:
             raise self.retry(exc=error, countdown=30, max_retries=MAX_RETRIES)
         if admission in {"returned", "stale"}:
-            if admission == "returned":
-                _dispatch_frontier_jobs(config, _enqueue_detail_task)
-            else:
+            if admission == "stale":
                 with get_db_connection() as connection:
                     connection.execute("""UPDATE crawl_jobs SET status = 'skipped', finished_at = ?,
                         error_message = 'stale_frontier' WHERE job_id = ?
@@ -397,15 +416,17 @@ def crawl_detail(self, site_name: str, detail_task_payload: dict[str, object], f
                           status="failed" if admission_reason == "infrastructure" else "skipped",
                           duration_ms=0, error_message=admission_reason)
         return {"site_name": site_name, "detail_job_id": self.request.id, "reason": admission_reason}
+    result = None
     try:
-        return execute_detail_job(site_name=site_name, detail_task=detail_task, queue_name=queue_name,
-                                  job_id=self.request.id, slot_owner=slot_owner)
+        result = execute_detail_job(site_name=site_name, detail_task=detail_task, queue_name=queue_name,
+                                    job_id=self.request.id, slot_owner=slot_owner)
+        return result
     finally:
         try:
             state_store.release_detail_slot(site_name, slot_owner)
         except Exception:
             logger.exception("failed to release detail slot for %s", site_name)
-        if frontier_token:
+        if frontier_token and result is not None and not result.get("reason"):
             try:
                 _dispatch_frontier_jobs(config, _enqueue_detail_task)
             except Exception:

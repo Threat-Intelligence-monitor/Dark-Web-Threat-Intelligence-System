@@ -43,11 +43,47 @@ def read_activity(path: Path) -> dict | None:
     return payload
 
 
+@contextmanager
+def _activity_lock(path: Path):
+    # OS locks are released on process death; leave the tiny lock file in place.
+    lock_path = path.with_suffix(".activity.lock")
+    if lock_path.is_symlink():
+        raise ValueError("unsafe worker activity lock")
+    with lock_path.open("a+b") as stream:
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def clear_activity(path: Path, payload: dict) -> None:
-    current = read_activity(path)
-    if current is not None and current["task_id"] != payload["task_id"]:
-        raise ValueError("worker activity ownership changed")
-    path.unlink(missing_ok=True)
+    with _activity_lock(path):
+        current = read_activity(path)
+        if current is not None and current["task_id"] != payload["task_id"]:
+            raise ValueError("worker activity ownership changed")
+        path.unlink(missing_ok=True)
 
 
 def activity_expired(payload: dict) -> bool:
@@ -80,6 +116,7 @@ def track_task(job_id: str, site_name: str, target_url: str, slot_owner: str, ti
         "slot_owner": slot_owner, "timeout_seconds": timeout,
         "started_at": started_at, "deadline_at": started_at + timeout,
         "started_monotonic": started_monotonic, "deadline_monotonic": started_monotonic + timeout,
+        "worker_job": os.environ.get("DARKWEB_WORKER_JOB", ""),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f".{os.getpid()}.{payload['task_id']}.tmp")
@@ -89,11 +126,14 @@ def track_task(job_id: str, site_name: str, target_url: str, slot_owner: str, ti
             json.dump(payload, stream, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
-        # Windows rename fails if the destination exists; POSIX needs an exclusive link.
-        if os.name == "nt":
-            os.rename(temporary, path)
-        else:
-            os.link(temporary, path)
+        with _activity_lock(path):
+            if path.exists():
+                raise RuntimeError("previous worker task has not been recovered")
+            # Windows rename fails if the destination exists; POSIX needs an exclusive link.
+            if os.name == "nt":
+                os.rename(temporary, path)
+            else:
+                os.link(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     try:

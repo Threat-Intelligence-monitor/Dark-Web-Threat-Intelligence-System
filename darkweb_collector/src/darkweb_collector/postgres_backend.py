@@ -351,6 +351,8 @@ def _get_pool(
 
                     ensure_change_schema(cursor, postgres=True)
                     ensure_incremental_projection_schema(cursor, postgres=True)
+                    from darkweb_collector.collector_metrics import ensure_metrics_schema
+                    ensure_metrics_schema(cursor, postgres=True)
                 raw.commit()
             finally:
                 pool.putconn(raw)

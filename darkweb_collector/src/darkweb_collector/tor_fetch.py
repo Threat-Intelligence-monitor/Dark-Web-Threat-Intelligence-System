@@ -33,19 +33,27 @@ def _stderr_text(stderr: str | bytes | None) -> str:
     return stderr.strip()
 
 
-def raise_for_http_status(status: int) -> None:
+def raise_for_http_status(status: int, html: str | None = None) -> None:
+    if html is not None and html.strip():
+        try:
+            raise_if_error_page(html)
+        except CollectionFailure as exc:
+            message = f"HTTP {status}; {exc}" if status else str(exc)
+            raise CollectionFailure(exc.kind, message, scope=exc.scope, retry_after=exc.retry_after) from exc
     if status == 401:
-        raise CollectionFailure("auth_required", "source requires authentication", scope="site")
+        raise CollectionFailure("auth_required", "HTTP 401; source requires authentication", scope="site")
     if status == 403:
-        raise CollectionFailure("blocked", "source refused the request", scope="target")
+        raise CollectionFailure("blocked", "HTTP 403; source refused the request", scope="target")
     if status == 429:
-        raise CollectionFailure("rate_limited", "source rate limit reached", scope="site")
+        raise CollectionFailure("rate_limited", "HTTP 429; source rate limit reached", scope="site")
     if status in {404, 410}:
         raise CollectionFailure("unknown", f"HTTP {status}; target availability is unconfirmed")
     if status in {408, 504}:
-        raise CollectionFailure("timeout", "source request timed out")
+        raise CollectionFailure("timeout", f"HTTP {status}; source request timed out")
     if isinstance(status, int) and 500 <= status < 600:
-        raise CollectionFailure("network", "source returned a temporary server error", scope="site")
+        raise CollectionFailure("network", f"HTTP {status}; source returned a temporary server error", scope="site")
+    if html is not None and not html.strip():
+        raise_if_error_page(html)
 
 
 def is_onion_hostname(hostname: str | None) -> bool:
@@ -223,7 +231,6 @@ def fetch_via_tor_curl(
             curl,
             "--socks5-hostname",
             f"{socks_host}:{socks_port}",
-            "--fail",
             "--silent",
             "--show-error",
             "--location",
@@ -243,15 +250,17 @@ def fetch_via_tor_curl(
         result = subprocess.run(command, capture_output=True, check=False)
         output = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
         body, marker, code = output.rpartition("\nDWTI_HTTP_STATUS:")
-        if marker and code.strip().isdigit():
-            raise_for_http_status(int(code.strip()))
+        status = int(code.strip()) if marker and code.strip().isdigit() else 0
         if result.returncode == 0:
-            return body if marker else output
+            content = body if marker else output
+            raise_for_http_status(status, content)
+            return content
+        raise_for_http_status(status)
 
         if attempt < attempts:
             time.sleep(backoff_seconds * attempt)
 
-    raise TorFetchError("curl fetch failed", kind="timeout" if result.returncode == 28 else "network")
+    raise TorFetchError(f"curl fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
 
 def fetch_with_cloudflare_bypass(
     url: str,
@@ -469,7 +478,6 @@ def fetch_via_http_proxy(
         # Build curl command
         command = [
             curl,
-            "--fail",
             "--silent",
             "--show-error",
             "--location",
@@ -495,8 +503,7 @@ def fetch_via_http_proxy(
         request_attempt()
         result = subprocess.run(command, capture_output=True, check=False)
         status_text = result.stdout.decode("ascii", errors="ignore") if isinstance(result.stdout, bytes) else str(result.stdout or "")
-        if status_text.strip().isdigit():
-            raise_for_http_status(int(status_text.strip()))
+        status = int(status_text.strip()) if status_text.strip().isdigit() else 0
         
         if result.returncode == 0:
             try:
@@ -505,13 +512,14 @@ def fetch_via_http_proxy(
                     content = f.read()
             except OSError as exc:
                 raise ProxyFetchError("HTTP response body could not be read", kind="parse") from exc
-            raise_if_error_page(content)
+            raise_for_http_status(status, content)
             return content
+        raise_for_http_status(status)
         
         if attempt < attempts:
             time.sleep(backoff_seconds * attempt)
     
-    raise ProxyFetchError("proxy fetch failed", kind="timeout" if result.returncode == 28 else "network")
+    raise ProxyFetchError(f"proxy fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
 
 
 def fetch_with_proxy_bypass(

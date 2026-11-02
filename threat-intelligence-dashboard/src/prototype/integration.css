@@ -223,3 +223,32 @@
 .page-monitoring .code-trend-chart {
   max-width: 100%;
 }
+
+.collector-overview-navigation {
+  display: flex;
+  gap: 25px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.collector-overview-navigation a {
+  padding: 10px 1px 11px;
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  font-size: 14px;
+}
+.collector-overview-navigation a[aria-current="page"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+.collector-health-table .status-dot.disabled {
+  color: var(--muted);
+  background: var(--bg);
+  border-color: var(--border);
+}
+.collector-health-table .status-dot.evidence-pending {
+  color: #a66803;
+  background: #fff2d8;
+  border-color: #ecd7ab;
+}

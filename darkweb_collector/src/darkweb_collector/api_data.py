@@ -422,7 +422,8 @@ def _latest_succeeded_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _latest_unresolved_problem_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    latest_success_dt = _job_event_dt(_latest_succeeded_row(rows))
+    latest_success_dt = max((_job_event_dt(row) for row in rows if row.get("status") in {"succeeded", "partial"}
+                             and _job_event_dt(row) is not None), default=None)
     for row in rows:
         if _effective_job_status(row) != "failed":
             continue
@@ -2534,7 +2535,13 @@ def build_failed_jobs_payload(page: int = 1, page_size: int = FAILED_JOB_HISTORY
     }
 
 
-def build_jobs_payload() -> dict[str, Any]:
+def build_jobs_payload(*, include_auxiliary: bool = True) -> dict[str, Any]:
+    from darkweb_collector.collector_metrics import site_job_rows
+    from darkweb_collector.collection_errors import safe_failure_text
+    configured_configs = load_site_configs()
+    configured_sites = [config.site_name for config in configured_configs]
+    enabled_map = {config.site_name: config.enabled for config in configured_configs}
+    config_map = {config.site_name: config for config in configured_configs}
     failure_cutoff = _now_utc() - timedelta(hours=RECENT_FAILURE_WINDOW_HOURS)
     with get_db_connection() as connection:
         detail_yield = [dict(row) for row in connection.execute(
@@ -2543,30 +2550,22 @@ def build_jobs_payload() -> dict[str, Any]:
                       SUM(CASE WHEN outcome = 'partial' THEN 1 ELSE 0 END) AS artifacts_pending_jobs
                FROM crawl_detail_results WHERE finished_at >= ? GROUP BY site_name""",
             (failure_cutoff.timestamp(),),
-        ).fetchall()]
-        crawl_jobs = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT site_name, job_type, status, queue_name, target, enqueued_at, started_at, finished_at, error_message
-                FROM crawl_jobs
-                ORDER BY COALESCE(finished_at, started_at, enqueued_at) DESC
-                LIMIT 1000
-                """
-            ).fetchall()
-        ]
+        ).fetchall()] if include_auxiliary else []
+        crawl_jobs, active_counts = site_job_rows(connection, configured_sites)
+        site_pauses = {r["site_name"]: dict(r) for r in connection.execute("SELECT * FROM crawl_site_control").fetchall()}
+        detail_pauses = {r["site_name"]: dict(r) for r in connection.execute("SELECT * FROM crawl_detail_site_control").fetchall()}
         forum_detail_counts = {
             row["site_name"]: int(row["count"])
             for row in connection.execute(
                 "SELECT site_name, COUNT(*) AS count FROM forum_details GROUP BY site_name"
             ).fetchall()
-        }
+        } if include_auxiliary else {}
         victim_counts = {
             row["site_name"]: int(row["count"])
             for row in connection.execute(
                 "SELECT site_name, COUNT(*) AS count FROM victims GROUP BY site_name"
             ).fetchall()
-        }
+        } if include_auxiliary else {}
         failure_counts_24h = {
             row["site_name"]: int(row["count"])
             for row in connection.execute(
@@ -2582,11 +2581,11 @@ def build_jobs_payload() -> dict[str, Any]:
         }
         vulnerability_count_row = connection.execute(
             "SELECT COUNT(*) AS count, MAX(disclosure_time) AS latest_disclosure_time FROM vulnerability_records"
-        ).fetchone()
-        connectivity_probe_map = get_site_connectivity_probe_map(connection)
+        ).fetchone() if include_auxiliary else None
+        connectivity_probe_map = get_site_connectivity_probe_map(connection) if include_auxiliary else {}
         try:
             frontier_count_map = frontier_counts(connection)
-            frontier_cursor_map = list_page_cursors(connection)
+            frontier_cursor_map = list_page_cursors(connection) if include_auxiliary else {}
         except Exception as exc:
             missing_frontier_table = (
                 isinstance(exc, sqlite3.OperationalError) and "no such table:" in str(exc)
@@ -2604,22 +2603,8 @@ def build_jobs_payload() -> dict[str, Any]:
         get_vulnerability_sync_status,
     )
 
-    try:
-        configured_configs = load_site_configs()
-        configured_sites = [config.site_name for config in configured_configs]
-        enabled_map = {config.site_name: config.enabled for config in configured_configs}
-        config_map = {config.site_name: config for config in configured_configs}
-    except Exception:
-        configured_sites = sorted({row.get("site_name") for row in crawl_jobs if row.get("site_name")})
-        enabled_map = {site_name: True for site_name in configured_sites}
-        config_map = {}
-
-    running_jobs = sum(1 for row in crawl_jobs if _effective_job_status(row) == "running")
-    stale_jobs = sum(
-        1
-        for row in crawl_jobs
-        if _effective_job_status(row) == "stale" and not row.get("finished_at")
-    )
+    running_jobs = sum(int(active_counts.get(site, {}).get("running") or 0) for site in configured_sites)
+    stale_jobs = sum(int(active_counts.get(site, {}).get("stale") or 0) for site in configured_sites)
 
     worker_errors = queue_health_errors()
     site_health = []
@@ -2644,7 +2629,11 @@ def build_jobs_payload() -> dict[str, Any]:
             None,
         )
         latest_success = next((row for row in site_rows if row.get("status") == "succeeded"), None)
-        latest_unresolved_problem = _latest_unresolved_problem_row(site_rows)
+        # A successful listing does not resolve a failed detail (or vice versa).
+        problems = [_latest_unresolved_problem_row([r for r in site_rows if r.get("job_type") == kind])
+                    for kind in ("seed", "detail")]
+        latest_unresolved_problem = max((r for r in problems if r is not None),
+            key=lambda r: _job_event_dt(r) or datetime.min.replace(tzinfo=timezone.utc), default=None)
         if latest_unresolved_problem is not None:
             unresolved_problem_rows.append(latest_unresolved_problem)
         error_category = classify_error(
@@ -2664,18 +2653,17 @@ def build_jobs_payload() -> dict[str, Any]:
             "auth_message": "",
         }
         auth_required = bool(auth["auth_required"])
-        auth_waiting = auth["auth_status"] in {"missing", "login_in_progress", "login_required"}
         failure_count = consecutive_failures(seed_rows)
         threshold = failure_threshold(config) if config is not None else 3
         cooldown_until_dt = failure_cooldown_until(config, seed_rows) if config is not None else None
         circuit_breaker_open = cooldown_until_dt is not None and _now_utc() < cooldown_until_dt
         active_cooldown_until_dt = cooldown_until_dt if circuit_breaker_open else None
-        active_running = sum(1 for row in site_rows if _effective_job_status(row) == "running")
-        active_enqueued = sum(1 for row in site_rows if _effective_job_status(row) == "enqueued")
+        active_running = int(active_counts.get(site_name, {}).get("running") or 0)
+        active_enqueued = int(active_counts.get(site_name, {}).get("enqueued") or 0)
         failed_jobs_24h = failure_counts_24h.get(site_name, 0)
         connectivity_probe = connectivity_probe_map.get(site_name) or {}
         frontier = frontier_count_map.get(site_name) or {}
-        frontier_enabled = bool(getattr(ADAPTERS.get(site_name), "supports_frontier", False))
+        frontier_enabled = bool(getattr(ADAPTERS.get(site_name), "supports_frontier", False)) or bool(frontier)
         frontier_pending = int(frontier.get("pending", 0))
         frontier_inflight = int(frontier.get("inflight", 0))
 
@@ -2697,7 +2685,7 @@ def build_jobs_payload() -> dict[str, Any]:
         seed_age_minutes = None
         if latest_seed_dt is not None:
             seed_age_minutes = max(0, round((_now_utc() - latest_seed_dt).total_seconds() / 60))
-        detail_status = _label_job_status(_effective_job_status(latest_detail)) if latest_detail else "未运行"
+        detail_status = _label_job_status(_effective_job_status(latest_detail)) if latest_detail else "等待调度"
         if (
             latest_detail
             and _effective_job_status(latest_detail) in {"failed", "stale"}
@@ -2710,6 +2698,37 @@ def build_jobs_payload() -> dict[str, Any]:
         ):
             detail_status = "未更新"
 
+        seed_pause = site_pauses.get(site_name, {})
+        pause = max((seed_pause, detail_pauses.get(site_name, {})),
+                    key=lambda item: float(item.get("next_retry") or 0))
+        retry_at = float(pause.get("next_retry") or 0)
+        paused = retry_at > _now_utc().timestamp()
+        message = safe_failure_text(worker_error or (latest_unresolved_problem or {}).get("error_message") or "")
+        kind = str(pause.get("failure_kind") or "") if paused else message.partition(":")[0]
+        reason_labels = {"source_closed": "源站关闭", "source_moved": "入口迁移", "blocked": "需要验证",
+                         "auth_required": "需要登录", "rate_limited": "限流等待", "parse": "解析异常"}
+        enabled = enabled_map.get(site_name, True)
+        artifacts_waiting = bool(frontier.get("artifacts_pending")) or bool(latest_detail and latest_detail.get("status") == "partial")
+        needs_attention = enabled and bool(worker_error or auth_required or latest_unresolved_problem or paused or artifacts_waiting
+                                          or active_counts.get(site_name, {}).get("stale"))
+        state = ("已停用" if not enabled else "执行资源异常" if worker_error else "需要登录" if auth_required
+                 else "执行中" if active_running else reason_labels[kind] if kind in reason_labels
+                 else "退避中" if paused or circuit_breaker_open else "采集异常" if latest_unresolved_problem
+                 else "等待执行" if active_enqueued else "证据待补" if artifacts_waiting else "资源等待" if frontier_pending or frontier_inflight
+                 else "等待调度")
+        if paused and not message:
+            subject = "详情" if pause is detail_pauses.get(site_name) else ""
+            message = subject + reason_labels.get(kind, "暂缓采集") + "，等待重试"
+        if artifacts_waiting and not message:
+            message = "正文已保存，截图或附件等待补采"
+        last_seed_success = next((r for r in seed_rows if r.get("status") == "succeeded"), None)
+        next_run = _job_event_dt(last_seed_success)
+        next_run = (next_run + timedelta(seconds=config.effective_interval_seconds)) if next_run and config else None
+        seed_retry_at = float(seed_pause.get("next_retry") or 0)
+        if seed_retry_at > _now_utc().timestamp() and (next_run is None or next_run.timestamp() < seed_retry_at):
+            next_run = datetime.fromtimestamp(seed_retry_at, timezone.utc)
+        if active_cooldown_until_dt and (next_run is None or next_run < active_cooldown_until_dt):
+            next_run = active_cooldown_until_dt
         site_health.append(
             {
                 "site_name": site_name,
@@ -2724,24 +2743,9 @@ def build_jobs_payload() -> dict[str, Any]:
                 "connectivity_last_success_at": _format_dt(connectivity_probe.get("last_success_at")),
                 "connectivity_failure_reason": connectivity_probe.get("failure_reason") or "",
                 "connectivity_error": connectivity_probe.get("error") or "",
-                "overall_status": (
-                    "异常"
-                    if worker_error
-                    else "待登录"
-                    if auth_required and auth_waiting
-                    else "会话失效"
-                    if auth_required
-                    else "异常"
-                    if latest_unresolved_problem
-                    else "运行中"
-                    if active_running
-                    else "等待中"
-                    if active_enqueued
-                    else "正常"
-                    if latest_success
-                    else "未运行"
-                ),
-                "seed_status": _label_job_status(_effective_job_status(latest_seed)) if latest_seed else "未运行",
+                "overall_status": state,
+                "needs_attention": needs_attention,
+                "seed_status": _label_job_status(_effective_job_status(latest_seed)) if latest_seed else ("等待调度" if enabled else "已停用"),
                 "detail_status": detail_status,
                 "running_jobs": active_running,
                 "enqueued_jobs": active_enqueued,
@@ -2759,9 +2763,10 @@ def build_jobs_payload() -> dict[str, Any]:
                 },
                 "failed_jobs_24h": failed_jobs_24h,
                 "last_success_at": _format_dt(latest_success.get("finished_at") if latest_success else None),
-                "last_error": (
-                    worker_error or (latest_unresolved_problem.get("error_message") if latest_unresolved_problem else "")
-                ),
+                "last_success_at_raw": latest_success.get("finished_at") if latest_success else None,
+                "next_run_at": next_run.isoformat() if enabled and next_run else None,
+                "detail_retry_at": datetime.fromtimestamp(retry_at, timezone.utc).isoformat() if paused else None,
+                "last_error": message,
                 "worker_error": worker_error,
                 "queue_errors": dependency_errors,
                 "auth_required": auth_required,
@@ -2801,7 +2806,7 @@ def build_jobs_payload() -> dict[str, Any]:
             "job_type": row.get("job_type"),
             "status": _label_job_status(_effective_job_status(row)),
             "target": row.get("target"),
-            "error_message": row.get("error_message") or "",
+            "error_message": safe_failure_text(row.get("error_message") or ""),
             "error_category": classify_error(row.get("error_message") or ""),
             "finished_at": _format_dt(row.get("finished_at") or row.get("started_at")),
         }
@@ -2810,6 +2815,9 @@ def build_jobs_payload() -> dict[str, Any]:
     failed_jobs_24h = sum(failure_counts_24h.values())
 
     overall_status = "部分失败" if any(item["worker_error"] for item in site_health) else "采集中" if running_jobs > 0 else "部分失败" if recent_failures or stale_jobs > 0 else "正常"
+    if not include_auxiliary:
+        return {"site_health": site_health, "running_jobs": running_jobs, "stale_jobs": stale_jobs,
+                "failed_jobs_24h": failed_jobs_24h, "updated_at": _now_utc().isoformat()}
     vulnerability_sync = {
         **get_vulnerability_sync_status(),
         "record_count": int(vulnerability_count_row["count"]) if vulnerability_count_row else 0,

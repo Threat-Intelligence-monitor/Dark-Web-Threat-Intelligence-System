@@ -477,7 +477,9 @@ export function initializePrototype() {
       exposureLinks.push(navLink('/social-monitoring', '社交平台监测', activePath('/social-monitoring')))
     }
     const collectorLinks = hasModuleAccess(MODULE_KEYS.COLLECTOR_CONTROL) ? [
+      navLink('/collector-control/overview', '采集总览', activePath('/collector-control/overview')),
       navLink('/collector-control/sites', '站点管理', active('collector-sites.html')),
+      navLink('/collector-control/tasks', '任务历史', activePath('/collector-control/tasks')),
       navLink('/collector-control/sync', '同步中心', active('collector-sync.html')),
       navLink('/collector-control/runtime', '运行环境', active('collector-runtime.html')),
       `<a class="nav-link sub${active('collector-failures.html')}" href="/collector-control/failures"><span>任务列表</span><span class="nav-alert-count num" data-task-nav-count hidden>0</span></a>`,
@@ -2346,17 +2348,17 @@ export function initializePrototype() {
 
     function renderSiteHealth(items = []) {
       if (!Array.isArray(items)) return
-      const healthyStatuses = new Set(['ok', 'healthy', 'running', '正常', '运行中', '等待中'])
-      const isHealthy = (item) => healthyStatuses.has(String(item.overall_status || '').toLowerCase())
+      const healthyStatuses = new Set(['ok', 'healthy', 'running', '正常', '运行中', '执行中', '等待中', '等待调度', '资源等待'])
+      const isHealthy = (item) => item.enabled !== false && healthyStatuses.has(String(item.overall_status || '').toLowerCase())
       const needsLogin = (item) => ['missing', 'login_required', 'login_in_progress'].includes(String(item.auth_status || '').toLowerCase())
       const healthy = items.filter(isHealthy).length
-      const abnormal = items.length - healthy
+      const abnormal = items.filter((item) => item.enabled !== false && !isHealthy(item)).length
       bindText('site-total', items.length)
       bindText('site-healthy', healthy)
       bindText('site-abnormal', abnormal)
       bindText('site-auth', items.filter(needsLogin).length)
       bindText('site-circuit', items.filter((item) => Boolean(item.circuit_breaker_open)).length)
-      const denominator = Math.max(items.length, 1)
+      const denominator = Math.max(items.filter((item) => item.enabled !== false).length, 1)
       const healthySegment = $('[data-site-health-segment="healthy"]', root)
       const abnormalSegment = $('[data-site-health-segment="abnormal"]', root)
       if (healthySegment) healthySegment.style.setProperty('--site-share', `${healthy / denominator * 100}%`)
@@ -2373,7 +2375,7 @@ export function initializePrototype() {
         const moduleLabel = { darkweb: '暗网', netdisk: '网盘', library: '文库' }[moduleKey]
         row.dataset.site = item.site_name || ''
         row.dataset.module = moduleKey
-        row.dataset.status = isHealthy(item) ? 'healthy' : 'abnormal'
+        row.dataset.status = item.enabled === false ? 'disabled' : isHealthy(item) ? 'healthy' : 'abnormal'
         row.dataset.auth = needsLogin(item) ? 'login' : 'public'
         const cells = [
           [item.display_name || item.site_name || '未知站点', `${moduleLabel} · ${needsLogin(item) ? '需要登录' : item.auth_required ? '会话站点' : '公开站点'}`],
@@ -2396,7 +2398,8 @@ export function initializePrototype() {
             cell.appendChild(small)
           } else if (index === 1) {
             const state = document.createElement('span')
-            state.className = `status-dot ${isHealthy(item) ? 'running' : 'stopped'}`
+            state.className = `status-dot ${item.enabled === false ? 'disabled' : isHealthy(item) ? 'running' : 'stopped'}`
+            if (primary === '证据待补') state.classList.add('evidence-pending')
             state.textContent = primary
             if (item.worker_error) state.title = item.worker_error
             cell.appendChild(state)
@@ -2873,7 +2876,10 @@ export function initializePrototype() {
       bindText('normalized-count', runtime.copied_counts?.normalized_intelligence_events ?? '—')
       renderSiteHealth(payload.site_health || [])
       renderTasks(payload)
-      setBadge('site-health-summary', overall === '正常' ? '全部正常' : '部分异常', overall === '正常' ? 'badge-success' : 'badge-high')
+      const enabledSites = (payload.site_health || []).filter((item) => item.enabled !== false)
+      const healthyStates = ['正常', '运行中', '执行中', '等待中', '等待调度', '资源等待']
+      const attentionCount = enabledSites.filter((item) => !healthyStates.includes(statusLabel(item.overall_status))).length
+      setBadge('site-health-summary', !enabledSites.length ? '未启用站点' : attentionCount ? `${attentionCount} 个站点需关注` : overall === '采集中' ? '采集中' : '按计划采集', attentionCount ? 'badge-high' : 'badge-success')
     }
 
     function renderVulnerabilitySync(payload = {}) {
