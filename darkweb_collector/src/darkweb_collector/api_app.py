@@ -821,6 +821,40 @@ def jobs() -> dict:
     return _reload_api_modules().build_jobs_payload()
 
 
+def _require_collector_access(request: Request) -> None:
+    if not _auth_enabled():
+        return
+    user = getattr(request.state, "current_user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="未登录或登录已过期")
+    if user.get("role") != "admin" and "collector_control" not in (user.get("modules") or []):
+        raise HTTPException(status_code=403, detail="当前账号没有采集管理权限")
+
+
+@app.get("/api/collector/overview")
+def collector_overview(request: Request, hours: int = Query(24), page: int = Query(1, ge=1),
+                       page_size: int = Query(10, ge=1, le=100), q: str = Query("", max_length=200),
+                       state: str = "all", attention_first: bool = False) -> dict:
+    _require_collector_access(request)
+    from darkweb_collector.collector_metrics import build_overview
+    try:
+        return build_overview(hours, page, page_size, q, state, attention_first)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/collector/tasks")
+def collector_tasks(request: Request, hours: int = Query(24), page: int = Query(1, ge=1),
+                    page_size: int = Query(20, ge=1, le=100), q: str = Query("", max_length=200),
+                    site: str = Query("", max_length=150), status: str = "") -> dict:
+    _require_collector_access(request)
+    from darkweb_collector.collector_metrics import build_task_history
+    try:
+        return build_task_history(hours, page, page_size, q, site, status)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.get("/api/events/search")
 def event_search(
     response: Response,

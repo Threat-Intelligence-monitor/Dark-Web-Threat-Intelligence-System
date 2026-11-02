@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import time
+from datetime import datetime, timezone
 
 import psutil
 
@@ -27,7 +28,12 @@ CREATE TABLE IF NOT EXISTS crawl_detail_control (
 );
 CREATE INDEX IF NOT EXISTS idx_detail_control_owner ON crawl_detail_control(owner_token);
 CREATE INDEX IF NOT EXISTS idx_detail_control_active ON crawl_detail_control(owner_token) WHERE owner_token <> '';
+CREATE INDEX IF NOT EXISTS idx_detail_control_activity ON crawl_detail_control(activity_path) WHERE activity_path <> '';
 CREATE TABLE IF NOT EXISTS crawl_site_control (
+    site_name TEXT PRIMARY KEY, failure_kind TEXT NOT NULL, next_retry DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL
+);
+CREATE TABLE IF NOT EXISTS crawl_detail_site_control (
     site_name TEXT PRIMARY KEY, failure_kind TEXT NOT NULL, next_retry DOUBLE PRECISION NOT NULL,
     updated_at DOUBLE PRECISION NOT NULL
 );
@@ -76,6 +82,7 @@ def worker_alive(pid: int, started: float) -> bool:
 
 def reset_site_failures(connection, site_name: str) -> None:
     connection.execute("DELETE FROM crawl_site_control WHERE site_name = ?", (site_name,))
+    connection.execute("DELETE FROM crawl_detail_site_control WHERE site_name = ?", (site_name,))
     connection.execute("""UPDATE crawl_detail_control SET failure_count = 0, failure_kind = '',
         next_retry = 0, request_count = 0, budget_until = 0, last_error = ''
         WHERE site_name = ? AND owner_token = ''""", (site_name,))
@@ -85,9 +92,13 @@ def reset_site_failures(connection, site_name: str) -> None:
                 AND c.target_url = crawl_frontier.target_url AND c.owner_token <> '')""", (site_name,))
 
 
-def site_retry_at(connection, site_name: str) -> float:
+def site_retry_at(connection, site_name: str, *, include_detail=True) -> float:
     row = connection.execute("SELECT next_retry FROM crawl_site_control WHERE site_name = ?", (site_name,)).fetchone()
-    return float(row[0]) if row else 0.0
+    retry_at = float(row[0]) if row else 0.0
+    if include_detail:
+        detail = connection.execute("SELECT next_retry FROM crawl_detail_site_control WHERE site_name = ?", (site_name,)).fetchone()
+        retry_at = max(retry_at, float(detail[0]) if detail else 0.0)
+    return retry_at
 
 
 def eligible_detail_tasks(connection, site_name: str, tasks: list, *, now=None) -> list:
@@ -105,12 +116,13 @@ def eligible_detail_tasks(connection, site_name: str, tasks: list, *, now=None) 
     return [task for task in tasks if task.target_url not in deferred or source_version(task) != deferred[task.target_url]]
 
 
-def pause_site(connection, site_name: str, kind: str, seconds: float, *, now=None) -> None:
+def pause_site(connection, site_name: str, kind: str, seconds: float, *, now=None, detail_only=False) -> None:
     timestamp = time.time() if now is None else float(now)
-    connection.execute("""INSERT INTO crawl_site_control(site_name, failure_kind, next_retry, updated_at)
+    table = "crawl_detail_site_control" if detail_only else "crawl_site_control"
+    connection.execute(f"""INSERT INTO {table}(site_name, failure_kind, next_retry, updated_at)
         VALUES (?, ?, ?, ?) ON CONFLICT(site_name) DO UPDATE SET failure_kind = excluded.failure_kind,
-        next_retry = CASE WHEN crawl_site_control.next_retry > excluded.next_retry
-            THEN crawl_site_control.next_retry ELSE excluded.next_retry END, updated_at = excluded.updated_at""",
+        next_retry = CASE WHEN {table}.next_retry > excluded.next_retry
+            THEN {table}.next_retry ELSE excluded.next_retry END, updated_at = excluded.updated_at""",
         (site_name, kind, timestamp + max(0, seconds), timestamp))
 
 
@@ -204,6 +216,22 @@ def fail_detail(connection, site_name: str, target_url: str, token: str, error: 
         (count, failure.kind, retry_at, str(failure)[:500], timestamp, site_name, target_url, token))
     if failure.scope == "site":
         pause_site(connection, site_name, failure.kind, delay, now=timestamp)
+    elif failure.kind in {"parse", "unknown"}:
+        cutoff = datetime.fromtimestamp(timestamp - 900, timezone.utc).isoformat()
+        failed_targets = {item[0] for item in connection.execute(
+            """SELECT DISTINCT target FROM crawl_jobs WHERE site_name = ? AND job_type = 'detail'
+                AND status = 'failed' AND finished_at >= ? AND error_message LIKE ? LIMIT 3""",
+            (site_name, cutoff, failure.kind + ":%"),
+        ).fetchall()}
+        if len(failed_targets | {target_url}) >= 3:
+            previous = connection.execute(
+                "SELECT failure_kind, next_retry, updated_at FROM crawl_detail_site_control WHERE site_name = ?",
+                (site_name,),
+            ).fetchone()
+            cooldown = 900
+            if previous and previous[0] == failure.kind and timestamp - float(previous[2]) < 21600:
+                cooldown = min(3600, max(900, float(previous[1]) - float(previous[2])) * 2)
+            pause_site(connection, site_name, failure.kind, cooldown, now=timestamp, detail_only=True)
     return retry_at
 
 
@@ -245,6 +273,7 @@ def complete_detail(connection, site_name, target_url, token, counts, body_hash,
         worker_pid = 0, worker_started = 0, body_hash = ?, updated_at = ?
         WHERE site_name = ? AND target_url = ? AND owner_token = ?""",
         (timestamp + 3600 if artifacts_pending else 0, str(body_hash or ""), timestamp, site_name, target_url, token))
+    connection.execute("DELETE FROM crawl_detail_site_control WHERE site_name = ?", (site_name,))
     return True
 
 

@@ -14,6 +14,8 @@ import AccountManagement from '@/views/AccountManagement.vue'
 import DocumentExposureScans from '@/views/DocumentExposureScans.vue'
 import SocialMonitoring from '@/views/SocialMonitoring.vue'
 
+const CollectorOverview = () => import('@/views/CollectorOverview.vue')
+
 const screen = (path, name, file, meta = {}) => ({
   path,
   name,
@@ -39,6 +41,8 @@ const routes = [
   screen('/document-exposure/detail/document_library/:hitId', 'DocumentExposureLibraryDetail', 'library-detail.html', { source: 'library' }),
   screen('/document-exposure/code-monitoring/detail/:hitId', 'CodeMonitoringDetail', 'code-detail.html', { source: 'code' }),
   { path: '/document-exposure/scans', name: 'DocumentExposureScans', component: DocumentExposureScans, meta: { layout: 'prototype-vue' } },
+  { path: '/collector-control/overview', name: 'CollectorOverview', component: CollectorOverview, meta: { layout: 'prototype-vue' } },
+  { path: '/collector-control/tasks', name: 'CollectorTasks', component: CollectorOverview, meta: { layout: 'prototype-vue' } },
   screen('/collector-control/sites', 'CollectorSites', 'collector-sites.html'),
   screen('/collector-control/sync', 'CollectorSync', 'collector-sync.html'),
   screen('/collector-control/runtime', 'CollectorRuntime', 'collector-runtime.html'),
@@ -54,7 +58,7 @@ const routes = [
   },
   screen('/event/:eventId', 'EventDetail', 'event-detail.html'),
   { path: '/threat-situation', redirect: '/' },
-  { path: '/collector-control', redirect: '/collector-control/sites' },
+  { path: '/collector-control', redirect: '/collector-control/overview' },
   { path: '/document-exposure', redirect: '/document-exposure/netdisk' },
   { path: '/document-exposure/settings', redirect: '/settings?tab=objects&module=netdisk' },
   { path: '/document-exposure/netdisk/settings', redirect: '/settings?tab=objects&module=netdisk' },

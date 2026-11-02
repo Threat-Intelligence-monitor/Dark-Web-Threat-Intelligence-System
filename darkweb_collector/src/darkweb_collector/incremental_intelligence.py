@@ -510,6 +510,9 @@ def _publication(connection, group, event, priority, updated_at, revision, compl
             connection.execute("INSERT INTO normalized_intelligence_events(" + ",".join(_COLUMNS) + ") VALUES (" + ",".join("?" for _ in _COLUMNS) + ") "
                 "ON CONFLICT(event_id) DO UPDATE SET " + ",".join(column + "=excluded." + column for column in _COLUMNS[1:]), tuple(row[column] for column in _COLUMNS))
             search_index.sync_search_document_delta(connection, [row])
+            from darkweb_collector.collector_metrics import record_visible_publication
+            record_visible_publication(connection, row["event_id"], row["source_site_name"],
+                                       group_key=group, is_new=current is None and not previous)
             if priority > 0:
                 connection.execute("""INSERT INTO normalized_notification_outbox(event_id, payload, revision, enqueued_at)
                     VALUES (?, ?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET payload = excluded.payload,

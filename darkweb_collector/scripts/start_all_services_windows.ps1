@@ -3517,6 +3517,28 @@ function Start-Services {
     Show-Status
 }
 
+function Recover-StoppedCollectorTasks {
+    if (-not (Test-Path -LiteralPath (Join-Path $RuntimeDir 'worker-health'))) { return }
+    if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+        Stop-WithError 'Cannot verify stopped collector tasks: prepared Python runtime is missing.'
+    }
+    $previousPythonPath = $env:PYTHONPATH
+    $previousRedisUrl = $env:REDIS_URL
+    try {
+        # Use this launcher package's recovery code even when stopping an older ServiceRoot.
+        $env:PYTHONPATH = [IO.Path]::GetFullPath((Join-Path $ScriptDir '..\src'))
+        $env:REDIS_URL = $RedisUrl
+        & $VenvPython -B -m darkweb_collector.worker_supervisor --recover-orphans
+        if ($LASTEXITCODE -ne 0) {
+            Stop-WithError 'Collector task recovery is incomplete; journals and queue data were retained.'
+        }
+    }
+    finally {
+        $env:PYTHONPATH = $previousPythonPath
+        $env:REDIS_URL = $previousRedisUrl
+    }
+}
+
 function Stop-Services {
     param([switch]$PreserveGarnet)
     $portsToClean = @($ApiPort, $FrontendPort)
@@ -3583,6 +3605,8 @@ function Stop-Services {
     if ($remainingOwned.Count -gt 0 -or $remainingManaged.Count -gt 0) {
         Stop-WithError "Managed project processes are still running after stop."
     }
+
+    Recover-StoppedCollectorTasks
 
     if ($garnetProcesses.Count) {
         # All producers, consumers and checkpoint loops have exited before the final commit.

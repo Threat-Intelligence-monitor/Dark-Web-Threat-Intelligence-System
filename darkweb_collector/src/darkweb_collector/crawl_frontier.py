@@ -202,8 +202,6 @@ def count_frontier_active(connection, site_name: str, now=None) -> int:
 
 
 def _lock_site_admission(connection, site_name, timestamp):
-    from darkweb_collector.detail_lifecycle import reconcile_detail_owners
-    reconcile_detail_owners(connection, now=timestamp)
     connection.execute(
         """INSERT INTO crawl_frontier_admission(site_name, updated_at) VALUES (?, ?)
         ON CONFLICT(site_name) DO UPDATE SET updated_at = excluded.updated_at""",
@@ -226,7 +224,21 @@ def claim_frontier(connection, site_name: str, target_url: str | None, lease_tok
         raise ValueError("A non-empty frontier lease token is required")
     timestamp = _timestamp(now)
     _lock_site_admission(connection, site_name, timestamp)
-    if count_frontier_active(connection, site_name, timestamp) >= max(1, int(max_active)):
+    from darkweb_collector.detail_lifecycle import site_retry_at
+    if site_retry_at(connection, site_name) > timestamp:
+        return None
+    active = connection.execute(
+        f"""SELECT COUNT(*) FROM (
+            SELECT f.lease_token AS identity FROM crawl_frontier f
+                WHERE f.site_name = ? AND {_ACTIVE}
+            UNION SELECT owner_token FROM crawl_detail_control
+                WHERE site_name = ? AND owner_token <> ''
+            UNION SELECT j.job_id FROM crawl_jobs j WHERE j.site_name = ? AND j.job_type = 'detail'
+                AND j.status IN ('enqueued', 'running') AND j.finished_at IS NULL
+                AND NOT EXISTS (SELECT 1 FROM crawl_frontier f WHERE f.site_name = j.site_name AND f.lease_token = j.job_id)
+        ) AS occupied""", (site_name, timestamp, timestamp, site_name, site_name),
+    ).fetchone()[0]
+    if int(active) >= max(1, int(max_active)):
         return None
     if target_url is None:
         candidates = list_frontier_candidates(connection, site_name, timestamp, limit=1)

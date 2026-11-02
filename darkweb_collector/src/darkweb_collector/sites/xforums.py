@@ -195,10 +195,12 @@ def parse_xforums_detail(url: str, html: str) -> dict:
     post = next((item for item in posts if item.has_class("is-first") or item.attrs.get("data-position") == "0"), None)
     if post is None:
         raise CollectionFailure("parse", "XForums response does not contain the original post")
-    message_body = post.first(cls="message-body")
-    body = message_body.first(cls="bbWrapper") if message_body else None
+    message_body = post.first(cls="message-body") or post.first(cls="message-userContent")
+    body = (message_body.first(cls="bbWrapper") or message_body) if message_body else None
     content = _text(body)
     if not content:
+        if body is not None and any(body.find_all(tag) for tag in ("img", "video", "audio")):
+            raise CollectionFailure("parse", "XForums original post contains media without readable text")
         raise CollectionFailure("parse", "XForums original post has no visible text")
     restricted = [
         node for node in body.find_all()

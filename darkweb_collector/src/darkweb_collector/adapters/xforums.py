@@ -7,6 +7,7 @@ from darkweb_collector.adapters.darkforums import DarkforumsAdapter
 from darkweb_collector.adapters.forum_artifacts import restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_paginated_seed
 from darkweb_collector.browser_client import fetch_html_with_browser, fetch_page_artifacts_with_browser
+from darkweb_collector.collection_errors import CollectionFailure, summarize_failures
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
 from darkweb_collector.runtime import user_data_root
 from darkweb_collector.session_cookies import resolve_session_cookie
@@ -42,6 +43,7 @@ class XforumsAdapter(DarkforumsAdapter):
     def _fetch_html(self, url: str, config: SiteConfig, mode: str) -> str:
         # HTTP is sufficient when the source allows it; challenge pages never
         # count as empty lists. Browser fallback uses the existing bounded pool.
+        failures: list[tuple[str, Exception]] = []
         try:
             html = fetch_url(
                 url, mode="tor_http", timeout_seconds=min(config.fetch_timeout_seconds, 20),
@@ -49,12 +51,23 @@ class XforumsAdapter(DarkforumsAdapter):
             )
             self.list_parser(url, html)
             return html
-        except Exception:
-            if mode != "browser":
+        except Exception as exc:
+            if mode != "browser" or (isinstance(exc, CollectionFailure) and exc.kind in {
+                "retry_budget", "unavailable", "rate_limited", "restricted",
+            }):
                 raise
-        html = fetch_html_with_browser(url, **self._browser_options(config, url))
-        self.list_parser(url, html)
-        return html
+            failures.append(("http", exc))
+        try:
+            html = fetch_html_with_browser(url, **self._browser_options(config, url))
+            self.list_parser(url, html)
+            return html
+        except CollectionFailure as exc:
+            if exc.kind in {"retry_budget", "unavailable", "rate_limited", "restricted"}:
+                raise
+            failures.append(("browser", exc))
+        except Exception as exc:
+            failures.append(("browser", exc))
+        raise summarize_failures("xforums listing fetch routes failed", failures)
 
     def collect_seed(self, config: SiteConfig, run_ctx: RunContext) -> SeedResult:
         def fetch_page(source_url: str, page: int, collected_at: str):

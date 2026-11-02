@@ -34,7 +34,7 @@ from darkweb_collector.db import (
 from darkweb_collector.collection_errors import CollectionFailure, classify_failure, has_detail_body, request_budget
 from darkweb_collector.detail_lifecycle import (
     claim_detail, complete_detail, consume_request, count_detail_writes, detail_timeout,
-    eligible_detail_tasks, fail_detail, owns_detail, reconcile_detail_owners, release_detail, reset_site_failures, site_retry_at,
+    fail_detail, owns_detail, reconcile_detail_owners, release_detail, reset_site_failures, site_retry_at, source_version,
 )
 from darkweb_collector.worker_activity import track_task
 from darkweb_collector.job_diagnostics import is_in_failure_cooldown
@@ -164,25 +164,19 @@ def _dispatch_detail_jobs(
     state_store: StateStore,
     detail_dispatcher: Callable[[SiteConfig, DetailTask], str | None] | None,
 ) -> tuple[list[str], int]:
-    dispatched: list[str] = []
-    failed = 0
     if detail_dispatcher is None:
-        return dispatched, failed
-
+        return [], 0
+    durable_tasks = []
+    for task in detail_tasks:
+        version = source_version(task)
+        metadata = {**task.metadata, "source_version": version}
+        if metadata.get("frontier_artifact_only"):
+            metadata.update(frontier_fetched_version=version, frontier_artifacts_complete=False)
+        durable_tasks.append(DetailTask(task.site_name, task.target_url, metadata))
     with get_db_connection() as connection:
-        eligible = eligible_detail_tasks(connection, config.site_name, detail_tasks)
-    detail_ttl = max(config.dedupe_window_minutes * 60, 60)
-    for detail_task in eligible:
-        if not state_store.claim_detail(config.site_name, detail_task.target_url, detail_ttl):
-            continue
-        try:
-            job_id = detail_dispatcher(config, detail_task)
-        except Exception:
-            failed += 1
-            continue
-        if job_id:
-            dispatched.append(job_id)
-    return dispatched, failed
+        observe_frontier(connection, config.site_name, durable_tasks)
+        connection.commit()
+    return _dispatch_frontier_jobs(config, detail_dispatcher)
 
 
 def _dispatch_frontier_jobs(
@@ -198,7 +192,7 @@ def _dispatch_frontier_jobs(
         with get_db_connection() as connection:
             task = claim_frontier(
                 connection, config.site_name, None, token, DISPATCH_RESERVATION_SECONDS,
-                max_active=config.frontier_dispatch_window,
+                max_active=config.max_concurrent_details,
             )
             connection.commit()
         if task is None:
@@ -215,7 +209,7 @@ def _dispatch_frontier_jobs(
                     error_message="dispatch_failed",
                 )
                 connection.commit()
-            continue
+            break
         with get_db_connection() as connection:
             mark_frontier_queued(connection, config.site_name, task.target_url, token)
             connection.commit()
@@ -248,7 +242,7 @@ def execute_seed_job(
         if force:
             reset_site_failures(connection, site_name)
             connection.commit()
-        elif site_retry_at(connection, site_name) > time.time():
+        elif site_retry_at(connection, site_name, include_detail=False) > time.time():
             return {"site_name": site_name, "seed_job_id": run_ctx.job_id, "reason": "source_cooldown",
                     "detail_job_ids": [], "detail_task_count": 0, "detail_dispatched_count": 0}
     seed_result = adapter.collect_seed(config, run_ctx)
@@ -263,7 +257,8 @@ def execute_seed_job(
     for error in pagination_errors:
         logger.warning(
             "%s listing page %s (%s) failed: %s; successful pages and retry position retained",
-            site_name, error.get("page"), error.get("lane"), error.get("error_type"),
+            site_name, error.get("page"), error.get("lane"),
+            f"{error.get('kind', error.get('error_type'))}: {error.get('error_message', '')}",
         )
     if uses_frontier:
         with get_db_connection() as connection:
@@ -528,8 +523,11 @@ def enqueue_due_sites(
     seed_dispatcher: Callable[[SiteConfig], str | None],
     state_store: StateStore,
     config_path: Path | None = None,
+    detail_dispatcher: Callable[[SiteConfig, DetailTask], str | None] | None = None,
 ) -> list[dict[str, str]]:
     dispatched: list[dict[str, str]] = []
+    from darkweb_collector.worker_supervisor import recover_orphaned_activities
+    recover_orphaned_activities()
     configs = load_site_configs(config_path)
     for config in configs:
         if not config.enabled:
@@ -540,12 +538,20 @@ def enqueue_due_sites(
         recover_changan_session(config, str(auth.get("auth_message") or "session expired"))
 
     with get_db_connection() as connection:
+        reconcile_detail_owners(connection)
         reconcile_stale_crawl_jobs(connection)
         connection.commit()
+        try:
+            from darkweb_collector.collector_metrics import record_queue_snapshot
+            record_queue_snapshot(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            logger.exception("failed to record collector queue snapshot")
         for config in configs:
             if not config.enabled:
                 continue
-            if site_retry_at(connection, config.site_name) > time.time():
+            if site_retry_at(connection, config.site_name, include_detail=False) > time.time():
                 continue
             if not site_auth_readiness(config)["ready"]:
                 continue
@@ -579,6 +585,15 @@ def enqueue_due_sites(
             # The dispatcher commits its enqueue row before publishing the task.
             dispatched.append({"site_name": config.site_name, "job_id": job_id, "queue_name": queue_name})
         connection.commit()
+    if detail_dispatcher is None:
+        from darkweb_collector.tasks import _enqueue_detail_task
+        detail_dispatcher = _enqueue_detail_task
+    for config in configs:
+        if config.enabled:
+            try:
+                _dispatch_frontier_jobs(config, detail_dispatcher)
+            except Exception:
+                logger.exception("failed to dispatch pending details for %s", config.site_name)
     return dispatched
 
 
