@@ -2429,6 +2429,18 @@ function bindIncidentBody(root, state, detail, id, sectionId) {
   if (!section) return
   const original = usableText(detail.detail_text) || usableText(detail.summary) || usableText(detail.original_summary)
   setText(section, 'pre', original || (detail.summary_unavailable ? '原摘要不可用，需重新同步来源' : '当前接口未提供正文证据'))
+  let accessNotice = query(section, '[data-content-access-notice]')
+  if (detail.content_access === 'partial') {
+    if (!accessNotice) {
+      accessNotice = document.createElement('p')
+      accessNotice.className = 'muted'
+      accessNotice.dataset.contentAccessNotice = '1'
+      accessNotice.textContent = '当前展示游客可见内容，部分内容需登录后查看'
+      query(section, 'pre')?.before(accessNotice)
+    }
+  } else {
+    accessNotice?.remove()
+  }
   const translate = query(section, 'button[data-toast], [data-runtime-translate]')
   if (!translate) return
   delete translate.dataset.toast

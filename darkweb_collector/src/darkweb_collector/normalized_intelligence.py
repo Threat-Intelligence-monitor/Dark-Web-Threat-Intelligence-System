@@ -44,6 +44,7 @@ from darkweb_collector.sites.breachforums import normalize_breachforums_timestam
 from darkweb_collector.sites.cracked import normalize_cracked_timestamp
 from darkweb_collector.sites.darkforums import clean_extracted_attackers, normalize_darkforums_timestamp
 from darkweb_collector.sites.pwnfrm import normalize_pwnfrm_timestamp
+from darkweb_collector.sites.spear import normalize_spear_timestamp
 from darkweb_collector.sites.xforums import normalize_xforums_timestamp
 from darkweb_collector.utils import safe_stem
 from darkweb_collector.vulnerability_i18n import (
@@ -80,6 +81,7 @@ SOURCE_LABELS = {
     "lynx": "Lynx",
     "pwnfrm": "PwnedForums",
     "raidforums": "RaidForums",
+    "spear": "Spear",
     "xforums": "XForums（xforums.st）",
     "baidu_wenku": "百度文库",
     "docin": "豆丁",
@@ -425,6 +427,7 @@ SOURCE_HOSTNAME_KEYWORDS = {
     "lynx",
     "pwnfrm",
     "raidforums",
+    "spear.cx",
     "xforums",
     "blogspot",
     "wordpress",
@@ -438,6 +441,7 @@ _FORUM_TIMESTAMP_NORMALIZERS = {
     "darkforums": normalize_darkforums_timestamp,
     "pwnfrm": normalize_pwnfrm_timestamp,
     "raidforums": normalize_pwnfrm_timestamp,
+    "spear": normalize_spear_timestamp,
     "xforums": normalize_xforums_timestamp,
 }
 
@@ -1787,7 +1791,7 @@ def _infer_region(*texts: str) -> str:
 
 def _classify_forum_leak_type(section: str, title: str, content: str) -> str:
     text = f"{title} {content}".lower()
-    if any(keyword in text for keyword in ("password", "credential", "combo", "combolist", "fullz", "account")):
+    if section == "stealer_logs" or any(keyword in text for keyword in ("password", "credential", "combo", "combolist", "fullz", "account")):
         return "凭证泄露"
     if any(keyword in text for keyword in ("source code", "repo", "repository", "git", "github")):
         return "源代码泄露"
@@ -2208,6 +2212,7 @@ def _build_forum_base_event(row: dict[str, Any], domain_cache: dict[str, Any] | 
             "section": str(row.get("section") or ""),
             "source": str(row.get("site_name") or ""),
             "source_label": _label_source(row.get("site_name")),
+            **({"content_access": raw_json["content_access"]} if raw_json.get("content_access") in ("public", "partial") else {}),
             "updated_time": row.get("fetched_at") or disclosure_time,
             "victim_candidates": _clean_entity_candidates(victim_candidates)[:8],
             "domain_candidates": domain_candidates[:8],
@@ -3445,6 +3450,7 @@ def normalized_event_to_detail(event: dict[str, Any]) -> dict[str, Any]:
         "attacker": event["attacker"],
         "disclosure_url": event.get("source_url") or "",
         "detail_text": event.get("detail_text") or "",
+        **({"content_access": metadata["content_access"]} if metadata.get("content_access") in ("public", "partial") else {}),
         "category": event["category"],
         "source": _label_source(event["source"]),
         "industry": _label_industry(event["industry"]),

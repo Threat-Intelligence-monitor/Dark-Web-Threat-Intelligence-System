@@ -1132,6 +1132,8 @@ def upsert_forum_detail(connection: sqlite3.Connection, **kwargs) -> int:
         "attackers": attackers_str,
         "content_hash": kwargs["content_hash"]
     }
+    if kwargs.get("content_access") in {"public", "partial"}:
+        payload["content_access"] = kwargs["content_access"]
     
     raw_json = json.dumps(payload, ensure_ascii=False)
     

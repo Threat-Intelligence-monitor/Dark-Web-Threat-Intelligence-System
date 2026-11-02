@@ -50,6 +50,7 @@ from darkweb_collector.normalized_intelligence import (
     _hydrate_event_row,
     _label_source as _normalized_source_label,
     _normalize_label,
+    _normalize_forum_timestamp,
     _severity_from_vulnerability,
     build_display_title,
     load_normalized_event_detail,
@@ -60,7 +61,6 @@ from darkweb_collector.normalization_runtime import get_normalization_runtime_st
 from darkweb_collector.queueing import queue_for_detail, queue_for_seed
 from darkweb_collector.search_schema import SEARCH_ORDER, event_report_time
 from darkweb_collector.runtime import active_release_config, default_db_path, output_root, project_root
-from darkweb_collector.sites.darkforums import normalize_darkforums_timestamp
 from darkweb_collector.site_auth import site_auth_readiness, site_display_name
 from darkweb_collector.utils import safe_stem
 from darkweb_collector.vulnerability_i18n import is_translation_error, resolve_vulnerability_summary
@@ -69,7 +69,9 @@ from darkweb_collector.worker_supervisor import queue_health_errors
 
 SECTION_LABELS = {
     "databases": "数据库板块",
+    "stealer_logs": "窃密日志板块",
     "other_leaks": "其他泄露板块",
+    "leaked_tools": "泄露工具板块",
     "sellers_place": "卖家交易板块",
 }
 
@@ -609,7 +611,8 @@ def _build_forum_event_payload(row_dict: dict[str, Any]) -> dict[str, Any]:
     victims = row_dict.get("victims") or raw_json.get("victims") or ""
     disclosure_time = (
         raw_json.get("published_at_utc")
-        or normalize_darkforums_timestamp(
+        or _normalize_forum_timestamp(
+            row_dict.get("site_name"),
             raw_json.get("timestamp") or row_dict.get("timestamps"),
             collected_at_utc=row_dict.get("fetched_at"),
         )
@@ -631,6 +634,7 @@ def _build_forum_event_payload(row_dict: dict[str, Any]) -> dict[str, Any]:
         "attacker": attackers or _label_source(row_dict.get("site_name")),
         "disclosure_url": row_dict.get("topic_url") or "",
         "detail_text": row_dict.get("content") or "",
+        **({"content_access": raw_json["content_access"]} if raw_json.get("content_access") in ("public", "partial") else {}),
         "category": SECTION_LABELS.get(row_dict.get("section", ""), row_dict.get("section", "未知")),
         "source": _label_source(row_dict.get("site_name")),
         "industry": _label_industry(row_dict.get("industry")),

@@ -123,6 +123,32 @@
       "fetch_timeout_seconds": 90
     },
     {
+      "site_name": "spear",
+      "enabled": true,
+      "seed_urls": [
+        "https://spear.cx/Forum-Databases?sortby=started&order=desc&datecut=9999",
+        "https://spear.cx/Forum-Stealer-Logs?sortby=started&order=desc&datecut=9999",
+        "https://spear.cx/Forum-Other-Leaks?sortby=started&order=desc&datecut=9999",
+        "https://spear.cx/Forum-Leaked-Tools?sortby=started&order=desc&datecut=9999"
+      ],
+      "seed_fetch_mode": "browser",
+      "detail_fetch_mode": "browser",
+      "browser_queue": "browser_public",
+      "profile": "hot",
+      "max_topics_per_run": 20,
+      "max_detail_pages_per_run": 10,
+      "cooldown_seconds": 900,
+      "output_dir": "output/spear",
+      "dedupe_window_minutes": 180,
+      "recent_pages_per_run": 1,
+      "backfill_pages_per_run": 5,
+      "frontier_max_pending": 500,
+      "max_concurrent_details": 1,
+      "display_name": "Spear",
+      "render_wait_seconds": 8,
+      "fetch_timeout_seconds": 90
+    },
+    {
       "site_name": "raidforums",
       "enabled": true,
       "seed_urls": [
