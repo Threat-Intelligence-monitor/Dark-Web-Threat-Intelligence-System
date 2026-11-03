@@ -7,8 +7,8 @@ from urllib.parse import urlparse
 from darkweb_collector.adapters.base import SiteAdapter
 from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
-from darkweb_collector.browser_client import screenshot_html_with_browser
-from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, summarize_failures
+from darkweb_collector.browser_client import fetch_html_with_browser, fetch_page_artifacts_with_browser, screenshot_html_with_browser
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, safe_failure_text, summarize_failures
 from darkweb_collector.db import (
     get_db_connection,
     get_forum_detail_snapshot,
@@ -17,9 +17,9 @@ from darkweb_collector.db import (
     upsert_forum_topic,
 )
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
-from darkweb_collector.session_cookies import resolve_session_cookie
+from darkweb_collector.source_sessions import browser_session_options, http_session_options
 from darkweb_collector.sites.darkforums import parse_darkforums_detail, parse_darkforums_list
-from darkweb_collector.tor_fetch import fetch_page_artifacts, fetch_url, fetch_via_http_proxy
+from darkweb_collector.tor_fetch import browser_proxy_server_for_url, fetch_url, fetch_via_http_proxy, is_onion_url
 from darkweb_collector.utils import dump_json, dump_text, safe_stem
 
 
@@ -52,29 +52,47 @@ class DarkforumsAdapter(SiteAdapter):
     def _is_valid_seed_html(html: str) -> bool:
         return is_forum_listing_html(html)
 
+    @staticmethod
+    def _browser_options(config: SiteConfig, url: str) -> dict:
+        proxy_server = browser_proxy_server_for_url(url)
+        return {
+            "wait_seconds": config.render_wait_seconds,
+            "timeout_seconds": config.fetch_timeout_seconds,
+            "proxy_server": proxy_server,
+            **browser_session_options(config, url, proxy_server),
+            "browser_engine": str(config.extras.get("browser_engine") or "firefox"),
+        }
+
     def _fetch_html(self, url: str, config: SiteConfig, mode: str) -> str:
-        routes = (
-            ("direct", lambda: fetch_via_http_proxy(
-                url,
-                timeout=config.fetch_timeout_seconds,
-                retries=0,
-                bypass_proxy=True,
-            )),
-            ("fallback", lambda: fetch_url(
-                url=url,
-                mode=mode,
-                timeout_seconds=config.fetch_timeout_seconds,
-                render_wait_seconds=config.render_wait_seconds,
-                retries=1,
-            )),
-        )
+        proxy_server = browser_proxy_server_for_url(url)
+        def validate(html):
+            raise_if_error_page(html)
+            if not self._is_valid_seed_html(html):
+                raise CollectionFailure("parse", f"{self.site_name} response has no recognized forum listing")
+            self.list_parser(url, html)
+            return True
+
+        routes = []
+        if not is_onion_url(url):
+            routes.append(("direct", lambda: fetch_via_http_proxy(
+                url, timeout=config.fetch_timeout_seconds, retries=0, bypass_proxy=True,
+                **http_session_options(config, url, None),
+            )))
+        if mode == "browser":
+            routes.append(("browser", lambda: fetch_html_with_browser(
+                url, validate_html=validate, **self._browser_options(config, url),
+            )))
+        elif is_onion_url(url) or proxy_server:
+            routes.append(("proxy", lambda: fetch_url(
+                url=url, mode=mode, timeout_seconds=config.fetch_timeout_seconds,
+                retries=0, **http_session_options(config, url, proxy_server),
+            )))
         failures: list[tuple[str, Exception]] = []
         for route_name, fetcher in routes:
             try:
                 html = fetcher()
-                raise_if_error_page(html)
-                if not self._is_valid_seed_html(html):
-                    raise CollectionFailure("parse", f"{self.site_name} response has no recognized forum listing")
+                if route_name != "browser":
+                    validate(html)
                 return html
             except CollectionFailure as exc:
                 if exc.kind in self.terminal_failure_kinds:
@@ -166,75 +184,84 @@ class DarkforumsAdapter(SiteAdapter):
         )
         if restored is not None:
             return restored
-        html = ""
-        screenshot_png = None
-        failures: list[tuple[str, Exception]] = []
-        try:
-            direct_html = fetch_via_http_proxy(
-                detail_task.target_url,
-                timeout=config.fetch_timeout_seconds,
-                retries=0,
-                bypass_proxy=True,
-                cookie_header=resolve_session_cookie(config),
-            )
-            raise_if_error_page(direct_html)
-            if self._is_valid_detail_html(direct_html):
-                direct_detail = self.detail_parser(detail_task.target_url, direct_html)
-                if self._is_valid_detail_payload(direct_detail):
-                    try:
-                        screenshot_png = screenshot_html_with_browser(
-                            direct_html,
-                            detail_task.target_url,
-                            wait_seconds=config.render_wait_seconds,
-                            timeout_seconds=config.fetch_timeout_seconds,
-                            screenshot_selectors=self.detail_screenshot_selectors,
-                            hide_selectors=("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
-                        )
-                    except Exception:
-                        screenshot_png = None
-                    return DetailResult(
-                        site_name=self.site_name,
-                        target_url=detail_task.target_url,
-                        payload=direct_detail,
-                        raw_html=direct_html,
-                        screenshot_png=screenshot_png,
-                        metadata=detail_task.metadata,
-                    )
-                raise CollectionFailure("parse", f"{self.site_name} detail has no visible post content")
-            raise CollectionFailure("parse", f"{self.site_name} detail has no recognized post structure")
-        except CollectionFailure as exc:
-            if exc.kind in self.terminal_failure_kinds:
-                raise
-            failures.append(("direct", exc))
-        except Exception as exc:
-            failures.append(("direct", exc))
-        try:
-            html, screenshot_png = fetch_page_artifacts(
-                url=detail_task.target_url,
-                mode=config.detail_fetch_mode,
-                timeout_seconds=config.fetch_timeout_seconds,
-                render_wait_seconds=config.render_wait_seconds,
-                screenshot_selectors=self.detail_screenshot_selectors,
-                hide_selectors=("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
-                render_html_for_screenshot=True,
-                cookie_header=resolve_session_cookie(config),
-            )
+        url = detail_task.target_url
+        proxy_server = browser_proxy_server_for_url(url)
+        hide_selectors = ("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer")
+        detail, parsed_html = {}, None
+        def validate(html):
+            nonlocal detail, parsed_html
+            if html == parsed_html:
+                return True
             raise_if_error_page(html)
             if not self._is_valid_detail_html(html):
                 raise CollectionFailure("parse", f"{self.site_name} detail has no recognized post structure")
-            detail = self.detail_parser(detail_task.target_url, html)
-            if not self._is_valid_detail_payload(detail):
+            parsed = self.detail_parser(url, html)
+            if not self._is_valid_detail_payload(parsed):
                 raise CollectionFailure("parse", f"{self.site_name} detail has no visible post content")
-            return DetailResult(
-                site_name=self.site_name, target_url=detail_task.target_url, payload=detail,
-                raw_html=html, screenshot_png=screenshot_png, metadata=detail_task.metadata,
-            )
-        except CollectionFailure as exc:
-            if exc.kind in self.terminal_failure_kinds:
-                raise
-            failures.append(("fallback", exc))
-        except Exception as exc:
-            failures.append(("fallback", exc))
+            detail, parsed_html = parsed, html
+            return True
+
+        routes = [] if is_onion_url(url) else ["direct"]
+        if config.detail_fetch_mode == "browser":
+            routes.append("browser")
+        elif is_onion_url(url) or proxy_server:
+            routes.append("proxy")
+        failures: list[tuple[str, Exception]] = []
+        for route in routes:
+            try:
+                artifact_error = ""
+                if route == "browser":
+                    html, screenshot_png = fetch_page_artifacts_with_browser(
+                        url, screenshot_selectors=self.detail_screenshot_selectors,
+                        hide_selectors=hide_selectors, validate_html=validate,
+                        **self._browser_options(config, url),
+                    )
+                else:
+                    route_proxy = None if route == "direct" else proxy_server
+                    http_options = http_session_options(config, url, route_proxy)
+                    if route == "direct":
+                        html = fetch_via_http_proxy(
+                            url, timeout=config.fetch_timeout_seconds, retries=0, bypass_proxy=True,
+                            **http_options,
+                        )
+                    else:
+                        html = fetch_url(
+                            url, mode=config.detail_fetch_mode, timeout_seconds=config.fetch_timeout_seconds,
+                            retries=0, **http_options,
+                        )
+                    validate(html)
+                    try:
+                        session_options = browser_session_options(config, url, route_proxy)
+                        screenshot_png = screenshot_html_with_browser(
+                            html, url,
+                            wait_seconds=config.render_wait_seconds,
+                            timeout_seconds=config.fetch_timeout_seconds,
+                            proxy_server=route_proxy,
+                            browser_engine=str(config.extras.get("browser_engine") or "firefox"),
+                            storage_state_path=session_options["storage_state_path"],
+                            cookie_header=session_options["cookie_header"],
+                            user_agent=http_options["user_agent"],
+                            screenshot_selectors=self.detail_screenshot_selectors,
+                            hide_selectors=hide_selectors,
+                        )
+                    except Exception as exc:
+                        screenshot_png = None
+                        artifact_error = safe_failure_text(f"artifact: forum evidence capture failed ({type(exc).__name__}): {exc}")
+                metadata = dict(detail_task.metadata)
+                metadata.pop("artifact_error", None)
+                if not screenshot_png:
+                    metadata["artifact_error"] = artifact_error or "artifact: forum evidence capture produced no image"
+                    detail["_collector_artifact_error"] = metadata["artifact_error"]
+                return DetailResult(
+                    site_name=self.site_name, target_url=url, payload=detail,
+                    raw_html=html, screenshot_png=screenshot_png or None, metadata=metadata,
+                )
+            except CollectionFailure as exc:
+                if exc.kind in self.terminal_failure_kinds:
+                    raise
+                failures.append((route, exc))
+            except Exception as exc:
+                failures.append((route, exc))
         raise summarize_failures(f"{self.site_name} detail fetch routes failed", failures)
 
     def persist(

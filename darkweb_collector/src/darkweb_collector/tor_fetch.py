@@ -9,6 +9,7 @@ import traceback
 import time
 import os
 import tempfile
+from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlparse
 
 from darkweb_collector.collection_errors import CollectionFailure, managed_request, request_attempt, raise_if_error_page
@@ -67,6 +68,57 @@ def _read_retry_after_headers(path: str) -> dict[str, str]:
     return {"retry-after": value} if value else {}
 
 
+def _write_curl_cookies(path: str, url: str, cookie_header: str | None, cookies: list[dict] | None) -> None:
+    origin = urlparse(url)
+    host = (origin.hostname or "").lower()
+    explicit = SimpleCookie()
+    if cookie_header:
+        if any(ord(char) < 32 or ord(char) == 127 for char in cookie_header):
+            raise CollectionFailure("infrastructure", "invalid source cookie configuration")
+        try:
+            explicit.load(cookie_header)
+        except CookieError as exc:
+            raise CollectionFailure("infrastructure", "invalid source cookie configuration") from exc
+        if not explicit or any(ord(char) < 32 or ord(char) == 127
+                               for item in explicit.values() for char in item.value):
+            raise CollectionFailure("infrastructure", "invalid source cookie configuration")
+    rows = []
+    for cookie in cookies or []:
+        name, value = str(cookie.get("name") or ""), str(cookie.get("value") or "")
+        domain = str(cookie.get("domain") or "").lower()
+        bare_domain = domain.lstrip(".")
+        include_subdomains = domain.startswith(".") and not cookie.get("hostOnly", False)
+        if not bare_domain or not (host == bare_domain or include_subdomains and host.endswith("." + bare_domain)):
+            continue
+        if name in explicit:
+            continue
+        try:
+            expires = float(cookie.get("expires", -1))
+            if expires != -1 and expires <= time.time():
+                continue
+            expires = max(0, int(expires))
+        except (ValueError, TypeError, OverflowError):
+            continue
+        cookie_path = str(cookie.get("path") or "/")
+        fields = (domain, name, value, cookie_path)
+        if not name or any(ord(char) < 32 or ord(char) == 127 for field in fields for char in field):
+            continue
+        if not cookie_path.startswith("/") or any(char in domain for char in "/\\: "):
+            continue
+        rows.append((domain if include_subdomains else bare_domain, include_subdomains, cookie_path,
+                     bool(cookie.get("secure")), expires, name, value))
+    # An explicit Cookie header has no scope metadata. Restrict it to the
+    # requested host, with Secure set for an HTTPS origin, rather than forwarding
+    # the raw header through redirects.
+    rows.extend((host, False, "/", origin.scheme == "https", 0, name, value.value)
+                for name, value in explicit.items())
+    with open(path, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("# Netscape HTTP Cookie File\n")
+        for domain, subdomains, cookie_path, secure, expires, name, value in rows:
+            stream.write("\t".join((domain, str(subdomains).upper(), cookie_path,
+                                   str(secure).upper(), str(expires), name, value)) + "\n")
+
+
 def raise_for_http_status(
     status: int, html: str | None = None, *, headers: Mapping[str, str] | None = None,
 ) -> None:
@@ -86,7 +138,7 @@ def raise_for_http_status(
     if status == 403:
         raise CollectionFailure("blocked", "HTTP 403; source refused the request", scope="target")
     if status in {404, 410}:
-        raise CollectionFailure("unknown", f"HTTP {status}; target availability is unconfirmed")
+        raise CollectionFailure("not_found", f"HTTP {status}; target availability is unconfirmed", scope="target")
     if status in {408, 504}:
         raise CollectionFailure("timeout", f"HTTP {status}; source request timed out")
     if isinstance(status, int) and 500 <= status < 600:
@@ -143,6 +195,8 @@ def fetch_url(
     render_wait_seconds: int = 8,
     retries: int = 1,
     cookie_header: str | None = None,
+    user_agent: str | None = None,
+    cookies: list[dict] | None = None,
 ) -> str:
     if mode == "browser":
         from darkweb_collector.browser_client import fetch_html_with_browser
@@ -164,6 +218,8 @@ def fetch_url(
             timeout=timeout_seconds,
             retries=retries,
             cookie_header=cookie_header,
+            user_agent=user_agent,
+            cookies=cookies,
         )
 
     proxy_host, proxy_port = get_http_proxy_settings()
@@ -175,6 +231,8 @@ def fetch_url(
         retries=retries,
         backoff_seconds=3.0,
         cookie_header=cookie_header,
+        user_agent=user_agent,
+        cookies=cookies,
     )
 
 
@@ -259,55 +317,58 @@ def fetch_via_tor_curl(
     retries: int = 0,
     backoff_seconds: float = 2.0,
     cookie_header: str | None = None,
+    user_agent: str | None = None,
+    cookies: list[dict] | None = None,
 ) -> str:
     curl = shutil.which("curl")
     if not curl:
         raise TorFetchError("curl not found in PATH", kind="infrastructure")
 
+    if user_agent and any(ord(char) < 32 or ord(char) == 127 for char in user_agent):
+        raise CollectionFailure("infrastructure", "invalid source user-agent configuration")
     attempts = 1 if managed_request() else retries + 1
-    for attempt in range(1, attempts + 1):
-        command = [
-            curl,
-            "--socks5-hostname",
-            f"{socks_host}:{socks_port}",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time",
-            str(timeout),
-            "--write-out",
-            "\nDWTI_HTTP_STATUS:%{http_code}",
-            "--user-agent",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        ]
-        if cookie_header:
-            command.extend(["--cookie", cookie_header])
-        descriptor, headers_file = tempfile.mkstemp(prefix="dwti-tor-headers-", suffix=".txt")
-        os.close(descriptor)
-        command.extend(["--dump-header", headers_file, url])
-        try:
+    with tempfile.TemporaryDirectory(prefix="dwti-tor-fetch-") as temp_dir:
+        cookie_file = os.path.join(temp_dir, "cookies.txt")
+        headers_file = os.path.join(temp_dir, "headers.txt")
+        _write_curl_cookies(cookie_file, url, cookie_header, cookies)
+        for attempt in range(1, attempts + 1):
+            command = [
+                curl,
+                "--socks5-hostname",
+                f"{socks_host}:{socks_port}",
+                "--noproxy", "",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--max-time",
+                str(timeout),
+                "--write-out",
+                "\nDWTI_HTTP_STATUS:%{http_code}",
+                "--user-agent",
+                user_agent or ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+                "--cookie", cookie_file,
+                "--cookie-jar", cookie_file,
+                "--dump-header", headers_file,
+            ]
+            command.append(url)
+
             request_attempt()
             result = subprocess.run(command, capture_output=True, check=False)
             response_headers = _read_retry_after_headers(headers_file)
-        finally:
-            try:
-                os.unlink(headers_file)
-            except FileNotFoundError:
-                pass
-        output = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
-        body, marker, code = output.rpartition("\nDWTI_HTTP_STATUS:")
-        status = int(code.strip()) if marker and code.strip().isdigit() else 0
-        if result.returncode == 0:
-            content = body if marker else output
-            raise_for_http_status(status, content, headers=response_headers)
-            return content
-        raise_for_http_status(status, headers=response_headers)
+            output = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
+            body, marker, code = output.rpartition("\nDWTI_HTTP_STATUS:")
+            status = int(code.strip()) if marker and code.strip().isdigit() else 0
+            if result.returncode == 0:
+                content = body if marker else output
+                raise_for_http_status(status, content, headers=response_headers)
+                return content
+            raise_for_http_status(status, headers=response_headers)
 
-        if attempt < attempts:
-            time.sleep(backoff_seconds * attempt)
+            if attempt < attempts:
+                time.sleep(backoff_seconds * attempt)
 
-    raise TorFetchError(f"curl fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
+        raise TorFetchError(f"curl fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
 
 def fetch_with_cloudflare_bypass(
     url: str,
@@ -440,11 +501,13 @@ def fetch_via_http_proxy(
     backoff_seconds: float = 3.0,
     cookie_header: str | None = None,
     bypass_proxy: bool = False,
+    user_agent: str | None = None,
+    cookies: list[dict] | None = None,
 ) -> str:
     """
     Fetch URL using HTTP/HTTPS proxy (e.g., Clash, Shadowsocks, etc.)
     If no proxy is configured, fetches directly.
-    
+
     Args:
         url: The URL to fetch
         proxy_host: Proxy host (default: from env PROXY_HOST or None)
@@ -452,12 +515,12 @@ def fetch_via_http_proxy(
         timeout: Request timeout in seconds
         retries: Number of retries on failure
         backoff_seconds: Base backoff time between retries
-    
+
     Returns:
         The HTML content of the page
     """
     import random
-    
+
     # Get proxy settings from environment (no defaults - must be explicitly set)
     if bypass_proxy:
         proxy_host = None
@@ -466,7 +529,7 @@ def fetch_via_http_proxy(
         proxy_host = proxy_host or os.environ.get("PROXY_HOST")
         proxy_port_str = os.environ.get("PROXY_PORT")
         proxy_port = proxy_port or (int(proxy_port_str) if proxy_port_str else None)
-    
+
     # Use different user agents
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -475,10 +538,12 @@ def fetch_via_http_proxy(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:123.0) Gecko/20100101 Firefox/123.0"
     ]
-    
-    # Randomly select a user agent
-    user_agent = random.choice(user_agents)
-    
+
+    # Keep the validated browser session's user agent when one is supplied.
+    user_agent = user_agent or random.choice(user_agents)
+    if any(ord(char) < 32 or ord(char) == 127 for char in user_agent):
+        raise CollectionFailure("infrastructure", "invalid source user-agent configuration")
+
     # Generate random accept headers
     accept_languages = [
         "en-US,en;q=0.9",
@@ -486,22 +551,21 @@ def fetch_via_http_proxy(
         "en-CA,en;q=0.9,en-US;q=0.8",
         "en-AU,en;q=0.9,en-US;q=0.8"
     ]
-    
+
     accept_language = random.choice(accept_languages)
-    
+
     # Use curl with HTTP proxy
     curl = shutil.which("curl")
     if not curl:
         raise ProxyFetchError("curl not found in PATH", kind="infrastructure")
-    
+
     attempts = 1 if managed_request() else retries + 1
-    
-    # Keep cookies, body and response headers private to this fetch and clean up on every exit.
+
     with tempfile.TemporaryDirectory(prefix="dwti-http-fetch-") as temp_dir:
         cookie_file = os.path.join(temp_dir, "cookies.txt")
         output_file = os.path.join(temp_dir, "temp.html")
         headers_file = os.path.join(temp_dir, "headers.txt")
-
+        _write_curl_cookies(cookie_file, url, cookie_header, cookies)
         for attempt in range(1, attempts + 1):
             # Generate headers
             # Note: Not sending Accept-Encoding to avoid compressed responses
@@ -534,13 +598,10 @@ def fetch_via_http_proxy(
             ]
 
             # Add proxy if configured
-            if bypass_proxy:
+            if bypass_proxy or not (proxy_host and proxy_port):
                 command.extend(["--noproxy", "*"])
-            elif proxy_host and proxy_port:
-                command.extend(["--proxy", f"http://{proxy_host}:{proxy_port}"])
-
-            if cookie_header:
-                command.extend(["--header", f"Cookie: {cookie_header}"])
+            else:
+                command.extend(["--proxy", f"http://{proxy_host}:{proxy_port}", "--noproxy", ""])
 
             command.extend(headers + [url])
 
@@ -564,8 +625,8 @@ def fetch_via_http_proxy(
 
             if attempt < attempts:
                 time.sleep(backoff_seconds * attempt)
-    
-    raise ProxyFetchError(f"proxy fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
+
+        raise ProxyFetchError(f"proxy fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
 
 
 def fetch_with_proxy_bypass(

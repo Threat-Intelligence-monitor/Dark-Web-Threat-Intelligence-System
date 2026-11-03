@@ -45,14 +45,7 @@ def parse_breachforums_list(url: str, html: str, max_topics: int = 20) -> dict:
 
 
 def parse_breachforums_detail(url: str, html: str) -> dict:
-    posts = list(re.finditer(r'<div\b[^>]*\bid=[\'"]post_\d+[\'"][^>]*>', html, re.IGNORECASE))
-    scoped_html = html
-    if posts:
-        title = re.search(r"<title>.*?</title>", html, re.IGNORECASE | re.DOTALL)
-        end = posts[1].start() if len(posts) > 1 else len(html)
-        scoped_html = (title.group(0) if title else "") + html[posts[0].start():end]
-    scoped_html = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", scoped_html, flags=re.IGNORECASE | re.DOTALL)
-    detail = parse_pwnfrm_detail(url, scoped_html, site_name="breachforums")
+    detail = parse_pwnfrm_detail(url, html, site_name="breachforums")
     detail["published_at_utc"] = normalize_breachforums_timestamp(
         detail.get("timestamp"), collected_at_utc=detail["collected_at_utc"],
     )

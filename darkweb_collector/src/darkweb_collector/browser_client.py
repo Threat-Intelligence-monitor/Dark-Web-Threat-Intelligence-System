@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import atexit
-import json
-import os
 from pathlib import Path
 from threading import Lock, current_thread
 import traceback
 import time
 from dataclasses import dataclass
-from urllib.parse import urldefrag, urlparse
+from typing import Callable
+from urllib.parse import urlparse
 
-from darkweb_collector.collection_errors import CollectionFailure, request_attempt
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt
 from darkweb_collector.tor_fetch import raise_for_http_status
+from darkweb_collector.source_sessions import read_browser_session, persist_browser_session, same_source
 
 
 @dataclass(frozen=True)
@@ -21,7 +21,7 @@ class BrowserProxyConfig:
 
 
 _CAPTURE_READY_SCRIPT = r"""
-() => {
+(waitForImages = true) => {
     const isVisible = (element) => {
         const style = window.getComputedStyle(element);
         const rect = element.getBoundingClientRect();
@@ -34,10 +34,20 @@ _CAPTURE_READY_SCRIPT = r"""
         const text = String(element.textContent || '').replace(/\s+/g, ' ').trim();
         return text.length <= 80 && loadingText.test(text);
     });
-    const hasPendingImage = Array.from(document.images || []).some(
-        (image) => isVisible(image) && Boolean(image.currentSrc || image.src) && !image.complete
-    );
-    return document.readyState !== 'loading' && !hasVisibleLoadingState && !hasPendingImage;
+    const visibleImages = Array.from(document.images || []).filter((image) => {
+        const style = window.getComputedStyle(image);
+        return image.getClientRects().length > 0 && style.display !== 'none' &&
+            style.visibility !== 'hidden' && Number(style.opacity || 1) > 0 &&
+            Boolean(image.currentSrc || image.src);
+    });
+    if (waitForImages && visibleImages.some(image => image.complete && image.naturalWidth === 0))
+        throw new Error('visible source image failed to load; screenshot skipped');
+    const hasPendingImage = visibleImages.some(image => !image.complete);
+    const hasContent = document.body && isVisible(document.body) &&
+        (document.body.innerText.trim().length > 0 || Array.from(document.images || []).some(isVisible));
+    return document.readyState !== 'loading' && hasContent &&
+        !hasVisibleLoadingState && (!waitForImages ||
+            ((!document.fonts || document.fonts.status !== 'loading') && !hasPendingImage));
 }
 """
 
@@ -63,6 +73,13 @@ def _cookie_rows(cookie_header: str | None, url: str) -> list[dict[str, object]]
             }
         )
     return rows
+
+
+def _remaining_timeout_ms(deadline: float, maximum: int) -> int:
+    remaining = int((deadline - time.monotonic()) * 1000)
+    if remaining <= 0:
+        raise TimeoutError("browser capture deadline was exhausted")
+    return min(remaining, maximum)
 
 
 class BrowserClient:
@@ -112,6 +129,13 @@ class BrowserClient:
             self.close()
             self._open()
 
+    def _default_user_agent(self) -> str:
+        version = str(self._browser.version)
+        if self._proxy.engine == "chromium":
+            return ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{version} Safari/537.36")
+        return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{version}) Gecko/20100101 Firefox/{version}"
+
     def fetch_page_artifacts(
         self,
         url: str,
@@ -126,6 +150,8 @@ class BrowserClient:
         persist_storage_state: bool = False,
         capture_ready_script: str = "",
         cookie_header: str | None = None,
+        user_agent: str | None = None,
+        validate_html: Callable[[str], bool] | None = None,
     ) -> tuple[str, bytes | None]:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -135,24 +161,22 @@ class BrowserClient:
             raise CollectionFailure("infrastructure", "browser runtime could not be started", scope="site") from exc
         assert self._browser is not None
         storage_path = Path(storage_state_path).expanduser().resolve() if storage_state_path else None
-        if self._proxy.engine == "chromium":
-            browser_version = str(getattr(self._browser, "version", "122.0.0.0"))
-            user_agent = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browser_version} Safari/537.36"
+        stored_state, session_revision, saved_agent = None, "", None
+        if storage_path is not None:
+            stored_state, session_revision, saved_agent = read_browser_session(
+                storage_path, url, self._proxy.server, self._proxy.engine,
             )
-        else:
-            user_agent = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) "
-                "Gecko/20100101 Firefox/123.0"
-            )
+        user_agent = user_agent or saved_agent or self._default_user_agent()
         context_kwargs = {
             "user_agent": user_agent,
             "viewport": {"width": 1440, "height": 960},
             "locale": "en-US",
         }
-        if storage_path is not None and storage_path.exists():
-            context_kwargs["storage_state"] = str(storage_path)
+        cookie_rows = _cookie_rows(cookie_header, url)
+        if stored_state is not None:
+            explicit_names = {cookie["name"] for cookie in cookie_rows}
+            stored_state["cookies"] = [cookie for cookie in stored_state["cookies"] if cookie["name"] not in explicit_names]
+            context_kwargs["storage_state"] = stored_state
         try:
             context = self._browser.new_context(**context_kwargs)
         except Exception:
@@ -164,19 +188,70 @@ class BrowserClient:
             context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
-        cookie_rows = _cookie_rows(cookie_header, url)
         if cookie_rows:
             context.add_cookies(cookie_rows)
         page = context.new_page()
         main_response = None
+        limited_response = None
+        limited_headers = None
+        session_eligible = False
 
         def remember_main_response(received):
-            nonlocal main_response
+            nonlocal main_response, limited_response, limited_headers, session_eligible
             if received.request.is_navigation_request() and received.frame == page.main_frame:
                 main_response = received
+                if received.status == 429 and limited_response is None:
+                    limited_response, limited_headers = received, received.headers
+                    session_eligible = False
+                    # Stop automatic navigation/retries in this worker-owned
+                    # temporary page; keep the response headers for the caller.
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
 
         page.on("response", remember_main_response)
         selector_timeout_ms = min(timeout_seconds * 1000, 10_000)
+        deadline = time.monotonic() + timeout_seconds
+        validated_html = None
+
+        def check_rate_limit():
+            if limited_response is not None:
+                if not same_source(url, limited_response.url):
+                    raise CollectionFailure("source_moved", "browser navigation left the configured source origin", scope="site")
+                raise_for_http_status(429, headers=limited_headers)
+
+        def verified_document(*, validate_content=True):
+            nonlocal validated_html
+            check_rate_limit()
+            if not same_source(url, page.url):
+                raise CollectionFailure("source_moved", "browser navigation left the configured source origin", scope="site")
+            if main_response is None or not same_source(main_response.url, page.url):
+                raise CollectionFailure("network", "browser final document response is unconfirmed")
+            html = _read_page_content(page)
+            check_rate_limit()
+            raise_for_http_status(main_response.status, html, headers=main_response.headers)
+            if not 200 <= main_response.status < 300:
+                raise CollectionFailure("network", "browser final document did not return a successful status")
+            if validate_content and validate_html is not None and html != validated_html:
+                if not validate_html(html):
+                    raise CollectionFailure("parse", "browser document did not contain the expected source content")
+            if validate_content:
+                validated_html = html
+            return html
+
+        def finish_capture(screenshot):
+            nonlocal session_eligible
+            try:
+                return verified_document(), screenshot
+            except Exception as exc:
+                session_eligible = False
+                if isinstance(exc, CollectionFailure) and exc.kind == "rate_limited":
+                    raise
+                if validated_html is None:
+                    raise
+                return validated_html, None
+
         try:
             # Onion sites commonly keep polling or streaming connections open,
             # so waiting for networkidle adds a full timeout to otherwise loaded
@@ -192,35 +267,37 @@ class BrowserClient:
             status = getattr(response, "status", 0)
             if status in {401, 429}:
                 raise_for_http_status(status, headers=getattr(response, "headers", None))
-            page.wait_for_timeout(wait_seconds * 1000)
-            if main_response is not None and (
-                urldefrag(main_response.url)[0] == urldefrag(page.url)[0]
-                and main_response.status in {401, 429}
-            ):
-                raise_for_http_status(main_response.status, headers=main_response.headers)
-            _clear_browser_check_interstitial(page, timeout_ms=timeout_seconds * 1000)
-            html = _read_page_content(page)
-            if main_response is not None and (
-                urldefrag(main_response.url)[0] == urldefrag(page.url)[0]
-            ):
-                response = main_response
-            raise_for_http_status(getattr(response, "status", 0), html, headers=getattr(response, "headers", None))
+            check_rate_limit()
+            render_deadline = min(deadline, time.monotonic() + max(0, wait_seconds))
+            while time.monotonic() < render_deadline:
+                page.wait_for_timeout(min(250, max(0, (render_deadline - time.monotonic()) * 1000)))
+                check_rate_limit()
+            _clear_browser_check_interstitial(page, timeout_ms=max(0, int((deadline - time.monotonic()) * 1000)))
+            verified_document(validate_content=False)
+            # Validate the source only after ordinary asynchronous content is
+            # ready. A loading shell is not evidence of a parser regression.
+            try:
+                _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)), wait_for_images=False)
+            except Exception as exc:
+                raise CollectionFailure("timeout", "browser content did not become ready within the request deadline") from exc
+            verified_document()
+            session_eligible = True
             try:
                 if hide_selectors:
                     selector_rules = ", ".join(hide_selectors)
                     page.add_style_tag(content=f"{selector_rules} {{ display: none !important; }}")
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(_remaining_timeout_ms(deadline, 500))
                 if screenshot_styles:
                     page.add_style_tag(content=screenshot_styles)
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(_remaining_timeout_ms(deadline, 500))
             except Exception:
+                session_eligible = False
                 self._task_count += 1
-                return _read_page_content(page), None
+                return finish_capture(None)
             if not capture_screenshot:
-                html = _read_page_content(page)
                 self._task_count += 1
-                return html, b""
-            capture_timeout_ms = min(timeout_seconds * 1000, 30_000) if capture_ready_script else selector_timeout_ms
+                return finish_capture(b"")
+            capture_timeout_ms = max(1, min(30_000 if capture_ready_script else selector_timeout_ms, int((deadline - time.monotonic()) * 1000)))
             try:
                 _wait_for_capture_ready(
                     page,
@@ -228,17 +305,19 @@ class BrowserClient:
                     capture_ready_script=capture_ready_script,
                 )
             except Exception:
+                session_eligible = False
                 self._task_count += 1
-                return _read_page_content(page), None
+                return finish_capture(None)
             screenshot_png = None
             if screenshot_selectors:
                 try:
                     clip_boxes = []
                     for selector in screenshot_selectors:
-                        page.wait_for_selector(selector, timeout=selector_timeout_ms)
                         locator = page.locator(selector).first
-                        locator.scroll_into_view_if_needed(timeout=selector_timeout_ms)
-                        box = locator.bounding_box()
+                        if not locator.count() or not locator.is_visible():
+                            continue
+                        locator.scroll_into_view_if_needed(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
+                        box = locator.bounding_box(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
                         if box is not None:
                             clip_boxes.append(box)
                     if clip_boxes:
@@ -248,7 +327,7 @@ class BrowserClient:
                         max_y = max(box["y"] + box["height"] for box in clip_boxes)
                         screenshot_png = page.screenshot(
                             type="png",
-                            timeout=selector_timeout_ms,
+                            timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
                             animations="disabled",
                             clip={
                                 "x": min_x,
@@ -258,43 +337,59 @@ class BrowserClient:
                             },
                         )
                 except Exception:
+                    session_eligible = False
                     screenshot_png = None
             elif screenshot_selector:
                 try:
-                    page.wait_for_selector(screenshot_selector, timeout=selector_timeout_ms)
                     locator = page.locator(screenshot_selector).first
-                    locator.scroll_into_view_if_needed(timeout=selector_timeout_ms)
-                    screenshot_png = locator.screenshot(
-                        type="png",
-                        timeout=selector_timeout_ms,
-                        animations="disabled",
-                    )
+                    if locator.count() and locator.is_visible():
+                        locator.scroll_into_view_if_needed(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
+                        screenshot_png = locator.screenshot(
+                            type="png",
+                            timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
+                            animations="disabled",
+                        )
                 except Exception:
+                    session_eligible = False
                     screenshot_png = None
             if screenshot_png is None:
                 try:
                     screenshot_png = page.screenshot(
                         type="png",
                         full_page=True,
-                        timeout=selector_timeout_ms,
+                        timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
                         animations="disabled",
                     )
                 except Exception:
+                    session_eligible = False
                     screenshot_png = None
             # Capture HTML after the page-specific selectors have had a chance to
             # appear. Some forum pages finish rendering well after the initial
             # DOMContentLoaded/networkidle checkpoint, which made us persist a
             # head-only document while the screenshot already contained the post.
-            html = _read_page_content(page)
             self._task_count += 1
-            return html, screenshot_png
+            return finish_capture(screenshot_png)
+        except Exception:
+            check_rate_limit()
+            raise
         finally:
-            if storage_path is not None and persist_storage_state:
-                try:
-                    _persist_browser_storage_state(context, storage_path)
-                except Exception:
-                    pass
-            context.close()
+            try:
+                if storage_path is not None and persist_storage_state and session_eligible:
+                    try:
+                        verified_document()
+                        state = context.storage_state()
+                        check_rate_limit()
+                        if session_eligible:
+                            persist_browser_session(
+                                state, storage_path, url=page.url,
+                                proxy_server=self._proxy.server, user_agent=user_agent,
+                                engine=self._proxy.engine, expected_revision=session_revision,
+                            )
+                    except Exception:
+                        pass
+                check_rate_limit()
+            finally:
+                context.close()
 
     def screenshot_html_content(
         self,
@@ -306,22 +401,34 @@ class BrowserClient:
         screenshot_selectors: tuple[str, ...] = (),
         hide_selectors: tuple[str, ...] = (),
         screenshot_styles: str = "",
+        storage_state_path: str | None = None,
+        cookie_header: str | None = None,
+        user_agent: str | None = None,
     ) -> bytes:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
         self._ensure_browser()
         assert self._browser is not None
+        stored_state, saved_agent = None, None
+        if storage_state_path:
+            stored_state, _, saved_agent = read_browser_session(
+                Path(storage_state_path).expanduser().resolve(), base_url, self._proxy.server, self._proxy.engine,
+            )
+        cookie_rows = _cookie_rows(cookie_header, base_url)
+        if stored_state is not None:
+            explicit_names = {cookie["name"] for cookie in cookie_rows}
+            stored_state["cookies"] = [cookie for cookie in stored_state["cookies"] if cookie["name"] not in explicit_names]
         context = self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) "
-                "Gecko/20100101 Firefox/123.0"
-            ),
+            user_agent=user_agent or saved_agent or self._default_user_agent(),
             viewport={"width": 1440, "height": 960},
             # The supplied HTML is already the rendered evidence document.
             # Re-running its application bundle can replace that content with
             # a loading screen while the app hydrates.
             java_script_enabled=False,
+            storage_state=stored_state,
         )
+        if cookie_rows:
+            context.add_cookies(cookie_rows)
         page = context.new_page()
         selector_timeout_ms = min(timeout_seconds * 1000, 10_000)
         try:
@@ -333,20 +440,31 @@ class BrowserClient:
             if screenshot_styles:
                 capture_styles.append(screenshot_styles)
             rendered_html = _inject_capture_styles(rendered_html, "\n".join(capture_styles))
-            page.set_content(rendered_html, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
-            page.wait_for_timeout(wait_seconds * 1000)
-            _clear_browser_check_interstitial(page, timeout_ms=timeout_seconds * 1000)
-
-            _wait_for_capture_ready(page, timeout_ms=selector_timeout_ms)
+            raise_if_error_page(html)
+            # Fulfil only the main document locally so same-origin image cookies
+            # keep their browser scope without re-requesting the saved body.
+            def render_document(route):
+                if route.request.is_navigation_request() and route.request.frame == page.main_frame:
+                    if same_source(base_url, route.request.url):
+                        route.fulfill(status=200, content_type="text/html", body=rendered_html)
+                    else:
+                        route.abort()
+                else:
+                    route.continue_()
+            page.route("**/*", render_document)
+            deadline = time.monotonic() + timeout_seconds
+            page.goto(base_url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+            _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)), javascript_enabled=False)
             screenshot_png = None
             if screenshot_selectors:
                 try:
                     clip_boxes = []
                     for selector in screenshot_selectors:
-                        page.wait_for_selector(selector, timeout=selector_timeout_ms)
                         locator = page.locator(selector).first
-                        locator.scroll_into_view_if_needed(timeout=selector_timeout_ms)
-                        box = locator.bounding_box()
+                        if not locator.count() or not locator.is_visible():
+                            continue
+                        locator.scroll_into_view_if_needed(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
+                        box = locator.bounding_box(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
                         if box is not None:
                             clip_boxes.append(box)
                     if clip_boxes:
@@ -356,7 +474,7 @@ class BrowserClient:
                         max_y = max(box["y"] + box["height"] for box in clip_boxes)
                         screenshot_png = page.screenshot(
                             type="png",
-                            timeout=selector_timeout_ms,
+                            timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
                             animations="disabled",
                             clip={
                                 "x": min_x,
@@ -369,21 +487,21 @@ class BrowserClient:
                     screenshot_png = None
             elif screenshot_selector:
                 try:
-                    page.wait_for_selector(screenshot_selector, timeout=selector_timeout_ms)
                     locator = page.locator(screenshot_selector).first
-                    locator.scroll_into_view_if_needed(timeout=selector_timeout_ms)
-                    screenshot_png = locator.screenshot(
-                        type="png",
-                        timeout=selector_timeout_ms,
-                        animations="disabled",
-                    )
+                    if locator.count() and locator.is_visible():
+                        locator.scroll_into_view_if_needed(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
+                        screenshot_png = locator.screenshot(
+                            type="png",
+                            timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
+                            animations="disabled",
+                        )
                 except PlaywrightTimeoutError:
                     screenshot_png = None
             if screenshot_png is None:
                 screenshot_png = page.screenshot(
                     type="png",
                     full_page=True,
-                    timeout=selector_timeout_ms,
+                    timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
                     animations="disabled",
                 )
             self._task_count += 1
@@ -407,30 +525,6 @@ class BrowserClient:
 _GLOBAL_CLIENTS: dict[object, tuple[BrowserProxyConfig, BrowserClient]] = {}
 _GLOBAL_CLIENT_LOCK = Lock()
 
-_BROWSER_CHECK_MARKERS = (
-    "checking your browser",
-    "cf-browser-verification",
-    "security verification",
-    "verify you are human",
-    "please move your mouse or press a key",
-    "please wait while we verify",
-)
-
-
-def _persist_browser_storage_state(context, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{current_thread().ident or 0}.tmp"
-    )
-    try:
-        state = context.storage_state()
-        temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
 def _read_page_content(page, *, attempts: int = 6, wait_ms: int = 250) -> str:
     last_error: Exception | None = None
     for _ in range(attempts):
@@ -444,16 +538,26 @@ def _read_page_content(page, *, attempts: int = 6, wait_ms: int = 250) -> str:
     return ""
 
 
-def _wait_for_capture_ready(page, *, timeout_ms: int, capture_ready_script: str = "") -> None:
+def _wait_for_capture_ready(page, *, timeout_ms: int, capture_ready_script: str = "",
+                            wait_for_images: bool = True, javascript_enabled: bool = True) -> None:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+    deadline = time.monotonic() + max(timeout_ms, 1) / 1000
     try:
-        page.wait_for_function(_CAPTURE_READY_SCRIPT, timeout=max(timeout_ms, 1_000))
+        if javascript_enabled:
+            page.wait_for_function(_CAPTURE_READY_SCRIPT, arg=wait_for_images, polling=100, timeout=max(timeout_ms, 1))
+        else:
+            # In a script-disabled evidence document, scheduled JS callbacks may
+            # not run. Poll readiness from Playwright without enabling the app.
+            while not page.evaluate(_CAPTURE_READY_SCRIPT, wait_for_images):
+                remaining = (deadline - time.monotonic()) * 1000
+                if remaining <= 0:
+                    raise RuntimeError("page remained in a loading state; screenshot skipped")
+                page.wait_for_timeout(min(100, remaining))
         if capture_ready_script:
-            page.wait_for_function(capture_ready_script, timeout=max(timeout_ms, 1_000))
+            page.wait_for_function(capture_ready_script, polling=100, timeout=max(1, int((deadline - time.monotonic()) * 1000)))
     except PlaywrightTimeoutError as exc:
         raise RuntimeError("page remained in a loading state; screenshot skipped") from exc
-    page.wait_for_timeout(500)
 
 
 def _inject_base_href(html: str, base_url: str) -> str:
@@ -475,56 +579,31 @@ def _inject_capture_styles(html: str, styles: str) -> str:
 
 
 def _looks_like_browser_check_page(html: str | None) -> bool:
-    content = str(html or "").lower()
-    return any(marker in content for marker in _BROWSER_CHECK_MARKERS)
+    try:
+        raise_if_error_page(str(html or ""))
+    except CollectionFailure as exc:
+        return exc.kind == "blocked"
+    return False
 
 
 def _clear_browser_check_interstitial(
     page,
     *,
     timeout_ms: int,
-    settle_wait_ms: int = 750,
+    settle_wait_ms: int = 250,
 ) -> str:
     html = _read_page_content(page)
     if not _looks_like_browser_check_page(html):
         return html
 
-    deadline = time.monotonic() + max(timeout_ms, settle_wait_ms) / 1000
-    viewport = getattr(page, "viewport_size", None) or {"width": 1440, "height": 960}
-    center_x = int(viewport.get("width", 1440) * 0.5)
-    center_y = int(viewport.get("height", 960) * 0.38)
-
+    deadline = time.monotonic() + max(timeout_ms, 0) / 1000
     while time.monotonic() < deadline:
-        try:
-            page.mouse.move(center_x, center_y, steps=12)
-            page.wait_for_timeout(120)
-            page.mouse.click(center_x, center_y, delay=80)
-            page.wait_for_timeout(120)
-            page.mouse.wheel(0, 420)
-            page.wait_for_timeout(120)
-        except Exception:
-            # Cloudflare/browser-check pages can trigger a navigation mid-action.
-            # When that happens, just wait for the next stable DOM snapshot
-            # instead of failing the whole fetch.
-            page.wait_for_timeout(300)
-        for key in ("Tab", "Space"):
-            try:
-                page.keyboard.press(key)
-                page.wait_for_timeout(120)
-            except Exception:
-                page.wait_for_timeout(300)
-            html = _read_page_content(page)
-            if not _looks_like_browser_check_page(html):
-                page.wait_for_timeout(settle_wait_ms)
-                return _read_page_content(page)
-        try:
-            page.wait_for_load_state("networkidle", timeout=min(1500, timeout_ms))
-        except Exception:
-            pass
+        # Only wait for ordinary automatic verification. Random clicks or Space
+        # can activate unrelated controls and must never be sent to the source.
+        page.wait_for_timeout(max(0, min(settle_wait_ms, (deadline - time.monotonic()) * 1000)))
         html = _read_page_content(page)
         if not _looks_like_browser_check_page(html):
-            page.wait_for_timeout(settle_wait_ms)
-            return _read_page_content(page)
+            return html
     return html
 
 
@@ -564,6 +643,8 @@ def fetch_html_with_browser(
     storage_state_path: str | None = None,
     persist_storage_state: bool = False,
     cookie_header: str | None = None,
+    user_agent: str | None = None,
+    validate_html: Callable[[str], bool] | None = None,
 ) -> str:
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
     try:
@@ -579,6 +660,8 @@ def fetch_html_with_browser(
             storage_state_path=storage_state_path,
             persist_storage_state=persist_storage_state,
             cookie_header=cookie_header,
+            user_agent=user_agent,
+            validate_html=validate_html,
         )
         return html
     except Exception:
@@ -600,6 +683,8 @@ def fetch_page_artifacts_with_browser(
     persist_storage_state: bool = False,
     capture_ready_script: str = "",
     cookie_header: str | None = None,
+    user_agent: str | None = None,
+    validate_html: Callable[[str], bool] | None = None,
 ) -> tuple[str, bytes | None]:
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
     try:
@@ -619,6 +704,8 @@ def fetch_page_artifacts_with_browser(
             persist_storage_state=persist_storage_state,
             capture_ready_script=capture_ready_script,
             cookie_header=cookie_header,
+            user_agent=user_agent,
+            validate_html=validate_html,
         )
     except Exception:
         close_browser_client()
@@ -636,6 +723,9 @@ def screenshot_html_with_browser(
     screenshot_selectors: tuple[str, ...] = (),
     hide_selectors: tuple[str, ...] = (),
     screenshot_styles: str = "",
+    storage_state_path: str | None = None,
+    cookie_header: str | None = None,
+    user_agent: str | None = None,
 ) -> bytes:
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
     client = _get_or_create_client(requested_proxy)
@@ -649,6 +739,9 @@ def screenshot_html_with_browser(
             screenshot_selectors=screenshot_selectors,
             hide_selectors=hide_selectors,
             screenshot_styles=screenshot_styles,
+            storage_state_path=storage_state_path,
+            cookie_header=cookie_header,
+            user_agent=user_agent,
         )
     except Exception:
         close_browser_client()

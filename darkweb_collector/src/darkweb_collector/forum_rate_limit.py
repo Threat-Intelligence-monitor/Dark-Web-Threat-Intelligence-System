@@ -39,7 +39,9 @@ def _check_cooldown(connection, site_name: str) -> None:
     ).fetchone()
     remaining = float(row[1]) - time.time() if row else 0
     if remaining > 0:
-        raise CollectionFailure(str(row[0]), "source is in a persisted cooldown", scope="site", retry_after=remaining)
+        failure = CollectionFailure(str(row[0]), "source is in a persisted cooldown", scope="site", retry_after=remaining)
+        failure._forum_backoff = (site_name, float(row[1]))
+        raise failure
 
 
 def before_source_request() -> None:
@@ -71,13 +73,9 @@ def note_source_failure(site_name: str, error: Exception, *, now: float | None =
 
     timestamp = time.time() if now is None else float(now)
     with get_db_connection() as connection:
-        previous = connection.execute(
-            "SELECT failure_kind, next_retry FROM crawl_site_control WHERE site_name = ?", (site_name,),
-        ).fetchone()
-        active = previous and previous[0] in NETWORK_FAILURES and float(previous[1]) > timestamp
         # Re-observing a cached cooldown must not extend it indefinitely.
         observed = getattr(failure, "_forum_backoff", None)
-        deadline = observed[1] if observed and observed[0] == site_name else timestamp + max(0 if active else 1800, failure.retry_after)
+        deadline = observed[1] if observed and observed[0] == site_name else timestamp + max(1800, failure.retry_after)
         failure._forum_backoff = (site_name, deadline)
         delay = max(0, deadline - timestamp)
         pause_site(connection, site_name, failure.kind, delay, now=timestamp)

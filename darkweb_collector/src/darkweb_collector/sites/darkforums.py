@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlparse
 
 from darkweb_collector.collection_errors import CollectionFailure
 from darkweb_collector.normalize import content_hash
+from darkweb_collector.sites.forum_post_content import extract_mybb_post
 
 
 FORUM_SECTIONS = {
@@ -19,10 +20,6 @@ FORUM_SECTIONS = {
 
 # HTML cleaning
 DETAIL_QUOTE_RE = re.compile(r'<blockquote[^>]*>.*?</blockquote>', re.IGNORECASE | re.DOTALL)
-FIRST_POST_BLOCK_RE = re.compile(
-    r'<div class="post classic .*?id="post_\d+".*?<!-- end: postbit_classic -->',
-    re.IGNORECASE | re.DOTALL,
-)
 ABSOLUTE_TIMESTAMP_RE = re.compile(
     r'(?P<day>\d{1,2})-(?P<month>\d{1,2})-(?P<year>\d{2,4}),\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)',
     re.IGNORECASE,
@@ -358,33 +355,9 @@ def parse_darkforums_detail(url: str, html: str) -> dict:
     title = _clean_html_text(title_match.group(1)) if title_match else ""
     domain = _extract_domain(url)
     
-    post_block_match = FIRST_POST_BLOCK_RE.search(html)
-    post_block = post_block_match.group(0) if post_block_match else html
-
-    content_match = re.search(
-        r'<div[^>]*class="[^"]*post_body[^"]*"[^>]*>(.*?)</div>\s*<div class="post_meta"',
-        post_block,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not content_match:
-        content_match = re.search(
-            r'<div[^>]*class="[^"]*post_body[^"]*"[^>]*>(.*?)</div>\s*<div class="post_controls"',
-            post_block,
-            re.IGNORECASE | re.DOTALL,
-        )
-    if not content_match:
-        fallback_selectors = [
-            r'<div[^>]*class="[^"]*post_content[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<footer|<div class="post_controls")',
-            r'<div[^>]*class="[^"]*messageContent[^"]*"[^>]*>(.*?)</div>',
-            r'<div[^>]*class="[^"]*post_body[^"]*"[^>]*>(.*?)</div>',
-        ]
-        for selector in fallback_selectors:
-            fallback_match = re.search(selector, post_block, re.IGNORECASE | re.DOTALL)
-            if fallback_match:
-                content_match = fallback_match
-                break
-    content = _clean_html_text(content_match.group(1)) if content_match else ""
-    raise_if_hidden_post(content, post_block)
+    original = extract_mybb_post(url, html)
+    post_block, content = original["metadata_html"], original["content"]
+    raise_if_hidden_post(content, original["post_html"])
 
     _debug_log(f"[{time.strftime('%H:%M:%S')}] Extracted content length: {len(content)} chars")
     
@@ -403,7 +376,7 @@ def parse_darkforums_detail(url: str, html: str) -> dict:
     _debug_log(f"[{time.strftime('%H:%M:%S')}] Author: {author}")
     
     # Extract post date/timestamp
-    timestamp = _extract_timestamp_text(post_block, html)
+    timestamp = _extract_timestamp_text(post_block, original["header_html"])
     
     _debug_log(f"[{time.strftime('%H:%M:%S')}] Timestamp: {timestamp}")
     
@@ -430,7 +403,7 @@ def parse_darkforums_detail(url: str, html: str) -> dict:
     # Extract attachments/links
     attachment_matches = re.findall(
         r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*attachment[^"]*"[^>]*>',
-        post_block, re.IGNORECASE
+        original["post_html"], re.IGNORECASE
     )
     attachments = [urljoin(url, match) for match in attachment_matches]
     
@@ -446,6 +419,9 @@ def parse_darkforums_detail(url: str, html: str) -> dict:
         "title": title,
         "collected_at_utc": collected_at_utc,
         "content": content,
+        "content_access": original["content_access"],
+        "content_quote_only": original["content_quote_only"],
+        "quote_attributions": original["quote_attributions"],
         "author": author,
         "timestamp": timestamp,
         "published_at_utc": normalize_darkforums_timestamp(timestamp, collected_at_utc=collected_at_utc),

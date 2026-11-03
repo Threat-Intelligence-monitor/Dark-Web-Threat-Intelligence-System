@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import nullcontext
 import hashlib
 import time
-from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -11,12 +10,11 @@ from darkweb_collector.adapters.base import SiteAdapter
 from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
 from darkweb_collector.browser_client import (
-    close_browser_client,
     fetch_html_with_browser,
     fetch_page_artifacts_with_browser,
     screenshot_html_with_browser,
 )
-from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, summarize_failures
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, safe_failure_text, summarize_failures
 from darkweb_collector.db import (
     get_db_connection,
     get_forum_detail_snapshot,
@@ -25,10 +23,9 @@ from darkweb_collector.db import (
     upsert_forum_topic,
 )
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
-from darkweb_collector.session_cookies import resolve_session_cookie
+from darkweb_collector.source_sessions import browser_session_options, http_session_options
 from darkweb_collector.sites.cracked import parse_cracked_detail, parse_cracked_list
-from darkweb_collector.tor_fetch import fetch_via_http_proxy, get_http_proxy_settings
-from darkweb_collector.runtime import user_data_root
+from darkweb_collector.tor_fetch import browser_proxy_server_for_url, fetch_via_http_proxy, get_http_proxy_settings
 from darkweb_collector.utils import dump_json, dump_text, safe_stem
 
 
@@ -51,16 +48,6 @@ def _detail_artifacts_exist(output_dir, section_name: str, topic_url: str) -> bo
     return detail_artifacts_complete(details_dir, artifact_stem)
 
 
-def _browser_storage_state_path(config: SiteConfig) -> str | None:
-    raw_path = str(config.extras.get("browser_storage_state_file") or "").strip()
-    if not raw_path:
-        return None
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        path = user_data_root() / path
-    return str(path.resolve())
-
-
 class CrackedAdapter(SiteAdapter):
     site_name = "cracked"
     supports_frontier = True
@@ -76,14 +63,22 @@ class CrackedAdapter(SiteAdapter):
         *,
         validator: Callable[[str], bool],
         capture_screenshot: bool,
+        artifact_metadata: dict | None = None,
     ) -> tuple[str, bytes | None]:
-        cookie_header = resolve_session_cookie(config)
         proxy_host, proxy_port = get_http_proxy_settings()
         browser_engine = str(config.extras.get("browser_engine") or "chromium").strip().lower()
-        storage_state_path = _browser_storage_state_path(config)
+        browser_proxy = browser_proxy_server_for_url(url)
         routes: list[tuple[str, Callable[[], tuple[str, bytes | None]]]] = []
 
+        def validate(html):
+            raise_if_error_page(html)
+            if not validator(html):
+                raise CollectionFailure("parse", "cracked response has no recognized content structure")
+            return True
+
         def curl_route(*, bypass_proxy: bool, host: str | None = None, port: int | None = None):
+            proxy_server = None if bypass_proxy else f"http://{host}:{port}"
+            http_options = http_session_options(config, url, proxy_server)
             html = fetch_via_http_proxy(
                 url,
                 proxy_host=host,
@@ -91,35 +86,42 @@ class CrackedAdapter(SiteAdapter):
                 timeout=config.fetch_timeout_seconds,
                 retries=0,
                 bypass_proxy=bypass_proxy,
-                cookie_header=cookie_header,
+                **http_options,
             )
+            validate(html)
             screenshot = None
             if capture_screenshot:
                 try:
+                    session_options = browser_session_options(config, url, proxy_server)
                     screenshot = screenshot_html_with_browser(
                         html,
                         url,
                         wait_seconds=config.render_wait_seconds,
                         timeout_seconds=config.fetch_timeout_seconds,
                         browser_engine=browser_engine,
+                        proxy_server=proxy_server,
+                        storage_state_path=session_options["storage_state_path"],
+                        cookie_header=session_options["cookie_header"],
+                        user_agent=http_options["user_agent"],
                     )
-                except Exception:
+                except Exception as exc:
                     screenshot = None
+                    if artifact_metadata is not None:
+                        artifact_metadata["artifact_error"] = safe_failure_text(f"artifact: forum evidence capture failed ({type(exc).__name__}): {exc}")
             return html, screenshot
 
-        def browser_route(cookie: str | None = None):
-            route_storage_state = storage_state_path if not cookie else None
+        def browser_route():
+            options = browser_session_options(config, url, browser_proxy)
+            options["browser_engine"] = browser_engine
             if not capture_screenshot:
                 return (
                     fetch_html_with_browser(
                         url,
                         wait_seconds=config.render_wait_seconds,
                         timeout_seconds=config.fetch_timeout_seconds,
-                        proxy_server=None,
-                        browser_engine=browser_engine,
-                        storage_state_path=route_storage_state,
-                        persist_storage_state=bool(route_storage_state),
-                        cookie_header=cookie,
+                        proxy_server=browser_proxy,
+                        validate_html=validate,
+                        **options,
                     ),
                     None,
                 )
@@ -127,13 +129,11 @@ class CrackedAdapter(SiteAdapter):
                 url,
                 wait_seconds=config.render_wait_seconds,
                 timeout_seconds=config.fetch_timeout_seconds,
-                proxy_server=None,
-                browser_engine=browser_engine,
+                proxy_server=browser_proxy,
                 screenshot_selectors=("#posts", ".post_body") if capture_screenshot else (),
                 hide_selectors=("header", "#panel", "#quick-search", ".footer", "footer", ".signature"),
-                storage_state_path=route_storage_state,
-                persist_storage_state=bool(route_storage_state),
-                cookie_header=cookie,
+                validate_html=validate,
+                **options,
             )
             return html, screenshot or None
 
@@ -141,34 +141,33 @@ class CrackedAdapter(SiteAdapter):
         if proxy_host and proxy_port:
             routes.append(("proxy", lambda: curl_route(bypass_proxy=False, host=proxy_host, port=proxy_port)))
         routes.append(("browser", lambda: browser_route()))
-        if cookie_header:
-            routes.append(("browser_cookie", lambda: browser_route(cookie_header)))
 
         failures: list[tuple[str, Exception]] = []
         for index, (route_name, fetcher) in enumerate(routes):
             try:
                 html, screenshot = fetcher()
-                raise_if_error_page(html)
-                if validator(html):
-                    return html, screenshot
-                raise CollectionFailure("parse", "cracked response has no recognized content structure")
+                return html, screenshot
             except CollectionFailure as exc:
                 if exc.kind in {"retry_budget", "unavailable", "rate_limited", "restricted"}:
                     raise
                 failures.append((route_name, exc))
             except Exception as exc:
                 failures.append((route_name, exc))
-            close_browser_client()
             if index + 1 < len(routes):
                 time.sleep(1)
         raise summarize_failures("cracked fetch routes failed", failures)
 
     def _fetch_html(self, url: str, config: SiteConfig, mode: str) -> str:
         del mode
+        def validate(html):
+            if not self._is_valid_seed_html(html):
+                return False
+            parse_cracked_list(url, html)
+            return True
         return self._fetch_with_fallback(
             url,
             config,
-            validator=self._is_valid_seed_html,
+            validator=validate,
             capture_screenshot=False,
         )[0]
 
@@ -259,22 +258,37 @@ class CrackedAdapter(SiteAdapter):
         )
         if restored is not None:
             return restored
+        detail, parsed_html = {}, None
+        def validate(html):
+            nonlocal detail, parsed_html
+            if html == parsed_html:
+                return True
+            if not self._is_valid_detail_html(html):
+                return False
+            parsed = parse_cracked_detail(detail_task.target_url, html)
+            if not self._is_valid_detail_payload(parsed):
+                raise CollectionFailure("parse", "cracked detail has no visible post content")
+            detail, parsed_html = parsed, html
+            return True
+        metadata = dict(detail_task.metadata)
+        metadata.pop("artifact_error", None)
         html, screenshot_png = self._fetch_with_fallback(
             detail_task.target_url,
             config,
-            validator=self._is_valid_detail_html,
+            validator=validate,
             capture_screenshot=True,
+            artifact_metadata=metadata,
         )
-        detail = parse_cracked_detail(detail_task.target_url, html)
-        if not self._is_valid_detail_payload(detail):
-            raise CollectionFailure("parse", "cracked detail has no visible post content")
+        if not screenshot_png:
+            metadata.setdefault("artifact_error", "artifact: forum evidence capture produced no image")
+            detail["_collector_artifact_error"] = metadata["artifact_error"]
         return DetailResult(
             site_name=self.site_name,
             target_url=detail_task.target_url,
             payload=detail,
             raw_html=html,
             screenshot_png=screenshot_png,
-            metadata=detail_task.metadata,
+            metadata=metadata,
         )
 
     def persist(

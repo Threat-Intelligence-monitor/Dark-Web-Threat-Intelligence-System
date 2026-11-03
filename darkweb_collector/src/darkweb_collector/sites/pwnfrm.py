@@ -8,6 +8,7 @@ from html import unescape
 from urllib.parse import unquote, urljoin, urlparse
 
 from darkweb_collector.normalize import content_hash
+from darkweb_collector.sites.forum_post_content import extract_mybb_post
 from darkweb_collector.sites.darkforums import (
     raise_if_hidden_post,
     determine_industry,
@@ -40,13 +41,6 @@ def _debug_log(message: str) -> None:
 # --- HTML/text helpers ----------------------------------------------------
 
 DETAIL_QUOTE_RE = re.compile(r'<blockquote[^>]*>.*?</blockquote>', re.IGNORECASE | re.DOTALL)
-# pwnfrm wraps every post in `<div class="post " ... id="post_NNN">` (no
-# "classic" suffix, no end-of-postbit comment). The first post runs until the
-# next post block opens or the document ends.
-FIRST_POST_BLOCK_RE = re.compile(
-    r'<div[^>]*class="post\s*"[^>]*id="post_\d+".*?(?=<div[^>]*class="post\s*"[^>]*id="post_\d+"|$)',
-    re.IGNORECASE | re.DOTALL,
-)
 # pwnfrm uses US-style MM-DD-YYYY (e.g. "01-24-2026, 07:25 AM"), unlike
 # darkforums' DD-MM-YY. The named groups stay consistent so downstream code
 # is symmetric.
@@ -318,33 +312,9 @@ def parse_pwnfrm_detail(
     title = _clean_html_text(title_match.group(1)) if title_match else ""
     domain = _extract_domain(url)
 
-    post_block_match = FIRST_POST_BLOCK_RE.search(html)
-    post_block = post_block_match.group(0) if post_block_match else html
-
-    content_match = re.search(
-        r'<div[^>]*class="[^"]*post_body[^"]*"[^>]*>(.*?)</div>\s*<div class="post_meta"',
-        post_block,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not content_match:
-        content_match = re.search(
-            r'<div[^>]*class="[^"]*post_body[^"]*"[^>]*>(.*?)</div>\s*<div class="post_controls"',
-            post_block,
-            re.IGNORECASE | re.DOTALL,
-        )
-    if not content_match:
-        fallback_selectors = [
-            r'<div[^>]*class="[^"]*post_content[^"]*"[^>]*>(.*?)</div>\s*(?:<div|<footer|<div class="post_controls")',
-            r'<div[^>]*class="[^"]*messageContent[^"]*"[^>]*>(.*?)</div>',
-            r'<div[^>]*class="[^"]*post_body[^"]*"[^>]*>(.*?)</div>',
-        ]
-        for selector in fallback_selectors:
-            fallback_match = re.search(selector, post_block, re.IGNORECASE | re.DOTALL)
-            if fallback_match:
-                content_match = fallback_match
-                break
-    content = _clean_html_text(content_match.group(1)) if content_match else ""
-    raise_if_hidden_post(content, post_block)
+    original = extract_mybb_post(url, html)
+    post_block, content = original["metadata_html"], original["content"]
+    raise_if_hidden_post(content, original["post_html"])
     _debug_log(f"[{time.strftime('%H:%M:%S')}] [{site_name}] content length: {len(content)} chars")
 
     # Prefer the /User-NAME slug from the profile link — it's stable across
@@ -367,7 +337,7 @@ def parse_pwnfrm_detail(
                 author = _clean_html_text(user_match.group(1)) or "Unknown"
     _debug_log(f"[{time.strftime('%H:%M:%S')}] [{site_name}] author: {author}")
 
-    timestamp = _extract_timestamp_text(post_block, html)
+    timestamp = _extract_timestamp_text(post_block, original["header_html"])
     _debug_log(f"[{time.strftime('%H:%M:%S')}] [{site_name}] timestamp: {timestamp}")
 
     victims = extract_victims_from_content(content, title)
@@ -387,7 +357,7 @@ def parse_pwnfrm_detail(
 
     attachment_matches = re.findall(
         r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*attachment[^"]*"[^>]*>',
-        post_block, re.IGNORECASE,
+        original["post_html"], re.IGNORECASE,
     )
     attachments = [urljoin(url, match) for match in attachment_matches]
 
@@ -402,6 +372,9 @@ def parse_pwnfrm_detail(
         "title": title,
         "collected_at_utc": collected_at_utc,
         "content": content,
+        "content_access": original["content_access"],
+        "content_quote_only": original["content_quote_only"],
+        "quote_attributions": original["quote_attributions"],
         "author": author,
         "timestamp": timestamp,
         "published_at_utc": normalize_pwnfrm_timestamp(timestamp, collected_at_utc=collected_at_utc),

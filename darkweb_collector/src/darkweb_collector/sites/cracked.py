@@ -8,6 +8,7 @@ from html import unescape
 from urllib.parse import urljoin, urlparse
 
 from darkweb_collector.normalize import content_hash
+from darkweb_collector.sites.forum_post_content import extract_mybb_post
 from darkweb_collector.sites.darkforums import (
     raise_if_hidden_post,
     determine_industry,
@@ -38,11 +39,6 @@ FORUM_SECTIONS = {
 
 DETAIL_QUOTE_RE = re.compile(r"<blockquote[^>]*>.*?</blockquote>", re.IGNORECASE | re.DOTALL)
 SCRIPT_STYLE_RE = re.compile(r"<(?:script|style)[^>]*>.*?</(?:script|style)>", re.IGNORECASE | re.DOTALL)
-FIRST_POST_BLOCK_RE = re.compile(
-    r'<div(?=[^>]*id="post_\d+")(?=[^>]*class="[^"]*post-set[^"]*")[^>]*>.*?'
-    r'(?=<div(?=[^>]*id="post_\d+")(?=[^>]*class="[^"]*post-set[^"]*")|$)',
-    re.IGNORECASE | re.DOTALL,
-)
 TOPIC_RE = re.compile(
     r'<span[^>]*class="[^"]*subject(?:_new|_old)?"[^>]*id="tid_(\d+)"[^>]*>'
     r'\s*<a href="(Thread-[^"]+)"[^>]*>(.*?)</a>',
@@ -72,12 +68,6 @@ THREAD_HEADER_TIMESTAMP_RE = re.compile(
 POST_DATE_TITLE_RE = re.compile(
     r'<span[^>]*class="[^"]*post_date[^"]*"[^>]*>.*?'
     r'<span[^>]*title="[^"]*"[^>]*>(.*?)</span>\s*</span>',
-    re.IGNORECASE | re.DOTALL,
-)
-POST_BODY_RE = re.compile(
-    r'<div[^>]*class="[^"]*post_body[^"]*"[^>]*>(.*?)'
-    r'(?=<div[^>]*class="[^"]*signature\b|<div[^>]*class="[^"]*post_controls|'
-    r'<div(?=[^>]*id="post_\d+")(?=[^>]*class="[^"]*post-set[^"]*")|$)',
     re.IGNORECASE | re.DOTALL,
 )
 CRACKED_TEXTUAL_TIMESTAMP_RE = re.compile(
@@ -322,18 +312,15 @@ def parse_cracked_detail(url: str, html: str) -> dict:
     title = _clean_html_text(title_match.group(1)) if title_match else ""
     domain = _extract_domain(url)
 
-    post_block_match = FIRST_POST_BLOCK_RE.search(html)
-    post_block = post_block_match.group(0) if post_block_match else html
-
-    content_match = POST_BODY_RE.search(post_block)
-    content = _clean_html_text(content_match.group(1)) if content_match else ""
-    raise_if_hidden_post(content, post_block)
+    original = extract_mybb_post(url, html)
+    post_block, content = original["metadata_html"], original["content"]
+    raise_if_hidden_post(content, original["post_html"])
     _safe_print(f"[{time.strftime('%H:%M:%S')}] [cracked] content length: {len(content)} chars")
 
-    author = _extract_author(post_block, html)
+    author = _extract_author(post_block, original["header_html"])
     _safe_print(f"[{time.strftime('%H:%M:%S')}] [cracked] author: {author}")
 
-    timestamp = _extract_timestamp_text(post_block, html)
+    timestamp = _extract_timestamp_text(post_block, original["header_html"])
     _safe_print(f"[{time.strftime('%H:%M:%S')}] [cracked] timestamp: {timestamp}")
 
     victims = extract_victims_from_content(content, title)
@@ -349,7 +336,7 @@ def parse_cracked_detail(url: str, html: str) -> dict:
 
     attachment_matches = re.findall(
         r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*attachment[^"]*"[^>]*>',
-        post_block,
+        original["post_html"],
         re.IGNORECASE,
     )
     attachments = [urljoin(url, match) for match in attachment_matches]
@@ -365,6 +352,9 @@ def parse_cracked_detail(url: str, html: str) -> dict:
         "title": title,
         "collected_at_utc": collected_at_utc,
         "content": content,
+        "content_access": original["content_access"],
+        "content_quote_only": original["content_quote_only"],
+        "quote_attributions": original["quote_attributions"],
         "author": author,
         "timestamp": timestamp,
         "published_at_utc": normalize_cracked_timestamp(timestamp, collected_at_utc=collected_at_utc),
