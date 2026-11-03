@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from html.parser import HTMLParser
 import re
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 
@@ -110,6 +110,70 @@ def is_post_container(node):
     return _post(node) and not _ancillary(node)
 
 
+def _pagination_url_key(url):
+    parsed = urlsplit(url)
+    path = re.sub(r"(?:/page[-/]|-page-)\d+(?=(?:\.html)?/?$)", "", parsed.path).rstrip("/")
+    xenforo = re.fullmatch(r"/(threads|forums)/(?:[^/]+\.)?(\d+)", path)
+    if xenforo:
+        path = f"/{xenforo.group(1)}/{xenforo.group(2)}"
+    query = parse_qs(parsed.query)
+    prefix, _, filename = path.rpartition("/")
+    mybb = re.fullmatch(r"thread-(\d+)\.html", filename, re.I)
+    if mybb:
+        path, filename, query = prefix + "/showthread.php", "showthread.php", {"tid": [mybb.group(1)]}
+    keys = {"showthread.php": ("tid",), "forumdisplay.php": ("fid",)}.get(filename, ("tid", "fid"))
+    identity = tuple((key, tuple(query.get(key, ()))) for key in keys) if path.endswith(".php") else ()
+    return parsed.netloc.lower(), path, identity
+
+
+def _pagination_context(node):
+    group, parent, needs_link = None, node, False
+    while parent is not None:
+        classes = _classes(parent)
+        # Semantic header/footer/nav tags can also contain the real pager.
+        if (parent.tag in (_IGNORE_TAGS - {"nav", "footer"}) | {"blockquote", "pre", "code", "iframe", "object"}
+                or _post(parent) or _restricted(parent) or classes & (_IGNORE_CLASSES | {
+                    "navigation", "pagination_breadcrumb", "breadcrumb", "breadcrumbs", "p-breadcrumbs", "p-nav",
+                    "post_body", "post_content", "messageContent", "message-body", "message-userContent",
+                })
+                or "hidden" in parent.attrs or str(parent.attrs.get("aria-hidden") or "").lower() == "true"
+                or re.search(r"display\s*:\s*none|visibility\s*:\s*hidden", str(parent.attrs.get("style") or ""), re.I)):
+            return False, None, False
+        if group is None and classes & {"pagination", "pageNav"}:
+            group = parent
+        needs_link = needs_link or parent.tag in {"header", "footer"}
+        parent = getattr(parent, "parent", None)
+    return True, group, needs_link
+
+
+def is_current_pagination(node, url: str) -> bool:
+    """Ignore navigation/examples and pagers explicitly pointing elsewhere."""
+    eligible, group, needs_link = _pagination_context(node)
+    if not eligible:
+        return False
+
+    def targets(container):
+        return [urljoin(url, str(item.attrs["href"])) for item in _nodes(container)
+                if item.tag == "a" and item.attrs.get("href")
+                and _pagination_context(item)[0]
+                and not str(item.attrs["href"]).startswith(("#", "javascript:"))]
+
+    # The current page's own link is stronger evidence than adjacent links.
+    links = targets(node) or (targets(group) if group is not None else [])
+    return not needs_link if not links else any(_pagination_url_key(link) == _pagination_url_key(url) for link in links)
+
+
+def pagination_label(node) -> str:
+    parts, pending = [], [node]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            parts.append(current)
+        elif not _ignored(current):
+            pending.extend(reversed(current.children))
+    return _normal(" ".join(parts))
+
+
 def extract_body_content(body) -> dict:
     if body is None:
         raise CollectionFailure("parse", "forum original post has no recognized body container")
@@ -168,14 +232,14 @@ def extract_mybb_post(url: str, html: str) -> dict:
     raise_if_error_page(html)
     parsed_url = urlsplit(url)
     pages = parse_qs(parsed_url.query).get("page", [])
-    path_page = re.search(r"(?:/|-)page[-/](\d+)(?:/|$)", parsed_url.path)
+    path_page = re.search(r"(?:/|-)page[-/](\d+)(?:\.html)?(?:/|$)", parsed_url.path)
     if any(value.isdigit() and int(value) > 1 for value in pages) or path_page and int(path_page.group(1)) > 1:
         raise CollectionFailure("parse", "forum detail must contain the original post, not a replies page")
     document = _Document(html)
     nodes = list(_nodes(document.root))
     for node in nodes:
-        if _classes(node) & {"pagination_current", "pageNav-page--current"}:
-            label = _normal(" ".join(child for child in node.children if isinstance(child, str)))
+        if _classes(node) & {"pagination_current", "pageNav-page--current"} and is_current_pagination(node, url):
+            label = pagination_label(node)
             if label.isdigit() and int(label) > 1:
                 raise CollectionFailure("parse", "forum response is a replies page")
     posts = [node for node in nodes if is_post_container(node)]

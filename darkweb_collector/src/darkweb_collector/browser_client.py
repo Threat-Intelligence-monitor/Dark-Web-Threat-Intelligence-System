@@ -21,35 +21,108 @@ class BrowserProxyConfig:
 
 
 _CAPTURE_READY_SCRIPT = r"""
-(waitForImages = true) => {
+(options = {}) => {
+    const waitForImages = typeof options === 'boolean' ? options : options.waitForImages !== false;
+    const scoped = typeof options === 'object' && options.contentSelector != null;
     const isVisible = (element) => {
         const style = window.getComputedStyle(element);
         const rect = element.getBoundingClientRect();
         return style.display !== 'none' && style.visibility !== 'hidden' &&
             Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
     };
+    const excluded = 'header, nav, footer, aside, form, button, [hidden], [aria-hidden="true"], ' +
+        '.signature, .post_signature, .message-signature, .post_controls, .post_meta, .post_actions, .post_toolbar, ' +
+        '.hide-tag, .hide-content, .hidden-content, .bbcode_hidden, .hidebox, ' +
+        '[class*="bbCodeBlock--hide"], [class*="bbCodeBlock--hidden"]';
+    const isExposed = (element) => {
+        if (element.closest(excluded)) return false;
+        for (let current = element; current; current = current.parentElement) {
+            const style = window.getComputedStyle(current);
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return false;
+        }
+        return true;
+    };
+    const stablePost = element => /^(DIV|ARTICLE)$/.test(element.tagName) &&
+        (/^post_\d+$/.test(element.id || '') || element.matches('article.message--post'));
+    const postOwner = (element) => {
+        let fallback = null;
+        for (let current = element; current; current = current.parentElement) {
+            // Copied post markup inside a quote is still original-post content.
+            if (current.parentElement?.closest('blockquote, pre, code')) continue;
+            if (stablePost(current)) return current;
+            if (!fallback && current.matches('div.post, article.post, div.post-article, article.post-article')) fallback = current;
+        }
+        return fallback;
+    };
+    let content = document.body;
+    if (scoped) {
+        const ancillary = 'header, nav, aside, footer, form, blockquote, pre, code, .signature, .post_signature, .message-signature, .post_meta, .post_controls, .post_actions, .post_toolbar';
+        const posts = Array.from(document.querySelectorAll('div[id^="post_"], article[id^="post_"], article.message--post'))
+            .filter(post => stablePost(post) && !post.parentElement?.closest(ancillary));
+        let original = posts[0];
+        if (original?.matches('article.message--post'))
+            original = posts.find(post => post.matches('article.message--post:is(.is-first, [data-position="0"])'));
+        const candidates = options.contentSelector ? Array.from(document.querySelectorAll(options.contentSelector))
+            .filter(body => !body.parentElement?.closest(ancillary)) : [];
+        content = original ? candidates.find(body => postOwner(body) === original) : (posts.length === 0 && candidates.length === 1 ? candidates[0] : null);
+    }
+    if (scoped && (!content || !isVisible(content) || !isExposed(content))) {
+        if (waitForImages) throw new Error('required original-post content scope is unavailable; screenshot skipped');
+        return false;
+    }
+    const owner = scoped ? postOwner(content) : null;
+    const roots = content ? [content] : [];
+    if (owner) {
+        for (const attachment of owner.querySelectorAll('.post_attachments, .attachments, .message-attachments')) {
+            if (postOwner(attachment) === owner && isExposed(attachment)) roots.push(attachment);
+        }
+    }
+    const belongs = element => !scoped || (isExposed(element) && (!owner || postOwner(element) === owner));
     const loadingText = /^(loading(?:[,.\u2026\s]+please wait)?|please wait)[.!\u2026]*$/i;
-    const hasVisibleLoadingState = Array.from(document.body?.querySelectorAll('*') || []).some((element) => {
+    const loadingElements = scoped ? roots.flatMap(root => [root, ...root.querySelectorAll('*')]) : Array.from(document.body?.querySelectorAll('*') || []);
+    const hasVisibleLoadingState = loadingElements.some((element) => {
+        if (!belongs(element)) return false;
         if (!isVisible(element)) return false;
         const text = String(element.textContent || '').replace(/\s+/g, ' ').trim();
         return text.length <= 80 && loadingText.test(text);
     });
-    const visibleImages = Array.from(document.images || []).filter((image) => {
+    const images = scoped ? Array.from(new Set(roots.flatMap(root => Array.from(root.querySelectorAll('img'))))) : Array.from(document.images || []);
+    const visibleImages = images.filter((image) => {
         const style = window.getComputedStyle(image);
         return image.getClientRects().length > 0 && style.display !== 'none' &&
             style.visibility !== 'hidden' && Number(style.opacity || 1) > 0 &&
-            Boolean(image.currentSrc || image.src);
+            belongs(image) && (scoped || Boolean(image.currentSrc || image.src));
     });
-    if (waitForImages && visibleImages.some(image => image.complete && image.naturalWidth === 0))
+    if (scoped && waitForImages) {
+        // Activate only public original-post media, not avatars or later replies.
+        // Cached HTML has app scripts disabled, so its explicit lazy attributes
+        // must be resolved without restarting the source application.
+        for (const image of visibleImages) {
+            image.loading = 'eager';
+            const source = image.dataset.src || image.dataset.lazySrc || image.dataset.original;
+            if (source && image.getAttribute('src') !== source) image.setAttribute('src', source);
+            if (image.dataset.srcset && image.getAttribute('srcset') !== image.dataset.srcset)
+                image.setAttribute('srcset', image.dataset.srcset);
+            const picture = image.closest('picture');
+            if (picture) for (const source of picture.querySelectorAll('source[data-srcset]'))
+                if (source.getAttribute('srcset') !== source.dataset.srcset) source.setAttribute('srcset', source.dataset.srcset);
+        }
+    }
+    if (waitForImages && visibleImages.some(image => image.complete && image.naturalWidth === 0 &&
+        (!scoped || Boolean(image.currentSrc || image.src))))
         throw new Error('visible source image failed to load; screenshot skipped');
-    const hasPendingImage = visibleImages.some(image => !image.complete);
-    const hasContent = document.body && isVisible(document.body) &&
-        (document.body.innerText.trim().length > 0 || Array.from(document.images || []).some(isVisible));
+    const hasPendingImage = visibleImages.some(image => !image.complete || scoped && !(image.currentSrc || image.src));
+    const hasContent = content && isVisible(content) &&
+        (content.innerText.trim().length > 0 || (scoped ? visibleImages : Array.from(document.images || [])).some(isVisible));
     return document.readyState !== 'loading' && hasContent &&
         !hasVisibleLoadingState && (!waitForImages ||
             ((!document.fonts || document.fonts.status !== 'loading') && !hasPendingImage));
 }
 """
+
+
+class _CaptureScopeUnavailable(RuntimeError):
+    pass
 
 
 def _cookie_rows(cookie_header: str | None, url: str) -> list[dict[str, object]]:
@@ -152,6 +225,7 @@ class BrowserClient:
         cookie_header: str | None = None,
         user_agent: str | None = None,
         validate_html: Callable[[str], bool] | None = None,
+        capture_content_selector: str | None = None,
     ) -> tuple[str, bytes | None]:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -277,7 +351,14 @@ class BrowserClient:
             # Validate the source only after ordinary asynchronous content is
             # ready. A loading shell is not evidence of a parser regression.
             try:
-                _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)), wait_for_images=False)
+                _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)),
+                                        wait_for_images=False, capture_content_selector=capture_content_selector)
+            except _CaptureScopeUnavailable:
+                # A parser may still validate a legacy body layout; an unknown
+                # evidence scope must remain partial rather than become complete.
+                verified_document()
+                self._task_count += 1
+                return finish_capture(None)
             except Exception as exc:
                 raise CollectionFailure("timeout", "browser content did not become ready within the request deadline") from exc
             verified_document()
@@ -303,6 +384,7 @@ class BrowserClient:
                     page,
                     timeout_ms=capture_timeout_ms,
                     capture_ready_script=capture_ready_script,
+                    capture_content_selector=capture_content_selector,
                 )
             except Exception:
                 session_eligible = False
@@ -319,6 +401,9 @@ class BrowserClient:
                         locator.scroll_into_view_if_needed(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
                         box = locator.bounding_box(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
                         if box is not None:
+                            if capture_content_selector is not None:
+                                offset = page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+                                box = {**box, "x": box["x"] + offset["x"], "y": box["y"] + offset["y"]}
                             clip_boxes.append(box)
                     if clip_boxes:
                         min_x = min(box["x"] for box in clip_boxes)
@@ -327,6 +412,7 @@ class BrowserClient:
                         max_y = max(box["y"] + box["height"] for box in clip_boxes)
                         screenshot_png = page.screenshot(
                             type="png",
+                            full_page=capture_content_selector is not None,
                             timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
                             animations="disabled",
                             clip={
@@ -404,6 +490,7 @@ class BrowserClient:
         storage_state_path: str | None = None,
         cookie_header: str | None = None,
         user_agent: str | None = None,
+        capture_content_selector: str | None = None,
     ) -> bytes:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -454,7 +541,8 @@ class BrowserClient:
             page.route("**/*", render_document)
             deadline = time.monotonic() + timeout_seconds
             page.goto(base_url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
-            _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)), javascript_enabled=False)
+            _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)),
+                                    javascript_enabled=False, capture_content_selector=capture_content_selector)
             screenshot_png = None
             if screenshot_selectors:
                 try:
@@ -466,6 +554,9 @@ class BrowserClient:
                         locator.scroll_into_view_if_needed(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
                         box = locator.bounding_box(timeout=_remaining_timeout_ms(deadline, selector_timeout_ms))
                         if box is not None:
+                            if capture_content_selector is not None:
+                                offset = page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+                                box = {**box, "x": box["x"] + offset["x"], "y": box["y"] + offset["y"]}
                             clip_boxes.append(box)
                     if clip_boxes:
                         min_x = min(box["x"] for box in clip_boxes)
@@ -474,6 +565,7 @@ class BrowserClient:
                         max_y = max(box["y"] + box["height"] for box in clip_boxes)
                         screenshot_png = page.screenshot(
                             type="png",
+                            full_page=capture_content_selector is not None,
                             timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
                             animations="disabled",
                             clip={
@@ -539,17 +631,21 @@ def _read_page_content(page, *, attempts: int = 6, wait_ms: int = 250) -> str:
 
 
 def _wait_for_capture_ready(page, *, timeout_ms: int, capture_ready_script: str = "",
-                            wait_for_images: bool = True, javascript_enabled: bool = True) -> None:
+                            wait_for_images: bool = True, javascript_enabled: bool = True,
+                            capture_content_selector: str | None = None) -> None:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     deadline = time.monotonic() + max(timeout_ms, 1) / 1000
+    if capture_content_selector is not None and not capture_content_selector.strip():
+        raise _CaptureScopeUnavailable("required original-post content scope is empty; screenshot skipped")
+    options = {"waitForImages": wait_for_images, "contentSelector": capture_content_selector}
     try:
         if javascript_enabled:
-            page.wait_for_function(_CAPTURE_READY_SCRIPT, arg=wait_for_images, polling=100, timeout=max(timeout_ms, 1))
+            page.wait_for_function(_CAPTURE_READY_SCRIPT, arg=options, polling=100, timeout=max(timeout_ms, 1))
         else:
             # In a script-disabled evidence document, scheduled JS callbacks may
             # not run. Poll readiness from Playwright without enabling the app.
-            while not page.evaluate(_CAPTURE_READY_SCRIPT, wait_for_images):
+            while not page.evaluate(_CAPTURE_READY_SCRIPT, options):
                 remaining = (deadline - time.monotonic()) * 1000
                 if remaining <= 0:
                     raise RuntimeError("page remained in a loading state; screenshot skipped")
@@ -557,6 +653,8 @@ def _wait_for_capture_ready(page, *, timeout_ms: int, capture_ready_script: str 
         if capture_ready_script:
             page.wait_for_function(capture_ready_script, polling=100, timeout=max(1, int((deadline - time.monotonic()) * 1000)))
     except PlaywrightTimeoutError as exc:
+        if capture_content_selector is not None and not page.locator(capture_content_selector).count():
+            raise _CaptureScopeUnavailable("required original-post content scope was not found; screenshot skipped") from exc
         raise RuntimeError("page remained in a loading state; screenshot skipped") from exc
 
 
@@ -645,6 +743,7 @@ def fetch_html_with_browser(
     cookie_header: str | None = None,
     user_agent: str | None = None,
     validate_html: Callable[[str], bool] | None = None,
+    capture_content_selector: str | None = None,
 ) -> str:
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
     try:
@@ -662,6 +761,7 @@ def fetch_html_with_browser(
             cookie_header=cookie_header,
             user_agent=user_agent,
             validate_html=validate_html,
+            capture_content_selector=capture_content_selector,
         )
         return html
     except Exception:
@@ -685,6 +785,7 @@ def fetch_page_artifacts_with_browser(
     cookie_header: str | None = None,
     user_agent: str | None = None,
     validate_html: Callable[[str], bool] | None = None,
+    capture_content_selector: str | None = None,
 ) -> tuple[str, bytes | None]:
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
     try:
@@ -706,6 +807,7 @@ def fetch_page_artifacts_with_browser(
             cookie_header=cookie_header,
             user_agent=user_agent,
             validate_html=validate_html,
+            capture_content_selector=capture_content_selector,
         )
     except Exception:
         close_browser_client()
@@ -726,6 +828,7 @@ def screenshot_html_with_browser(
     storage_state_path: str | None = None,
     cookie_header: str | None = None,
     user_agent: str | None = None,
+    capture_content_selector: str | None = None,
 ) -> bytes:
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
     client = _get_or_create_client(requested_proxy)
@@ -742,6 +845,7 @@ def screenshot_html_with_browser(
             storage_state_path=storage_state_path,
             cookie_header=cookie_header,
             user_agent=user_agent,
+            capture_content_selector=capture_content_selector,
         )
     except Exception:
         close_browser_client()

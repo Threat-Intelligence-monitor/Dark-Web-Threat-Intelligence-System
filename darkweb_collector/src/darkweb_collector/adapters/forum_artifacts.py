@@ -11,6 +11,10 @@ from darkweb_collector.source_sessions import browser_session_options, http_sess
 from darkweb_collector.tor_fetch import browser_proxy_server_for_url
 
 
+# Prefer the actual body over a wider MyBB content column containing author UI.
+FORUM_CAPTURE_CONTENT_SELECTOR = ".post_body, .post_content:not(:has(.post_body)), .messageContent:not(:has(.post_body))"
+
+
 def detail_artifacts_complete(directory, stem: str) -> bool:
     if not all((directory / f"{stem}.{suffix}").is_file() for suffix in ("html", "json", "png")):
         return False
@@ -30,6 +34,7 @@ def restore_detail_artifacts(
     hide_selectors: tuple[str, ...] = (),
     screenshot_styles: str = "",
     fallback_html=None,
+    capture_content_selector: str | None = None,
 ) -> DetailResult | None:
     if not detail_task.metadata.get("frontier_artifact_only"):
         return None
@@ -112,6 +117,7 @@ def restore_detail_artifacts(
             screenshot_selector=screenshot_selector,
             screenshot_selectors=screenshot_selectors, hide_selectors=hide_selectors,
             screenshot_styles=screenshot_styles,
+            capture_content_selector=capture_content_selector,
         )
         if not screenshot:
             raise CollectionFailure("artifact", "stored detail evidence capture produced no image")
