@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import shutil
 import subprocess
 import traceback
@@ -33,7 +36,45 @@ def _stderr_text(stderr: str | bytes | None) -> str:
     return stderr.strip()
 
 
-def raise_for_http_status(status: int, html: str | None = None) -> None:
+def _retry_after_seconds(headers: Mapping[str, str] | None) -> float:
+    value = next((str(value).strip() for name, value in (headers or {}).items() if name.lower() == "retry-after"), "")
+    if not value:
+        return 0.0
+    try:
+        return max(0.0, float(int(value)))
+    except (ValueError, OverflowError):
+        pass
+    try:
+        deadline = parsedate_to_datetime(value)
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _read_retry_after_headers(path: str) -> dict[str, str]:
+    value = ""
+    try:
+        with open(path, "r", encoding="iso-8859-1") as response_headers:
+            for line in response_headers:
+                if line.startswith("HTTP/"):
+                    value = ""
+                elif line.lower().startswith("retry-after:"):
+                    value = line.partition(":")[2].strip()
+    except OSError:
+        return {}
+    return {"retry-after": value} if value else {}
+
+
+def raise_for_http_status(
+    status: int, html: str | None = None, *, headers: Mapping[str, str] | None = None,
+) -> None:
+    if status == 429:
+        raise CollectionFailure(
+            "rate_limited", "HTTP 429; source rate limit reached", scope="site",
+            retry_after=_retry_after_seconds(headers),
+        )
     if html is not None and html.strip():
         try:
             raise_if_error_page(html)
@@ -44,8 +85,6 @@ def raise_for_http_status(status: int, html: str | None = None) -> None:
         raise CollectionFailure("auth_required", "HTTP 401; source requires authentication", scope="site")
     if status == 403:
         raise CollectionFailure("blocked", "HTTP 403; source refused the request", scope="target")
-    if status == 429:
-        raise CollectionFailure("rate_limited", "HTTP 429; source rate limit reached", scope="site")
     if status in {404, 410}:
         raise CollectionFailure("unknown", f"HTTP {status}; target availability is unconfirmed")
     if status in {408, 504}:
@@ -244,18 +283,26 @@ def fetch_via_tor_curl(
         ]
         if cookie_header:
             command.extend(["--cookie", cookie_header])
-        command.append(url)
-
-        request_attempt()
-        result = subprocess.run(command, capture_output=True, check=False)
+        descriptor, headers_file = tempfile.mkstemp(prefix="dwti-tor-headers-", suffix=".txt")
+        os.close(descriptor)
+        command.extend(["--dump-header", headers_file, url])
+        try:
+            request_attempt()
+            result = subprocess.run(command, capture_output=True, check=False)
+            response_headers = _read_retry_after_headers(headers_file)
+        finally:
+            try:
+                os.unlink(headers_file)
+            except FileNotFoundError:
+                pass
         output = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
         body, marker, code = output.rpartition("\nDWTI_HTTP_STATUS:")
         status = int(code.strip()) if marker and code.strip().isdigit() else 0
         if result.returncode == 0:
             content = body if marker else output
-            raise_for_http_status(status, content)
+            raise_for_http_status(status, content, headers=response_headers)
             return content
-        raise_for_http_status(status)
+        raise_for_http_status(status, headers=response_headers)
 
         if attempt < attempts:
             time.sleep(backoff_seconds * attempt)
@@ -449,75 +496,74 @@ def fetch_via_http_proxy(
     
     attempts = 1 if managed_request() else retries + 1
     
-    # Create temp directory for cookies and output
-    temp_scope = tempfile.TemporaryDirectory(prefix="dwti-http-fetch-")
-    temp_dir = temp_scope.name
-    cookie_file = os.path.join(temp_dir, "cookies.txt")
-    output_file = os.path.join(temp_dir, "temp.html")
-    
-    # Ensure temp directory exists
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    for attempt in range(1, attempts + 1):
-        # Generate headers
-        # Note: Not sending Accept-Encoding to avoid compressed responses
-        headers = [
-            f"-H", f"User-Agent: {user_agent}",
-            f"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            f"-H", f"Accept-Language: {accept_language}",
-            f"-H", "Connection: keep-alive",
-            f"-H", "Upgrade-Insecure-Requests: 1",
-            f"-H", "Cache-Control: max-age=0",
-            f"-H", "Sec-Fetch-Dest: document",
-            f"-H", "Sec-Fetch-Mode: navigate",
-            f"-H", "Sec-Fetch-Site: none",
-            f"-H", "Sec-Fetch-User: ?1",
-            f"-H", "DNT: 1"
-        ]
-        
-        # Build curl command
-        command = [
-            curl,
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time", str(timeout),
-            "--write-out", "%{http_code}",
-            "--cookie-jar", cookie_file,
-            "--cookie", cookie_file,
-            "--output", output_file
-        ]
-        
-        # Add proxy if configured
-        if bypass_proxy:
-            command.extend(["--noproxy", "*"])
-        elif proxy_host and proxy_port:
-            command.extend(["--proxy", f"http://{proxy_host}:{proxy_port}"])
+    # Keep cookies, body and response headers private to this fetch and clean up on every exit.
+    with tempfile.TemporaryDirectory(prefix="dwti-http-fetch-") as temp_dir:
+        cookie_file = os.path.join(temp_dir, "cookies.txt")
+        output_file = os.path.join(temp_dir, "temp.html")
+        headers_file = os.path.join(temp_dir, "headers.txt")
 
-        if cookie_header:
-            command.extend(["--header", f"Cookie: {cookie_header}"])
-        
-        command.extend(headers + [url])
-        
-        # Execute curl command
-        request_attempt()
-        result = subprocess.run(command, capture_output=True, check=False)
-        status_text = result.stdout.decode("ascii", errors="ignore") if isinstance(result.stdout, bytes) else str(result.stdout or "")
-        status = int(status_text.strip()) if status_text.strip().isdigit() else 0
-        
-        if result.returncode == 0:
-            try:
-                # Try UTF-8 first
-                with open(output_file, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-            except OSError as exc:
-                raise ProxyFetchError("HTTP response body could not be read", kind="parse") from exc
-            raise_for_http_status(status, content)
-            return content
-        raise_for_http_status(status)
-        
-        if attempt < attempts:
-            time.sleep(backoff_seconds * attempt)
+        for attempt in range(1, attempts + 1):
+            # Generate headers
+            # Note: Not sending Accept-Encoding to avoid compressed responses
+            headers = [
+                f"-H", f"User-Agent: {user_agent}",
+                f"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                f"-H", f"Accept-Language: {accept_language}",
+                f"-H", "Connection: keep-alive",
+                f"-H", "Upgrade-Insecure-Requests: 1",
+                f"-H", "Cache-Control: max-age=0",
+                f"-H", "Sec-Fetch-Dest: document",
+                f"-H", "Sec-Fetch-Mode: navigate",
+                f"-H", "Sec-Fetch-Site: none",
+                f"-H", "Sec-Fetch-User: ?1",
+                f"-H", "DNT: 1"
+            ]
+
+            # Build curl command
+            command = [
+                curl,
+                "--silent",
+                "--show-error",
+                "--location",
+                "--max-time", str(timeout),
+                "--write-out", "%{http_code}",
+                "--cookie-jar", cookie_file,
+                "--cookie", cookie_file,
+                "--dump-header", headers_file,
+                "--output", output_file
+            ]
+
+            # Add proxy if configured
+            if bypass_proxy:
+                command.extend(["--noproxy", "*"])
+            elif proxy_host and proxy_port:
+                command.extend(["--proxy", f"http://{proxy_host}:{proxy_port}"])
+
+            if cookie_header:
+                command.extend(["--header", f"Cookie: {cookie_header}"])
+
+            command.extend(headers + [url])
+
+            # Execute curl command
+            request_attempt()
+            result = subprocess.run(command, capture_output=True, check=False)
+            response_headers = _read_retry_after_headers(headers_file)
+            status_text = result.stdout.decode("ascii", errors="ignore") if isinstance(result.stdout, bytes) else str(result.stdout or "")
+            status = int(status_text.strip()) if status_text.strip().isdigit() else 0
+
+            if result.returncode == 0:
+                try:
+                    # Try UTF-8 first
+                    with open(output_file, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except OSError as exc:
+                    raise ProxyFetchError("HTTP response body could not be read", kind="parse") from exc
+                raise_for_http_status(status, content, headers=response_headers)
+                return content
+            raise_for_http_status(status, headers=response_headers)
+
+            if attempt < attempts:
+                time.sleep(backoff_seconds * attempt)
     
     raise ProxyFetchError(f"proxy fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
 

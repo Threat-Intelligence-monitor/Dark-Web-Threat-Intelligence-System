@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urldefrag, urlparse
 
-from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt
+from darkweb_collector.collection_errors import CollectionFailure, request_attempt
 from darkweb_collector.tor_fetch import raise_for_http_status
 
 
@@ -191,16 +191,20 @@ class BrowserClient:
                 raise CollectionFailure("network", "browser document navigation failed") from exc
             status = getattr(response, "status", 0)
             if status in {401, 429}:
-                raise_for_http_status(status)
+                raise_for_http_status(status, headers=getattr(response, "headers", None))
             page.wait_for_timeout(wait_seconds * 1000)
-            _clear_browser_check_interstitial(page, timeout_ms=timeout_seconds * 1000)
-            raise_if_error_page(_read_page_content(page))
             if main_response is not None and (
                 urldefrag(main_response.url)[0] == urldefrag(page.url)[0]
-                == urldefrag(response.url if response is not None else url)[0]
+                and main_response.status in {401, 429}
             ):
-                status = main_response.status
-            raise_for_http_status(status)
+                raise_for_http_status(main_response.status, headers=main_response.headers)
+            _clear_browser_check_interstitial(page, timeout_ms=timeout_seconds * 1000)
+            html = _read_page_content(page)
+            if main_response is not None and (
+                urldefrag(main_response.url)[0] == urldefrag(page.url)[0]
+            ):
+                response = main_response
+            raise_for_http_status(getattr(response, "status", 0), html, headers=getattr(response, "headers", None))
             try:
                 if hide_selectors:
                     selector_rules = ", ".join(hide_selectors)

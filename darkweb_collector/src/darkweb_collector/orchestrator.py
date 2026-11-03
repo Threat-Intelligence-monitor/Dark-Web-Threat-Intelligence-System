@@ -242,10 +242,16 @@ def execute_seed_job(
         if force:
             reset_site_failures(connection, site_name)
             connection.commit()
-        elif site_retry_at(connection, site_name, include_detail=False) > time.time():
+        if site_retry_at(connection, site_name, include_detail=False) > time.time():
             return {"site_name": site_name, "seed_job_id": run_ctx.job_id, "reason": "source_cooldown",
                     "detail_job_ids": [], "detail_task_count": 0, "detail_dispatched_count": 0}
-    seed_result = adapter.collect_seed(config, run_ctx)
+    try:
+        seed_result = adapter.collect_seed(config, run_ctx)
+    except CollectionFailure as failure:
+        from darkweb_collector.forum_rate_limit import note_source_failure
+
+        note_source_failure(site_name, failure)
+        raise
     detail_tasks = adapter.plan_details(seed_result, config)
     uses_frontier = bool(getattr(adapter, "supports_frontier", False))
     if uses_frontier:

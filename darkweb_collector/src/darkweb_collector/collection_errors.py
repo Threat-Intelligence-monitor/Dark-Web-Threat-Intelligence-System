@@ -35,13 +35,18 @@ def request_budget(callback: Callable[[], None]):
 
 
 def request_attempt() -> None:
+    from darkweb_collector.forum_rate_limit import before_source_request
+
+    before_source_request()
     callback = _request_callback.get()
     if callback is not None:
         callback()
 
 
 def managed_request() -> bool:
-    return _request_callback.get() is not None
+    from darkweb_collector.forum_rate_limit import scope_active
+
+    return _request_callback.get() is not None or scope_active()
 
 
 def has_detail_body(payload: dict) -> bool:
@@ -209,6 +214,14 @@ def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> 
     ):
         raise CollectionFailure("auth_required", "source returned its login form", scope="site")
     panel = " ".join(template.error_text).lower()
+    if not has_post and not template.has_listing and (
+        re.search(r"\b(?:too many requests|rate limit exceeded|request limit exceeded|"
+                  r"(?:accessing|refreshing) this page too quickly)\b", panel)
+        or not has_content and title in {"too many requests", "429 too many requests", "rate limit exceeded"}
+    ):
+        hint = re.search(r"\b(?:wait|try again in)\s+(\d+)\s*(seconds?|minutes?|hours?)\b", panel or service_text)
+        retry_after = int(hint.group(1)) * ({"s": 1, "m": 60, "h": 3600}[hint.group(2)[0]]) if hint else 0
+        raise CollectionFailure("rate_limited", "source returned its request-limit page", scope="site", retry_after=retry_after)
     if not has_post:
         if any(phrase in panel for phrase in (
             "do not have permission", "you must be logged", "you must be registered",

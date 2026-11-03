@@ -46,6 +46,7 @@ class DarkforumsAdapter(SiteAdapter):
     list_parser = staticmethod(parse_darkforums_list)
     detail_parser = staticmethod(parse_darkforums_detail)
     detail_screenshot_selectors = ("#thread-info", ".post.classic")
+    terminal_failure_kinds = frozenset({"retry_budget", "unavailable", "rate_limited", "restricted"})
 
     @staticmethod
     def _is_valid_seed_html(html: str) -> bool:
@@ -76,7 +77,7 @@ class DarkforumsAdapter(SiteAdapter):
                     raise CollectionFailure("parse", f"{self.site_name} response has no recognized forum listing")
                 return html
             except CollectionFailure as exc:
-                if exc.kind in {"retry_budget", "unavailable", "rate_limited", "restricted"}:
+                if exc.kind in self.terminal_failure_kinds:
                     raise
                 failures.append((route_name, exc))
             except Exception as exc:
@@ -202,7 +203,7 @@ class DarkforumsAdapter(SiteAdapter):
                 raise CollectionFailure("parse", f"{self.site_name} detail has no visible post content")
             raise CollectionFailure("parse", f"{self.site_name} detail has no recognized post structure")
         except CollectionFailure as exc:
-            if exc.kind in {"retry_budget", "unavailable", "rate_limited", "restricted"}:
+            if exc.kind in self.terminal_failure_kinds:
                 raise
             failures.append(("direct", exc))
         except Exception as exc:
@@ -229,7 +230,7 @@ class DarkforumsAdapter(SiteAdapter):
                 raw_html=html, screenshot_png=screenshot_png, metadata=detail_task.metadata,
             )
         except CollectionFailure as exc:
-            if exc.kind in {"retry_budget", "unavailable", "rate_limited", "restricted"}:
+            if exc.kind in self.terminal_failure_kinds:
                 raise
             failures.append(("fallback", exc))
         except Exception as exc:

@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS crawl_site_control (
     site_name TEXT PRIMARY KEY, failure_kind TEXT NOT NULL, next_retry DOUBLE PRECISION NOT NULL,
     updated_at DOUBLE PRECISION NOT NULL
 );
+CREATE TABLE IF NOT EXISTS crawl_source_request_control (
+    site_name TEXT PRIMARY KEY, request_at DOUBLE PRECISION NOT NULL
+);
 CREATE TABLE IF NOT EXISTS crawl_detail_site_control (
     site_name TEXT PRIMARY KEY, failure_kind TEXT NOT NULL, next_retry DOUBLE PRECISION NOT NULL,
     updated_at DOUBLE PRECISION NOT NULL
@@ -81,7 +84,14 @@ def worker_alive(pid: int, started: float) -> bool:
 
 
 def reset_site_failures(connection, site_name: str) -> None:
-    connection.execute("DELETE FROM crawl_site_control WHERE site_name = ?", (site_name,))
+    from darkweb_collector.forum_rate_limit import GUARDED_SITES
+
+    if site_name in GUARDED_SITES:
+        connection.execute("""DELETE FROM crawl_site_control WHERE site_name = ?
+            AND (next_retry <= ? OR failure_kind NOT IN ('rate_limited', 'blocked', 'auth_required'))""",
+            (site_name, time.time()))
+    else:
+        connection.execute("DELETE FROM crawl_site_control WHERE site_name = ?", (site_name,))
     connection.execute("DELETE FROM crawl_detail_site_control WHERE site_name = ?", (site_name,))
     connection.execute("""UPDATE crawl_detail_control SET failure_count = 0, failure_kind = '',
         next_retry = 0, request_count = 0, budget_until = 0, last_error = ''

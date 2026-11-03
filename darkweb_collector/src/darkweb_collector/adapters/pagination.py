@@ -117,6 +117,7 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
     seen_topics: set[str] = set()
     signatures: dict[str, set[str]] = {url: set() for url in config.seed_urls}
     pages_scanned = 0
+    site_stopped = False
 
     def result() -> SeedResult:
         return SeedResult(
@@ -126,7 +127,7 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
                      "pagination_errors": list(errors)},
             raw_html_by_url=raw_pages,
             metadata={"cursor_updates": list(updates.values()), "pagination_errors": errors,
-                      "pages_scanned": pages_scanned, "backfill_paused": detail_paused or pending >= min(limit, config.frontier_dispatch_window)},
+                      "pages_scanned": pages_scanned, "backfill_paused": site_stopped or detail_paused or pending >= min(limit, config.frontier_dispatch_window)},
         )
 
     def candidate_count() -> int:
@@ -152,7 +153,9 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
         }
 
     def visit(url: str, page: int, lane: str) -> bool:
-        nonlocal pages_scanned
+        nonlocal pages_scanned, site_stopped
+        if site_stopped:
+            return False
         try:
             parsed, raw, more, signature, page_url = fetch_page(url, page, collected_at)
             previous = str(cursors[url].get("last_signature") or "")
@@ -164,6 +167,13 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
             errors.append({"source_url": safe_failure_text(url), "page": page, "lane": lane, **failure_details(exc)})
             failures.append((f"source {config.seed_urls.index(url) + 1} page {page} ({lane})", exc))
             blocked.add(url)
+            failure = failure_details(exc)
+            if failure["scope"] == "site" or failure["kind"] == "rate_limited":
+                from darkweb_collector.forum_rate_limit import note_source_failure
+
+                note_source_failure(site_name, exc)
+                site_stopped = True
+                blocked.update(config.seed_urls)
             return False
         pages_scanned += 1
         signatures[url].add(signature)
@@ -191,6 +201,8 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
         return True
 
     for url in config.seed_urls:
+        if site_stopped:
+            break
         for page in range(1, recent_pages + 1):
             if not visit(url, page, "recent") or url in blocked:
                 break
@@ -221,5 +233,5 @@ def collect_paginated_seed(site_name: str, config: SiteConfig, fetch_page, *, pl
     if not pages_scanned and errors:
         raise summarize_failures(f"{site_name}: every listing request failed", failures)
     seed_result = result()
-    seed_result.metadata["backfill_paused"] = bool(detail_paused or recent_candidates or pending + discovered >= min(limit, config.frontier_dispatch_window))
+    seed_result.metadata["backfill_paused"] = bool(site_stopped or detail_paused or recent_candidates or pending + discovered >= min(limit, config.frontier_dispatch_window))
     return seed_result
