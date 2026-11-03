@@ -132,7 +132,8 @@ def raise_for_http_status(
             raise_if_error_page(html)
         except CollectionFailure as exc:
             message = f"HTTP {status}; {exc}" if status else str(exc)
-            raise CollectionFailure(exc.kind, message, scope=exc.scope, retry_after=exc.retry_after) from exc
+            raise CollectionFailure(exc.kind, message, scope=exc.scope, retry_after=exc.retry_after,
+                                    verification_provider=exc.verification_provider) from exc
     if status == 401:
         raise CollectionFailure("auth_required", "HTTP 401; source requires authentication", scope="site")
     if status == 403:

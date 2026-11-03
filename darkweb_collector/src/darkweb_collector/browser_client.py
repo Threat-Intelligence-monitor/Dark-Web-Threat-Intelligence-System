@@ -18,6 +18,7 @@ from darkweb_collector.source_sessions import read_browser_session, persist_brow
 class BrowserProxyConfig:
     server: str | None = None
     engine: str = "firefox"
+    verification_provider: str = ""
 
 
 _CAPTURE_READY_SCRIPT = r"""
@@ -177,6 +178,8 @@ class BrowserClient:
             }
             if self._proxy.engine == "chromium":
                 launch_kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
+                if self._proxy.verification_provider == "dnsproxy":
+                    launch_kwargs["channel"] = "chromium"
             if self._proxy.server:
                 launch_kwargs["proxy"] = {"server": self._proxy.server}
             browser_type = getattr(self._playwright, self._proxy.engine)
@@ -266,9 +269,15 @@ class BrowserClient:
             context.add_cookies(cookie_rows)
         page = context.new_page()
         main_response = None
+        main_request = None
         limited_response = None
         limited_headers = None
         session_eligible = False
+
+        def remember_main_request(received):
+            nonlocal main_request
+            if received.is_navigation_request() and received.frame == page.main_frame:
+                main_request = received
 
         def remember_main_response(received):
             nonlocal main_response, limited_response, limited_headers, session_eligible
@@ -284,6 +293,7 @@ class BrowserClient:
                     except Exception:
                         pass
 
+        page.on("request", remember_main_request)
         page.on("response", remember_main_response)
         selector_timeout_ms = min(timeout_seconds * 1000, 10_000)
         deadline = time.monotonic() + timeout_seconds
@@ -294,6 +304,36 @@ class BrowserClient:
                 if not same_source(url, limited_response.url):
                     raise CollectionFailure("source_moved", "browser navigation left the configured source origin", scope="site")
                 raise_for_http_status(429, headers=limited_headers)
+
+        early_verification = self._proxy.engine == "chromium" and self._proxy.verification_provider == "dnsproxy"
+
+        def observe_dnsproxy_document(response):
+            if not early_verification or response is None:
+                return
+            headers = response.headers
+            mime = str(headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            if (response.status != 302 or "location" in headers
+                    or str(headers.get("cf-mitigated") or "").strip().lower() == "challenge"
+                    or mime not in {"text/html", "application/xhtml+xml"}
+                    or not same_source(url, response.url)):
+                return
+            # This hint comes from the preceding strict HTTP-template check.
+            # Allow its normal, short input-observation window to run without
+            # clicking controls, synthesizing DOM events, or constructing tokens.
+            started = time.monotonic()
+            stop = min(deadline, started + 0.7)
+            viewport = page.viewport_size or {"width": 1440, "height": 960}
+            for index in range(24):
+                check_rate_limit()
+                if (time.monotonic() >= stop or page.is_closed() or main_response is not response
+                        or main_request is not response.request or not same_source(url, page.url)):
+                    break
+                page.mouse.move(min(viewport["width"] - 1, 80 + index * 8),
+                                min(viewport["height"] - 1, 120 + index * 3))
+                check_rate_limit()
+                remaining = min(stop, started + (index + 1) * 0.7 / 24) - time.monotonic()
+                if remaining > 0:
+                    page.wait_for_timeout(remaining * 1000)
 
         def verified_document(*, validate_content=True):
             nonlocal validated_html
@@ -333,7 +373,8 @@ class BrowserClient:
             # dynamic content after DOM readiness.
             request_attempt()
             try:
-                response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+                response = page.goto(url, wait_until="commit" if early_verification else "domcontentloaded",
+                                     timeout=timeout_seconds * 1000)
             except PlaywrightTimeoutError as exc:
                 raise CollectionFailure("timeout", "browser document navigation timed out") from exc
             except Exception as exc:
@@ -342,6 +383,9 @@ class BrowserClient:
             if status in {401, 429}:
                 raise_for_http_status(status, headers=getattr(response, "headers", None))
             check_rate_limit()
+            observe_dnsproxy_document(response)
+            if early_verification:
+                page.wait_for_load_state("domcontentloaded", timeout=_remaining_timeout_ms(deadline, timeout_seconds * 1000))
             render_deadline = min(deadline, time.monotonic() + max(0, wait_seconds))
             while time.monotonic() < render_deadline:
                 page.wait_for_timeout(min(250, max(0, (render_deadline - time.monotonic()) * 1000)))
@@ -744,8 +788,9 @@ def fetch_html_with_browser(
     user_agent: str | None = None,
     validate_html: Callable[[str], bool] | None = None,
     capture_content_selector: str | None = None,
+    verification_provider: str = "",
 ) -> str:
-    requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
+    requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine, verification_provider=verification_provider)
     try:
         client = _get_or_create_client(requested_proxy)
     except Exception as exc:
@@ -786,8 +831,9 @@ def fetch_page_artifacts_with_browser(
     user_agent: str | None = None,
     validate_html: Callable[[str], bool] | None = None,
     capture_content_selector: str | None = None,
+    verification_provider: str = "",
 ) -> tuple[str, bytes | None]:
-    requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
+    requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine, verification_provider=verification_provider)
     try:
         client = _get_or_create_client(requested_proxy)
     except Exception as exc:
