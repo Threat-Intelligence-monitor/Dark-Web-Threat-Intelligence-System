@@ -479,10 +479,8 @@ export function initializePrototype() {
     const collectorLinks = hasModuleAccess(MODULE_KEYS.COLLECTOR_CONTROL) ? [
       navLink('/collector-control/overview', '采集总览', activePath('/collector-control/overview')),
       navLink('/collector-control/sites', '站点管理', active('collector-sites.html')),
-      navLink('/collector-control/tasks', '任务历史', activePath('/collector-control/tasks')),
       navLink('/collector-control/sync', '同步中心', active('collector-sync.html')),
       navLink('/collector-control/runtime', '运行环境', active('collector-runtime.html')),
-      `<a class="nav-link sub${active('collector-failures.html')}" href="/collector-control/failures"><span>任务列表</span><span class="nav-alert-count num" data-task-nav-count hidden>0</span></a>`,
     ] : []
     const systemLinks = [
       hasModuleAccess(MODULE_KEYS.FILE_MONITORING) && navLink('/settings', '监测配置', active('settings.html')),
