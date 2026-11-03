@@ -14,7 +14,7 @@ from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete
 from darkweb_collector.adapters.pagination import collect_paginated_seed
 from darkweb_collector.browser_client import fetch_page_artifacts_with_browser
 from darkweb_collector.changan_auto_login import recover_changan_session
-from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt, safe_failure_text
 from darkweb_collector.db import (
     get_db_connection,
     get_forum_detail_snapshot,
@@ -277,6 +277,8 @@ class ChanganAdapter(SiteAdapter):
             raise CollectionFailure("parse", "changan detail has no recognized product content")
         raw_html = _fallback_html(detail)
         screenshot_png = None
+        metadata = dict(detail_task.metadata)
+        metadata.pop("artifact_error", None)
         try:
             _, storage_state_path = require_site_auth_token(config)
             rendered_html, screenshot_png = fetch_page_artifacts_with_browser(
@@ -290,20 +292,24 @@ class ChanganAdapter(SiteAdapter):
                 capture_ready_script=_capture_ready_script(bool(detail.get("attachments"))),
             )
             raise_if_error_page(rendered_html)
-            if screenshot_png is not None and "product-detail-info" in rendered_html:
-                raw_html = rendered_html
-            else:
-                screenshot_png = None
+            if not screenshot_png:
+                raise CollectionFailure("artifact", "changan detail evidence capture produced no image")
+            if "product-detail-info" not in rendered_html:
+                raise CollectionFailure("artifact", "changan detail evidence has no recognized product content")
+            raw_html = rendered_html
         except Exception as exc:
             screenshot_png = None
-            print(f"[changan] detail evidence capture failed: {type(exc).__name__}")
+            error = safe_failure_text(f"artifact: changan detail evidence capture failed ({type(exc).__name__}): {exc}")
+            metadata["artifact_error"] = error
+            detail["_collector_artifact_error"] = error
+            print(f"[changan] {error}")
         return DetailResult(
             site_name=self.site_name,
             target_url=detail_task.target_url,
             payload=detail,
             raw_html=raw_html,
             screenshot_png=screenshot_png,
-            metadata=detail_task.metadata,
+            metadata=metadata,
         )
 
     def persist(

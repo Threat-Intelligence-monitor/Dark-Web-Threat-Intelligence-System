@@ -31,7 +31,7 @@ from darkweb_collector.db import (
     reconcile_stale_crawl_jobs,
     upsert_crawl_job,
 )
-from darkweb_collector.collection_errors import CollectionFailure, classify_failure, has_detail_body, request_budget
+from darkweb_collector.collection_errors import CollectionFailure, classify_failure, has_detail_body, request_budget, safe_failure_text
 from darkweb_collector.detail_lifecycle import (
     claim_detail, complete_detail, consume_request, count_detail_writes, detail_timeout,
     fail_detail, owns_detail, reconcile_detail_owners, release_detail, reset_site_failures, site_retry_at, source_version,
@@ -242,10 +242,16 @@ def execute_seed_job(
         if force:
             reset_site_failures(connection, site_name)
             connection.commit()
-        elif site_retry_at(connection, site_name, include_detail=False) > time.time():
+        if site_retry_at(connection, site_name, include_detail=False) > time.time():
             return {"site_name": site_name, "seed_job_id": run_ctx.job_id, "reason": "source_cooldown",
                     "detail_job_ids": [], "detail_task_count": 0, "detail_dispatched_count": 0}
-    seed_result = adapter.collect_seed(config, run_ctx)
+    try:
+        seed_result = adapter.collect_seed(config, run_ctx)
+    except CollectionFailure as failure:
+        from darkweb_collector.forum_rate_limit import note_source_failure
+
+        note_source_failure(site_name, failure)
+        raise
     detail_tasks = adapter.plan_details(seed_result, config)
     uses_frontier = bool(getattr(adapter, "supports_frontier", False))
     if uses_frontier:
@@ -392,7 +398,8 @@ def execute_detail_job(
                     upsert_crawl_job(connection, job_id=token, site_name=site_name, job_type="detail",
                                     queue_name=queue_name, target=detail_task.target_url,
                                     status="partial" if artifacts_pending else "succeeded",
-                                    finished_at=utc_now_iso(), duration_ms=int((time.perf_counter() - start_perf) * 1000))
+                                    finished_at=utc_now_iso(), duration_ms=int((time.perf_counter() - start_perf) * 1000),
+                                    error_message=safe_failure_text(detail_result.metadata.get("artifact_error") or "") if artifacts_pending else "")
                     connection.commit()
                     result.update(artifacts_pending=artifacts_pending, **counts)
             except Exception as error:

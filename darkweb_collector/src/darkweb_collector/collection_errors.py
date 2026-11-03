@@ -35,13 +35,18 @@ def request_budget(callback: Callable[[], None]):
 
 
 def request_attempt() -> None:
+    from darkweb_collector.forum_rate_limit import before_source_request
+
+    before_source_request()
     callback = _request_callback.get()
     if callback is not None:
         callback()
 
 
 def managed_request() -> bool:
-    return _request_callback.get() is not None
+    from darkweb_collector.forum_rate_limit import scope_active
+
+    return _request_callback.get() is not None or scope_active()
 
 
 def has_detail_body(payload: dict) -> bool:
@@ -108,6 +113,9 @@ class _ErrorTemplate(HTMLParser):
             or "cf-turnstile" in classes
             or (tag in {"script", "iframe"} and any(marker in str(attrs.get("src") or "") for marker in (
                 "/cdn-cgi/challenge-platform/", "challenges.cloudflare.com/",
+            )))
+            or (tag == "script" and bool(re.match(
+                r"^(?:https?:)?//check\.ddos-guard\.net(?:[/:?]|$)", str(attrs.get("src") or ""), re.I,
             )))
         )
         if not parent_ignored and (not ancillary or tag == "script") and not in_post and not quoted:
@@ -198,6 +206,8 @@ def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> 
         if (re.search(r"\b(?:browser check|browser verification|checking your browser)\b", title)
                 and re.search(r"\b(?:browser check in progress|pending verification|verifying your browser|dnsproxy antibot)\b", service_text)):
             raise CollectionFailure("blocked", "source returned a browser-verification page", scope="site", retry_after=900)
+    if not has_content and title == "ddos-guard" and "checking your browser" in service_text:
+        raise CollectionFailure("blocked", "source returned a DDoS-Guard browser-verification page", scope="site")
     if template.primary_challenge or (not has_content and (template.challenge or title in {
         "just a moment...", "checking your browser", "attention required! | cloudflare", "verify you are human",
     })):
@@ -209,6 +219,14 @@ def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> 
     ):
         raise CollectionFailure("auth_required", "source returned its login form", scope="site")
     panel = " ".join(template.error_text).lower()
+    if not has_post and not template.has_listing and (
+        re.search(r"\b(?:too many requests|rate limit exceeded|request limit exceeded|"
+                  r"(?:accessing|refreshing) this page too quickly)\b", panel)
+        or not has_content and title in {"too many requests", "429 too many requests", "rate limit exceeded"}
+    ):
+        hint = re.search(r"\b(?:wait|try again in)\s+(\d+)\s*(seconds?|minutes?|hours?)\b", panel or service_text)
+        retry_after = int(hint.group(1)) * ({"s": 1, "m": 60, "h": 3600}[hint.group(2)[0]]) if hint else 0
+        raise CollectionFailure("rate_limited", "source returned its request-limit page", scope="site", retry_after=retry_after)
     if not has_post:
         if any(phrase in panel for phrase in (
             "do not have permission", "you must be logged", "you must be registered",
@@ -281,9 +299,16 @@ def failure_details(error: Exception) -> dict:
 def summarize_failures(message: str, failures: list[tuple[str, Exception]]) -> CollectionFailure:
     if not failures:
         return CollectionFailure("unknown", safe_failure_text(message))
-    priority = ("retry_budget", "rate_limited", "infrastructure", "source_moved", "source_closed", "blocked", "auth_required", "restricted", "timeout", "network", "parse", "unavailable", "unknown")
+    priority = ("retry_budget", "rate_limited", "infrastructure", "source_moved", "source_closed", "blocked", "auth_required", "restricted", "unavailable", "timeout", "network", "not_found", "parse", "unknown")
     details = [(safe_failure_text(label)[:80], failure_details(error)) for label, error in failures]
-    selected = min(details, key=lambda item: (
+    candidates = details
+    last_route, last_failure = details[-1]
+    if last_failure["kind"] == "not_found" and (last_route == "browser" or last_route.startswith("browser_")):
+        # A final browser response may have cleared the earlier HTTP login or
+        # verification wall. Keep those diagnostics, without pausing the site
+        # for a gate that the browser has already passed.
+        candidates = [item for item in details if item[1]["kind"] not in {"blocked", "auth_required"}]
+    selected = min(candidates, key=lambda item: (
         priority.index(item[1]["kind"]) if item[1]["kind"] in priority else len(priority),
         item[1]["scope"] != "site", -item[1]["retry_after"],
     ))

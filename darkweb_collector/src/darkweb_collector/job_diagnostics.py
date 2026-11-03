@@ -29,7 +29,7 @@ def classify_error(message: str | None) -> str:
     category = lowered.split(":", 1)[0]
     if category in {"unavailable", "auth_required", "restricted", "blocked", "rate_limited", "network",
                     "timeout", "parse", "unknown", "artifact", "infrastructure", "retry_budget",
-                    "source_closed", "source_moved"}:
+                    "source_closed", "source_moved", "not_found"}:
         return category
     if (
         "cannot switch to a different thread" in lowered
@@ -91,6 +91,8 @@ def consecutive_failures(rows: list[dict[str, Any]]) -> int:
         if status == "succeeded":
             break
         if status == "failed":
+            if row.get("job_type") == "detail" and classify_error(row.get("error_message")) == "not_found":
+                continue
             count += 1
             continue
         if status in {"running", "enqueued", "stale"}:
@@ -107,6 +109,7 @@ def failure_cooldown_until(config: SiteConfig, rows: list[dict[str, Any]]) -> da
             row
             for row in rows
             if str(row.get("status") or "") == "failed"
+            and not (row.get("job_type") == "detail" and classify_error(row.get("error_message")) == "not_found")
         ),
         None,
     )

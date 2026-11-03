@@ -7,6 +7,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 from darkweb_collector.normalize import content_hash
+from darkweb_collector.sites.forum_post_content import extract_body_content, is_post_container
 from darkweb_collector.sites.darkforums import (
     determine_industry,
     determine_region,
@@ -54,6 +55,12 @@ class _Document(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         node = _Node(tag, attrs)
+        if tag == "article" and node.has_class("message--post") and not any(item.tag in {"blockquote", "pre", "code"} for item in self.stack):
+            for index in range(len(self.stack) - 1, 0, -1):
+                if self.stack[index].tag == "article" and self.stack[index].has_class("message--post"):
+                    del self.stack[index:]
+                    break
+        node.parent = self.stack[-1]
         self.stack[-1].children.append(node)
         if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
             self.stack.append(node)
@@ -191,34 +198,32 @@ def parse_xforums_detail(url: str, html: str) -> dict:
     root = _document(html, "thread_view")
     if _pagination(root, url)[0] != 1:
         raise CollectionFailure("parse", "XForums detail must contain the original post, not a replies page")
-    posts = root.find_all("article", "message--post")
+    posts = [item for item in root.find_all("article", "message--post") if is_post_container(item)]
     post = next((item for item in posts if item.has_class("is-first") or item.attrs.get("data-position") == "0"), None)
     if post is None:
         raise CollectionFailure("parse", "XForums response does not contain the original post")
     message_body = post.first(cls="message-body") or post.first(cls="message-userContent")
     body = (message_body.first(cls="bbWrapper") or message_body) if message_body else None
-    content = _text(body)
-    if not content:
-        if body is not None and any(body.find_all(tag) for tag in ("img", "video", "audio")):
-            raise CollectionFailure("parse", "XForums original post contains media without readable text")
-        raise CollectionFailure("parse", "XForums original post has no visible text")
-    restricted = [
-        node for node in body.find_all()
-        if any(name.startswith(("bbCodeBlock--hide", "bbCodeBlock--hidden")) for name in (node.attrs.get("class") or "").split())
-    ]
-    visible = content
-    for node in restricted:
-        visible = visible.replace(_text(node), "")
-    if not visible.strip() or re.fullmatch(
-        r"you (?:must|need to|have to) (?:log in|login|register|reply|react).{0,200}",
-        visible.strip(), re.IGNORECASE,
-    ):
-        raise CollectionFailure("restricted", "XForums post content requires login or an interaction")
+    original = extract_body_content(body)
+    content = original["content"]
     title = _text(root.first("h1", "p-title-value")) or _text(root.first("title")).split(" | ", 1)[0]
-    attribution = post.first(cls="message-attribution")
-    timestamp_node = attribution.first("time") if attribution else post.first("time")
+
+    def metadata_node(tag="", cls="", scope=None):
+        scope = scope or post
+        for candidate in scope.find_all(tag, cls):
+            ancestor = candidate
+            while ancestor is not None and ancestor is not scope:
+                if ancestor is message_body or ancestor.tag == "blockquote":
+                    break
+                ancestor = getattr(ancestor, "parent", None)
+            if ancestor is scope:
+                return candidate
+        return None
+
+    attribution = metadata_node(cls="message-attribution")
+    timestamp_node = metadata_node("time", scope=attribution)
     timestamp = timestamp_node.attrs.get("datetime", "") if timestamp_node else ""
-    author = post.attrs.get("data-author") or _text(post.first(cls="message-name")) or "Unknown"
+    author = post.attrs.get("data-author") or _text(metadata_node(cls="message-name")) or "Unknown"
     attachments = list(dict.fromkeys(
         urljoin(url, link.attrs["href"]) for link in post.find_all("a")
         if re.match(r"/attachments/", urlsplit(urljoin(url, link.attrs.get("href") or "")).path)
@@ -229,7 +234,9 @@ def parse_xforums_detail(url: str, html: str) -> dict:
         "site_name": "xforums", "source_url": url, "domain": urlsplit(url).netloc,
         "title": title, "collected_at_utc": utc_now_iso(), "content": content,
         "author": author, "timestamp": timestamp, "published_at_utc": normalize_xforums_timestamp(timestamp),
-        "content_access": "partial" if restricted else "public",
+        "content_access": original["content_access"],
+        "content_quote_only": original["content_quote_only"],
+        "quote_attributions": original["quote_attributions"],
         "attachments": attachments,
         "victims": [{"name": victim, "industry": determine_industry(victim, f"{title} {content}"), "region": determine_region(victim)} for victim in victims],
         "attackers": extract_attackers_from_content(content),
