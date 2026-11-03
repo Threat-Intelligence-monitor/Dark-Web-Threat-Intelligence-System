@@ -45,6 +45,7 @@ from darkweb_collector.sites.cracked import normalize_cracked_timestamp
 from darkweb_collector.sites.darkforums import clean_extracted_attackers, normalize_darkforums_timestamp
 from darkweb_collector.sites.pwnfrm import normalize_pwnfrm_timestamp
 from darkweb_collector.sites.spear import normalize_spear_timestamp
+from darkweb_collector.sites.leakforum import normalize_leakforum_timestamp
 from darkweb_collector.sites.xforums import normalize_xforums_timestamp
 from darkweb_collector.utils import safe_stem
 from darkweb_collector.vulnerability_i18n import (
@@ -82,6 +83,7 @@ SOURCE_LABELS = {
     "pwnfrm": "PwnedForums",
     "raidforums": "RaidForums",
     "spear": "Spear",
+    "leakforum": "LeakForum",
     "xforums": "XForums（xforums.st）",
     "baidu_wenku": "百度文库",
     "docin": "豆丁",
@@ -428,6 +430,8 @@ SOURCE_HOSTNAME_KEYWORDS = {
     "pwnfrm",
     "raidforums",
     "spear.cx",
+    "leakforum.io",
+    "leakforum.st",
     "xforums",
     "blogspot",
     "wordpress",
@@ -442,6 +446,7 @@ _FORUM_TIMESTAMP_NORMALIZERS = {
     "pwnfrm": normalize_pwnfrm_timestamp,
     "raidforums": normalize_pwnfrm_timestamp,
     "spear": normalize_spear_timestamp,
+    "leakforum": normalize_leakforum_timestamp,
     "xforums": normalize_xforums_timestamp,
 }
 
@@ -1791,7 +1796,9 @@ def _infer_region(*texts: str) -> str:
 
 def _classify_forum_leak_type(section: str, title: str, content: str) -> str:
     text = f"{title} {content}".lower()
-    if section == "stealer_logs" or any(keyword in text for keyword in ("password", "credential", "combo", "combolist", "fullz", "account")):
+    if section == "source_codes":
+        return "源代码泄露"
+    if section in {"stealer_logs", "cloud_logs"} or any(keyword in text for keyword in ("password", "credential", "combo", "combolist", "fullz", "account")):
         return "凭证泄露"
     if any(keyword in text for keyword in ("source code", "repo", "repository", "git", "github")):
         return "源代码泄露"

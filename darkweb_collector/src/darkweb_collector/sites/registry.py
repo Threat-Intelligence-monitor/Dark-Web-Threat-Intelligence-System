@@ -11,6 +11,7 @@ from darkweb_collector.sites.cracked import parse_cracked_detail, parse_cracked_
 from darkweb_collector.sites.pwnfrm import parse_pwnfrm_detail, parse_pwnfrm_list
 from darkweb_collector.sites.raidforums import parse_raidforums_detail, parse_raidforums_list
 from darkweb_collector.sites.spear import parse_spear_detail, parse_spear_list
+from darkweb_collector.sites.leakforum import parse_leakforum_detail, parse_leakforum_list
 from darkweb_collector.sites.xforums import parse_xforums_detail, parse_xforums_list
 
 
@@ -34,6 +35,8 @@ PARSERS: dict[str, Parser] = {
     "raidforums_detail": parse_raidforums_detail,
     "spear_list": parse_spear_list,
     "spear_detail": parse_spear_detail,
+    "leakforum_list": parse_leakforum_list,
+    "leakforum_detail": parse_leakforum_detail,
     "xforums_list": parse_xforums_list,
     "xforums_detail": parse_xforums_detail,
 }

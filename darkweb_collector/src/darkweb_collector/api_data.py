@@ -70,6 +70,8 @@ from darkweb_collector.worker_supervisor import queue_health_errors
 SECTION_LABELS = {
     "databases": "数据库板块",
     "stealer_logs": "窃密日志板块",
+    "cloud_logs": "云日志板块",
+    "source_codes": "源码板块",
     "other_leaks": "其他泄露板块",
     "leaked_tools": "泄露工具板块",
     "sellers_place": "卖家交易板块",
