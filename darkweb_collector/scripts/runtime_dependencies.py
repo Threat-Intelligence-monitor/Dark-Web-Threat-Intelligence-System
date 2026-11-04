@@ -1,4 +1,4 @@
-"""Local dependency fingerprints and read-only Node installation validation."""
+"""Local dependency fingerprints and read-only runtime validation."""
 from __future__ import annotations
 
 import argparse
@@ -58,6 +58,41 @@ def python_profile(requirements: Path) -> dict[str, str]:
         "packages": _hash(sorted(packages)),
         "key": hashlib.sha256((identity + "\n" + requirement_hash).encode("utf-8")).hexdigest(),
     }
+
+
+class _CollectorDependencyError(ValueError):
+    pass
+
+
+def verify_collector(requirements: Path) -> None:
+    from importlib import import_module
+
+    try:
+        from packaging.requirements import Requirement
+    except ImportError:
+        raise _CollectorDependencyError("Collector dependency unavailable: packaging") from None
+    for line in _text(requirements).splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        requirement = Requirement(line)
+        if requirement.marker is not None and not requirement.marker.evaluate():
+            continue
+        try:
+            installed = metadata.version(requirement.name)
+        except metadata.PackageNotFoundError:
+            raise _CollectorDependencyError(f"Collector dependency unavailable: {requirement.name}") from None
+        if not requirement.specifier.contains(installed):
+            raise _CollectorDependencyError(f"Collector dependency version mismatch: {requirement.name}")
+    # These transport/backend imports are lazy in Celery's top-level package.
+    # Loading them does not open a broker connection or publish a task.
+    for name in ("celery", "redis", "playwright", "fastapi", "uvicorn", "pycountry", "babel",
+                 "psutil", "psycopg2", "jwt", "wecom_aibot_sdk", "kombu.transport.redis", "celery.backends.redis"):
+        try:
+            import_module(name)
+        except Exception as exc:
+            missing = getattr(exc, "name", "")
+            detail = f"; missing module: {missing}" if isinstance(missing, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", missing) else ""
+            raise _CollectorDependencyError(f"Collector module could not be loaded: {name}{detail}") from None
 
 
 def _no_link(path: Path) -> os.stat_result:
@@ -234,6 +269,7 @@ def main() -> int:
         parser = _Parser(description=__doc__)
         commands = parser.add_subparsers(dest="command", required=True)
         commands.add_parser("python-profile").add_argument("--requirements", required=True, type=Path)
+        commands.add_parser("verify-collector").add_argument("--requirements", required=True, type=Path)
         for name in ("node-profile", "check-node", "check-node-paths"):
             commands.add_parser(name).add_argument("--dashboard", required=True, type=Path)
         dashboard = commands.add_parser("dashboard-profile")
@@ -242,6 +278,9 @@ def main() -> int:
         args = parser.parse_args()
         if args.command == "python-profile":
             result = python_profile(args.requirements)
+        elif args.command == "verify-collector":
+            verify_collector(args.requirements)
+            return 0
         elif args.command == "node-profile":
             result = node_profile(args.dashboard)
         elif args.command == "dashboard-profile":
@@ -254,6 +293,9 @@ def main() -> int:
             return 0
         print(json.dumps(result, sort_keys=True))
         return 0
+    except _CollectorDependencyError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except Exception:
         print("Runtime dependency validation failed.", file=sys.stderr)
         return 1

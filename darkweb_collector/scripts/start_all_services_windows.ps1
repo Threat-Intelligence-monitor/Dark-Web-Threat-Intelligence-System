@@ -1685,11 +1685,11 @@ function Wait-ForDarkwebApi {
     return $false
 }
 
-function Wait-ForDarkwebFrontend {
+function Wait-ForDarkwebStack {
     param([int]$TimeoutSeconds)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        if (Test-DarkwebFrontendReady) {
+        if (Test-DarkwebStackReady) {
             return $true
         }
         Start-Sleep -Seconds 1
@@ -1819,9 +1819,62 @@ function Test-ManagedServicesRunning {
     return $true
 }
 
+function Test-CollectorWorkersReady {
+    $script:CollectorReadinessError = 'Collector child health could not be verified; check worker logs.'
+    $code = @"
+import json
+from pathlib import Path
+import sys
+import time
+import psutil
+
+root = Path(sys.argv[1])
+names = ['worker-seed', 'worker-detail']
+names += [f'worker-browser-public-{i}' for i in range(1, int(sys.argv[2]) + 1)]
+names += [f'worker-browser-onion-{i}' for i in range(1, int(sys.argv[3]) + 1)]
+records = json.loads((root / 'services.json').read_text(encoding='utf-8-sig'))
+owners = {row['name']: int(row['pid']) for row in records}
+for name in names:
+    try:
+        state = json.loads((root / 'worker-health' / (name + '.json')).read_text(encoding='utf-8-sig'))
+        if state['status'] != 'running' or not -5 <= time.time() - float(state['updated_at']) <= 60:
+            raise ValueError('worker is not ready')
+        processes = []
+        for role in ('supervisor', 'worker'):
+            pid = int(state[role + '_pid'])
+            if pid <= 0:
+                raise ValueError('worker process is absent')
+            process = psutil.Process(pid)
+            if not process.is_running() or not abs(process.create_time() - float(state[role + '_started'])) <= 0.001:
+                raise ValueError('worker process identity changed')
+            processes.append(process)
+        supervisor, worker = processes
+        if owners[name] not in {parent.pid for parent in supervisor.parents()} or supervisor.pid not in {parent.pid for parent in worker.parents()}:
+            raise ValueError('worker process ownership changed')
+    except (OSError, ValueError, TypeError, KeyError, psutil.Error):
+        print(f'{name}: collector child is not ready; check {name}.log', file=sys.stderr)
+        raise SystemExit(1)
+"@
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $diagnostic = & $VenvPython -B -c $code $RuntimeDir $BrowserPublicConcurrency $BrowserOnionConcurrency 2>&1
+        if ($LASTEXITCODE -eq 0) { $script:CollectorReadinessError = ''; return $true }
+        $reason = @($diagnostic | Where-Object { $_.ToString() -match '^worker-[a-z0-9-]+: collector child is not ready;' } | Select-Object -Last 1)
+        if ($reason.Count) { $script:CollectorReadinessError = $reason[0].ToString() }
+    }
+    catch { }
+    finally { $ErrorActionPreference = $previousErrorAction }
+    return $false
+}
+
 function Test-DarkwebStackReady {
+    $script:CollectorReadinessError = ''
     Load-RuntimePorts
     if (-not (Test-ManagedServicesRunning)) {
+        return $false
+    }
+    if (-not (Test-CollectorWorkersReady)) {
         return $false
     }
     if (-not (Test-RedisReady)) {
@@ -2931,32 +2984,29 @@ function Ensure-CollectorVenv {
 
 function Test-CollectorDependencies {
     param([string]$Python = $VenvPython)
+    $script:CollectorDependencyError = 'Collector dependency validation failed.'
+    $previousErrorAction = $ErrorActionPreference
     try {
-        $code = @"
-from importlib.metadata import version
-from pathlib import Path
-import sys
-from pip._vendor.packaging.requirements import Requirement
-import celery, redis, playwright, fastapi, uvicorn, pycountry, babel, psutil, psycopg2, jwt, wecom_aibot_sdk
-for line in Path(sys.argv[1]).read_text(encoding='utf-8-sig').splitlines():
-    if not line.strip() or line.lstrip().startswith('#'):
-        continue
-    requirement = Requirement(line)
-    if requirement.marker is None or requirement.marker.evaluate():
-        if not requirement.specifier.contains(version(requirement.name)):
-            raise SystemExit(1)
-"@
-        & $Python -B -c $code (Join-Path $CollectorRoot "requirements.txt") *> $null
-        if ($LASTEXITCODE -ne 0) { return $false }
+        $ErrorActionPreference = 'Continue'
+        $diagnostic = & $Python -B $DependencyHelper verify-collector --requirements (Join-Path $CollectorRoot "requirements.txt") 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $reason = @($diagnostic | Where-Object { $_.ToString() -match '^Collector (dependency|module) ' } | Select-Object -Last 1)
+            if ($reason.Count) { $script:CollectorDependencyError = $reason[0].ToString() }
+            return $false
+        }
+        $script:CollectorDependencyError = 'Collector package metadata is inconsistent; run pip check with the configured Python runtime.'
         & $Python -B -m pip check *> $null
-        return ($LASTEXITCODE -eq 0)
+        if ($LASTEXITCODE -eq 0) { $script:CollectorDependencyError = ''; return $true }
+        return $false
     }
     catch {
         return $false
     }
+    finally { $ErrorActionPreference = $previousErrorAction }
 }
 
 function Ensure-CollectorDependencies {
+    $script:CollectorDependencyError = 'Collector dependency validation failed.'
     $saved = Read-PythonEnvironmentProfile $PythonEnvironmentState
     $actual = Get-PythonDependencyProfile $VenvPython
     if ($saved -and $actual -and $actual.key -eq $saved.key -and $actual.packages -eq $saved.packages -and
@@ -2964,14 +3014,14 @@ function Ensure-CollectorDependencies {
         return
     }
     if (-not $NewCollectorEnvironment -or -not (Test-PathUnderRoot $VenvDir $PythonEnvironmentsRoot)) {
-        Stop-WithError "An existing Python environment failed verification; preserving it without modification."
+        Stop-WithError "An existing Python environment failed verification; preserving it without modification. $script:CollectorDependencyError"
     }
     Write-Info "Installing collector Python dependencies"
     & $VenvPython -m pip install -r (Join-Path $CollectorRoot "requirements.txt")
     if ($LASTEXITCODE -ne 0) {
         Stop-WithError "Failed to install Python requirements."
     }
-    if (-not (Test-CollectorDependencies)) { Stop-WithError "Prepared Python dependencies failed validation." }
+    if (-not (Test-CollectorDependencies)) { Stop-WithError "Prepared Python dependencies failed validation. $script:CollectorDependencyError" }
     Save-PythonEnvironmentProfile
     $script:NewCollectorEnvironment = $false
 }
@@ -3450,7 +3500,7 @@ function Prepare-UpdateEnvironment {
 function Assert-DarkwebHealth {
     Load-RuntimePorts
     if (-not (Test-DarkwebStackReady)) {
-        Stop-WithError "Darkweb services did not pass the strict health check."
+        Stop-WithError "Darkweb services did not pass the strict health check. $script:CollectorReadinessError"
     }
     Write-Info "Darkweb services passed the strict health check"
 }
@@ -3521,8 +3571,8 @@ function Start-Services {
 
     Save-ServiceRecords $records
 
-    if (-not (Wait-ForDarkwebFrontend -TimeoutSeconds $ServiceWaitSeconds)) {
-        Write-Warn "Darkweb frontend did not become ready within ${ServiceWaitSeconds}s"
+    if (-not (Wait-ForDarkwebStack -TimeoutSeconds $ServiceWaitSeconds)) {
+        Stop-WithError "Darkweb services did not become ready within ${ServiceWaitSeconds}s. $script:CollectorReadinessError Check $LogDir."
     }
 
     Write-Info "Services started"
