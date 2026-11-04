@@ -43,6 +43,25 @@ jobs:
         shell: pwsh
         run: python -m compileall -q darkweb_collector/src darkweb_collector/scripts scripts/build_update_package.py
 
+      - name: Set up collector validation Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Validate a fresh collector environment and Redis driver
+        shell: pwsh
+        run: |
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "collector-runtime"
+          python -m venv $runtimeRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $runtimePython = Join-Path $runtimeRoot "Scripts/python.exe"
+          & $runtimePython -m pip install -r darkweb_collector/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $runtimePython -B darkweb_collector/scripts/runtime_dependencies.py verify-collector --requirements darkweb_collector/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $runtimePython -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Validate transition repair script
         shell: pwsh
         run: |
