@@ -5,7 +5,7 @@ import hashlib
 from urllib.parse import urlparse
 
 from darkweb_collector.adapters.base import SiteAdapter
-from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
+from darkweb_collector.adapters.forum_artifacts import FORUM_CAPTURE_CONTENT_SELECTOR, detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
 from darkweb_collector.browser_client import fetch_html_with_browser, fetch_page_artifacts_with_browser, screenshot_html_with_browser
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, safe_failure_text
@@ -155,6 +155,7 @@ class PwnfrmAdapter(SiteAdapter):
     ) -> DetailResult | None:
         restored = restore_detail_artifacts(
             detail_task, config, screenshot_selectors=("#thread-info", ".post.classic"),
+            capture_content_selector=FORUM_CAPTURE_CONTENT_SELECTOR,
             hide_selectors=("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
         )
         if restored is not None:
@@ -175,6 +176,7 @@ class PwnfrmAdapter(SiteAdapter):
             detail, parsed_html = parsed, html
             return True
         capture_options = {
+            "capture_content_selector": FORUM_CAPTURE_CONTENT_SELECTOR,
             "wait_seconds": config.render_wait_seconds, "timeout_seconds": config.fetch_timeout_seconds,
             "proxy_server": proxy_server, "screenshot_selectors": ("#thread-info", ".post.classic"),
             "hide_selectors": ("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),

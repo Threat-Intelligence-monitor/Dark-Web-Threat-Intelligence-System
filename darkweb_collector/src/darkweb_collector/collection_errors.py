@@ -12,14 +12,18 @@ from urllib.parse import urlsplit, urlunsplit
 class CollectionFailure(RuntimeError):
     """A collector outcome with a scheduling reason, never an inferred deletion."""
 
-    def __init__(self, kind: str, message: str, *, scope: str = "target", retry_after: float = 0):
+    def __init__(self, kind: str, message: str, *, scope: str = "target", retry_after: float = 0,
+                 verification_provider: str = ""):
         super().__init__(message)
         self.kind = kind
         self.scope = scope
         self.retry_after = max(0.0, float(retry_after))
+        self.verification_provider = verification_provider
 
     def __reduce__(self):
-        return CollectionFailure, (self.kind, str(self)), {"scope": self.scope, "retry_after": self.retry_after}
+        return CollectionFailure, (self.kind, str(self)), {
+            "scope": self.scope, "retry_after": self.retry_after, "verification_provider": self.verification_provider,
+        }
 
 
 _request_callback: ContextVar[Callable[[], None] | None] = ContextVar("collection_request", default=None)
@@ -205,7 +209,12 @@ def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> 
             raise CollectionFailure("source_moved", "source returned a migration notice; destination requires review", scope="site", retry_after=21600)
         if (re.search(r"\b(?:browser check|browser verification|checking your browser)\b", title)
                 and re.search(r"\b(?:browser check in progress|pending verification|verifying your browser|dnsproxy antibot)\b", service_text)):
-            raise CollectionFailure("blocked", "source returned a browser-verification page", scope="site", retry_after=900)
+            provider = "dnsproxy" if (
+                not has_content and " ".join(unescape(title).split()) == "one more step - browser check"
+                and re.search(r"\bdnsproxy\s+antibot\b", service_text)
+            ) else ""
+            raise CollectionFailure("blocked", "source returned a browser-verification page", scope="site",
+                                    retry_after=900, verification_provider=provider)
     if not has_content and title == "ddos-guard" and "checking your browser" in service_text:
         raise CollectionFailure("blocked", "source returned a DDoS-Guard browser-verification page", scope="site")
     if template.primary_challenge or (not has_content and (template.challenge or title in {
@@ -293,6 +302,7 @@ def failure_details(error: Exception) -> dict:
     return {
         "error_type": type(error).__name__, "kind": failure.kind, "scope": failure.scope,
         "retry_after": failure.retry_after, "error_message": safe_failure_text(str(failure)),
+        "verification_provider": failure.verification_provider,
     }
 
 
@@ -316,6 +326,8 @@ def summarize_failures(message: str, failures: list[tuple[str, Exception]]) -> C
     ordered = [selected] + [item for item in details if item is not selected]
     reasons = "; ".join(f"{context}: {item['kind']}: {item['error_message']}" for context, item in ordered[:8])
     summary = f"{safe_failure_text(message)}; {reasons}".encode("utf-8")[:3600].decode("utf-8", errors="ignore")
-    failure = CollectionFailure(primary["kind"], summary, scope=primary["scope"], retry_after=primary["retry_after"])
-    failure.__cause__ = CollectionFailure(primary["kind"], primary["error_message"], scope=primary["scope"], retry_after=primary["retry_after"])
+    failure = CollectionFailure(primary["kind"], summary, scope=primary["scope"], retry_after=primary["retry_after"],
+                                verification_provider=primary["verification_provider"])
+    failure.__cause__ = CollectionFailure(primary["kind"], primary["error_message"], scope=primary["scope"],
+                                          retry_after=primary["retry_after"], verification_provider=primary["verification_provider"])
     return failure

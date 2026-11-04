@@ -5,7 +5,7 @@ import hashlib
 from urllib.parse import urlparse
 
 from darkweb_collector.adapters.base import SiteAdapter
-from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
+from darkweb_collector.adapters.forum_artifacts import FORUM_CAPTURE_CONTENT_SELECTOR, detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
 from darkweb_collector.browser_client import fetch_html_with_browser, fetch_page_artifacts_with_browser, screenshot_html_with_browser
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, safe_failure_text, summarize_failures
@@ -46,6 +46,7 @@ class DarkforumsAdapter(SiteAdapter):
     list_parser = staticmethod(parse_darkforums_list)
     detail_parser = staticmethod(parse_darkforums_detail)
     detail_screenshot_selectors = ("#thread-info", ".post.classic")
+    detail_capture_content_selector = FORUM_CAPTURE_CONTENT_SELECTOR
     terminal_failure_kinds = frozenset({"retry_budget", "unavailable", "rate_limited", "restricted"})
 
     @staticmethod
@@ -180,6 +181,7 @@ class DarkforumsAdapter(SiteAdapter):
     def collect_detail(self, detail_task: DetailTask, config: SiteConfig, run_ctx: RunContext) -> DetailResult | None:
         restored = restore_detail_artifacts(
             detail_task, config, screenshot_selectors=self.detail_screenshot_selectors,
+            capture_content_selector=self.detail_capture_content_selector,
             hide_selectors=("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
         )
         if restored is not None:
@@ -213,6 +215,7 @@ class DarkforumsAdapter(SiteAdapter):
                 if route == "browser":
                     html, screenshot_png = fetch_page_artifacts_with_browser(
                         url, screenshot_selectors=self.detail_screenshot_selectors,
+                        capture_content_selector=self.detail_capture_content_selector,
                         hide_selectors=hide_selectors, validate_html=validate,
                         **self._browser_options(config, url),
                     )
@@ -242,6 +245,7 @@ class DarkforumsAdapter(SiteAdapter):
                             cookie_header=session_options["cookie_header"],
                             user_agent=http_options["user_agent"],
                             screenshot_selectors=self.detail_screenshot_selectors,
+                            capture_content_selector=self.detail_capture_content_selector,
                             hide_selectors=hide_selectors,
                         )
                     except Exception as exc:

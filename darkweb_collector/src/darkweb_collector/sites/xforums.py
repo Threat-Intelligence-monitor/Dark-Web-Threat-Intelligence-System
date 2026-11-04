@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 from darkweb_collector.normalize import content_hash
-from darkweb_collector.sites.forum_post_content import extract_body_content, is_post_container
+from darkweb_collector.sites.forum_post_content import extract_body_content, is_current_pagination, is_post_container, pagination_label
 from darkweb_collector.sites.darkforums import (
     determine_industry,
     determine_region,
@@ -120,13 +120,15 @@ def xforums_section(url: str) -> str:
 
 
 def _page_number(url: str) -> int:
-    match = re.search(r"/page-(\d+)/?$", urlsplit(url).path)
-    return int(match.group(1)) if match else 1
+    parsed = urlsplit(url)
+    match = re.search(r"/page-(\d+)/?$", parsed.path)
+    pages = [int(value) for key, value in parse_qsl(parsed.query) if key.lower() == "page" and value.isdigit()]
+    return max([int(match.group(1)) if match else 1, *pages])
 
 
 def _pagination(root: _Node, url: str) -> tuple[int, bool]:
-    current_nodes = root.find_all(cls="pageNav-page--current")
-    current_values = {_text(node) for node in current_nodes}
+    current_nodes = [node for node in root.find_all(cls="pageNav-page--current") if is_current_pagination(node, url)]
+    current_values = {pagination_label(node) for node in current_nodes}
     page = _page_number(url)
     if current_values and current_values != {str(page)}:
         raise ValueError("XForums pagination did not advance to the requested page")
@@ -135,6 +137,8 @@ def _pagination(root: _Node, url: str) -> tuple[int, bool]:
     base = xforums_page_url(url, 1)
     has_more = False
     for nav in root.find_all(cls="pageNav"):
+        if not is_current_pagination(nav, url):
+            continue
         for link in nav.find_all("a"):
             target = urljoin(url, link.attrs.get("href") or "")
             if xforums_page_url(target, 1) == base and _page_number(target) > page:

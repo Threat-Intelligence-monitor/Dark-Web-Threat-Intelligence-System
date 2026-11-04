@@ -7,7 +7,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from darkweb_collector.adapters.base import SiteAdapter
-from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
+from darkweb_collector.adapters.forum_artifacts import FORUM_CAPTURE_CONTENT_SELECTOR, detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
 from darkweb_collector.browser_client import (
     fetch_html_with_browser,
@@ -96,6 +96,7 @@ class CrackedAdapter(SiteAdapter):
                     screenshot = screenshot_html_with_browser(
                         html,
                         url,
+                        capture_content_selector=FORUM_CAPTURE_CONTENT_SELECTOR,
                         wait_seconds=config.render_wait_seconds,
                         timeout_seconds=config.fetch_timeout_seconds,
                         browser_engine=browser_engine,
@@ -127,6 +128,7 @@ class CrackedAdapter(SiteAdapter):
                 )
             html, screenshot = fetch_page_artifacts_with_browser(
                 url,
+                capture_content_selector=FORUM_CAPTURE_CONTENT_SELECTOR,
                 wait_seconds=config.render_wait_seconds,
                 timeout_seconds=config.fetch_timeout_seconds,
                 proxy_server=browser_proxy,
@@ -254,6 +256,7 @@ class CrackedAdapter(SiteAdapter):
     ) -> DetailResult | None:
         restored = restore_detail_artifacts(
             detail_task, config, screenshot_selectors=("#posts", ".post_body"),
+            capture_content_selector=FORUM_CAPTURE_CONTENT_SELECTOR,
             hide_selectors=("header", "#panel", "#quick-search", ".footer", "footer", ".signature"),
         )
         if restored is not None:

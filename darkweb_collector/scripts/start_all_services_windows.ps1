@@ -2980,17 +2980,32 @@ function Test-PlaywrightBrowsers {
     param([switch]$FilesOnly)
     try {
         $code = @"
+from importlib.metadata import version
 from pathlib import Path
 import sys
+from pip._vendor.packaging.version import Version
 from playwright.sync_api import sync_playwright
 
+if Version(version('playwright')) < Version('1.49'):
+    raise SystemExit(1)
+
 with sync_playwright() as playwright:
-    for browser_type in (playwright.chromium, playwright.firefox):
+    modes = ((playwright.chromium, {}),
+             (playwright.chromium, {'channel': 'chromium'}),
+             (playwright.firefox, {}))
+    for browser_type, launch_options in modes:
         if not Path(browser_type.executable_path).exists():
             raise SystemExit(1)
         if sys.argv[1] != 'files':
-            browser = browser_type.launch(headless=True)
-            browser.close()
+            browser = browser_type.launch(headless=True, **launch_options)
+            try:
+                page = browser.new_page()
+                page.set_content('<title>DWTI runtime check</title><p>ready</p>',
+                                 wait_until='domcontentloaded', timeout=5000)
+                if page.title() != 'DWTI runtime check':
+                    raise SystemExit(1)
+            finally:
+                browser.close()
 "@
         & $VenvPython -B -c $code $(if ($FilesOnly) { "files" } else { "launch" }) *> $null
         return ($LASTEXITCODE -eq 0)
