@@ -390,7 +390,8 @@ def fail_frontier(connection, site_name, target_url, lease_token, *, retry_secon
     cursor = connection.execute(
         """
         UPDATE crawl_frontier SET status = 'pending', lease_token = '', lease_until = 0,
-            claimed_version = '', next_retry = ?, last_error = ?, updated_at = ?
+            next_retry = CASE WHEN observed_version <> claimed_version THEN 0 ELSE ? END,
+            claimed_version = '', last_error = ?, updated_at = ?
         WHERE site_name = ? AND target_url = ? AND lease_token = ?
             AND status IN ('queued', 'running')
         """,

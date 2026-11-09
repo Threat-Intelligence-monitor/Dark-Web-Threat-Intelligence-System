@@ -213,10 +213,24 @@ def fail_detail(connection, site_name: str, target_url: str, token: str, error: 
         (site_name, target_url, token)).fetchone()
     if row is None:
         return 0.0
+    artifact_interruption = False
+    if row[1] == "artifact" and failure.scope == "target" and failure.kind in {"timeout", "worker_lost"}:
+        artifact_interruption = connection.execute("""SELECT 1 FROM crawl_frontier f
+            JOIN crawl_detail_control c ON c.site_name = f.site_name AND c.target_url = f.target_url
+            WHERE f.site_name = ? AND f.target_url = ? AND c.owner_token = ?
+                AND f.fetched_version <> '' AND f.fetched_version = c.source_version""",
+            (site_name, target_url, token)).fetchone() is not None
     count = int(row[0]) + 1
-    if failure.kind == "not_found":
+    if row[1] == "artifact" and failure.kind != "artifact" and not artifact_interruption:
+        count = 1
+    if artifact_interruption:
+        delay = (3600, 21600, 86400)[min(count, 3) - 1]
+    elif failure.kind == "not_found":
         count = count if row[1] == "not_found" else 1
         delay = (3600, 21600, 86400)[min(count, 3) - 1]
+    elif failure.kind == "empty_content":
+        count = count if row[1] == "empty_content" else 1
+        delay = (900, 3600, 21600)[min(count, 3) - 1]
     elif failure.kind in {"unavailable", "restricted"}:
         delay = 86400
     elif failure.kind in {"auth_required", "blocked", "rate_limited"}:
@@ -232,7 +246,8 @@ def fail_detail(connection, site_name: str, target_url: str, token: str, error: 
     connection.execute("""UPDATE crawl_detail_control SET failure_count = ?, failure_kind = ?,
         next_retry = ?, last_error = ?, owner_token = '', owner_until = 0, worker_pid = 0, worker_started = 0,
         updated_at = ? WHERE site_name = ? AND target_url = ? AND owner_token = ?""",
-        (count, failure.kind, retry_at, str(failure)[:500], timestamp, site_name, target_url, token))
+        (count, "artifact" if artifact_interruption else failure.kind, retry_at,
+         str(failure)[:500], timestamp, site_name, target_url, token))
     if failure.scope == "site":
         observed = getattr(failure, "_forum_backoff", None)
         site_delay = max(0, float(observed[1]) - timestamp) if observed and observed[0] == site_name else delay
@@ -283,17 +298,26 @@ def complete_detail(connection, site_name, target_url, token, counts, body_hash,
     if not owns_detail(connection, site_name, target_url, token):
         return False
     timestamp = time.time() if now is None else float(now)
+    body_hash = str(body_hash or "")
+    failure_count, retry_at = 0, 0
+    if artifacts_pending:
+        previous = connection.execute("""SELECT failure_count, failure_kind, body_hash FROM crawl_detail_control
+            WHERE site_name = ? AND target_url = ? AND owner_token = ?""", (site_name, target_url, token)).fetchone()
+        if previous is None:
+            return False
+        failure_count = int(previous[0]) + 1 if previous[1] == "artifact" and previous[2] == body_hash else 1
+        retry_at = timestamp + (3600, 21600, 86400)[min(failure_count, 3) - 1]
     outcome = "partial" if artifacts_pending else "succeeded"
     connection.execute("""INSERT INTO crawl_detail_results
         (job_id, site_name, target_url, outcome, new_count, updated_count, unchanged_count, finished_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO NOTHING""",
         (token, site_name, target_url, outcome, counts["new_count"], counts["updated_count"],
          counts["unchanged_count"], timestamp))
-    connection.execute("""UPDATE crawl_detail_control SET failure_count = 0, failure_kind = '', last_error = '',
+    connection.execute("""UPDATE crawl_detail_control SET failure_count = ?, failure_kind = ?, last_error = '',
         next_retry = ?, request_count = 0, budget_until = 0, owner_token = '', owner_until = 0,
         worker_pid = 0, worker_started = 0, body_hash = ?, updated_at = ?
         WHERE site_name = ? AND target_url = ? AND owner_token = ?""",
-        (timestamp + 3600 if artifacts_pending else 0, str(body_hash or ""), timestamp, site_name, target_url, token))
+        (failure_count, "artifact" if artifacts_pending else "", retry_at, body_hash, timestamp, site_name, target_url, token))
     connection.execute("DELETE FROM crawl_detail_site_control WHERE site_name = ?", (site_name,))
     return True
 

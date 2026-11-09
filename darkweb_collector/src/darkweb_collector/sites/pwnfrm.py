@@ -360,6 +360,8 @@ def parse_pwnfrm_detail(
         original["post_html"], re.IGNORECASE,
     )
     attachments = [urljoin(url, match) for match in attachment_matches]
+    media_links = original.get("media_links", [])
+    attachments.extend(link for link in media_links if link not in attachments)
 
     elapsed = time.time() - start_time
     _debug_log(f"[{time.strftime('%H:%M:%S')}] [{site_name}] detail parse done in {elapsed:.2f}s")
@@ -375,13 +377,14 @@ def parse_pwnfrm_detail(
         "content_access": original["content_access"],
         "content_quote_only": original["content_quote_only"],
         "quote_attributions": original["quote_attributions"],
+        **({"media_links": media_links} if media_links else {}),
         "author": author,
         "timestamp": timestamp,
         "published_at_utc": normalize_pwnfrm_timestamp(timestamp, collected_at_utc=collected_at_utc),
         "attachments": attachments,
         "victims": victim_info,
         "attackers": attackers,
-        "content_hash": content_hash(content[:1000], author),
+        "content_hash": content_hash(content[:1000], author, *media_links),
     }
 
 

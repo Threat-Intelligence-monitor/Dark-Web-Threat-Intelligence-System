@@ -340,6 +340,8 @@ def parse_cracked_detail(url: str, html: str) -> dict:
         re.IGNORECASE,
     )
     attachments = [urljoin(url, match) for match in attachment_matches]
+    media_links = original.get("media_links", [])
+    attachments.extend(link for link in media_links if link not in attachments)
 
     elapsed = time.time() - start_time
     _safe_print(f"[{time.strftime('%H:%M:%S')}] [cracked] detail parse done in {elapsed:.2f}s")
@@ -355,13 +357,14 @@ def parse_cracked_detail(url: str, html: str) -> dict:
         "content_access": original["content_access"],
         "content_quote_only": original["content_quote_only"],
         "quote_attributions": original["quote_attributions"],
+        **({"media_links": media_links} if media_links else {}),
         "author": author,
         "timestamp": timestamp,
         "published_at_utc": normalize_cracked_timestamp(timestamp, collected_at_utc=collected_at_utc),
         "attachments": attachments,
         "victims": victim_info,
         "attackers": attackers,
-        "content_hash": content_hash(content[:1000], author),
+        "content_hash": content_hash(content[:1000], author, *media_links),
     }
 
 
