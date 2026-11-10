@@ -166,7 +166,7 @@ def _read_raw(connection, source_type, source_id):
                 AND t.section = d.section AND t.url = d.topic_url
             LEFT JOIN forum_victims fv ON fv.forum_detail_id = d.id WHERE d.id = ? GROUP BY d.id, t.title"""
     elif source_type == "victims":
-        statement = """SELECT v.*, vd.text_excerpt, vd.page_title, vd.fetched_at_utc,
+        statement = """SELECT v.*, vd.text_excerpt, vd.page_title, vd.outbound_link_count, vd.fetched_at_utc,
             cr.collected_at_utc AS last_seen_at_utc, vd.raw_json AS detail_raw_json
             FROM victims v LEFT JOIN collection_runs cr ON cr.id = v.last_seen_run_id
             LEFT JOIN victim_details vd ON vd.id = (SELECT vd2.id FROM victim_details vd2
@@ -462,6 +462,9 @@ def _merge_work(connection, kind, limit, max_bytes, domain_cache, publish):
 
 
 def _serialize(event, previous, updated_at):
+    # A collector snapshot owns its body and evidence together. Older cached
+    # resources must not turn a new partial capture into an apparently complete one.
+    previous = {} if event.get("_artifact_snapshot") else (previous or {})
     mirrors = n._merge_unique_resources(n._coerce_resource_list(n._parse_json((previous or {}).get("mirror_resources_json"))), event.get("mirror_resources") or [])
     screenshots = n._merge_unique_resources(n._coerce_resource_list(n._parse_json((previous or {}).get("screenshot_resources_json"))), event.get("screenshot_resources") or [])
     metadata = {**event["metadata"], "country": event.get("country") or "未知", "country_code": event.get("country_code") or "",
@@ -688,6 +691,8 @@ def refresh_incremental_intelligence(connection, max_rows=50, max_bytes=8 * 1024
             pending += int(connection.execute("SELECT COUNT(*) AS total FROM " + table).fetchone()["total"])
         bootstrap_pending = int(not complete) + int(_state(connection, "catalog_complete") != "1") + int(_state(connection, "cleanup_complete") != "1") + int(_state(connection, "search_complete") != "1")
         result.update(pending=pending + bootstrap_pending, bootstrap_pending=bootstrap_pending)
+        from darkweb_collector.detail_artifacts import legacy_artifact_view_active
+        _set_state(connection, "artifact_view_mode", "legacy" if legacy_artifact_view_active() else "versioned")
     except Exception:
         connection.execute("ROLLBACK TO SAVEPOINT intelligence_projection_batch")
         connection.execute("RELEASE SAVEPOINT intelligence_projection_batch")

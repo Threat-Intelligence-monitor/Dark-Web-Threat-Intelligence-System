@@ -46,7 +46,7 @@ def _check_cooldown(connection, site_name: str) -> None:
 
 def before_source_request() -> None:
     site_name = _source.get()
-    if site_name not in GUARDED_SITES:
+    if not site_name:
         return
     from darkweb_collector.db import get_db_connection
 
@@ -54,6 +54,8 @@ def before_source_request() -> None:
         with get_db_connection() as connection:
             # Recheck after each wait: another task may have received 429.
             _check_cooldown(connection, site_name)
+            if site_name not in GUARDED_SITES:
+                return
             timestamp = time.time()
             request_at = reserve_source_request(connection, site_name, now=timestamp)
             connection.commit()
@@ -66,7 +68,8 @@ def before_source_request() -> None:
 
 def note_source_failure(site_name: str, error: Exception, *, now: float | None = None) -> float:
     failure = classify_failure(error)
-    if site_name not in GUARDED_SITES or failure.kind not in NETWORK_FAILURES:
+    if (failure.kind not in NETWORK_FAILURES
+            or (site_name not in GUARDED_SITES and failure.kind != "rate_limited")):
         return 0.0
     from darkweb_collector.db import get_db_connection
     from darkweb_collector.detail_lifecycle import pause_site, site_retry_at
@@ -84,16 +87,20 @@ def note_source_failure(site_name: str, error: Exception, *, now: float | None =
     return retry_at
 
 
+def note_current_source_failure(error: Exception) -> float:
+    """Remember a response even when an adapter keeps its already validated body."""
+    site_name = _source.get()
+    return note_source_failure(site_name, error) if site_name else 0.0
+
+
 @contextmanager
 def source_request_scope(site_name: str):
-    if site_name not in GUARDED_SITES:
-        yield
-        return
     token = _source.set(site_name)
     try:
         yield
     except CollectionFailure as failure:
-        if failure.kind not in NETWORK_FAILURES:
+        if (failure.kind not in NETWORK_FAILURES
+                or (site_name not in GUARDED_SITES and failure.kind != "rate_limited")):
             raise
         failure.scope = "site"
         note_source_failure(site_name, failure)

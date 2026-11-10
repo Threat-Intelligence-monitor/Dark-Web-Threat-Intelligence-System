@@ -11,6 +11,7 @@ import time
 
 from darkweb_collector.crawl_frontier import ensure_frontier_schema
 from darkweb_collector.detail_lifecycle import record_detail_write, reconcile_detail_owners, worker_alive
+from darkweb_collector.detail_artifacts import forum_artifact_payload, victim_artifact_payload
 from darkweb_collector.postgres_backend import connect_postgres
 from darkweb_collector.search_schema import REPORT_TIME, SEARCH_ORDER, SEVERITY_RANK, ensure_search_indexes, event_report_time
 from darkweb_collector.search_index import (
@@ -964,14 +965,20 @@ def get_victim_snapshot(
 ) -> dict | None:
     cursor = connection.execute(
         """
-        SELECT id, content_hash, last_detail_fetch_status
-        FROM victims
-        WHERE site_name = ? AND source_url = ? AND name = ? AND ifnull(domain, '') = ifnull(?, '') AND status = ?
+        SELECT v.id, v.content_hash, v.last_detail_fetch_status, d.raw_json AS detail_raw_json,
+            d.page_title, d.text_excerpt, d.outbound_link_count
+        FROM victims v LEFT JOIN victim_details d ON d.id = (
+            SELECT latest.id FROM victim_details latest WHERE latest.victim_id = v.id ORDER BY latest.id DESC LIMIT 1)
+        WHERE v.site_name = ? AND v.source_url = ? AND v.name = ? AND ifnull(v.domain, '') = ifnull(?, '') AND v.status = ?
         """,
         (site_name, source_url, name, domain, status),
     )
     row = cursor.fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    snapshot = dict(row)
+    snapshot["artifact_payload"] = victim_artifact_payload(snapshot)
+    return snapshot
 
 
 def record_victim_detail(
@@ -1134,6 +1141,8 @@ def upsert_forum_detail(connection: sqlite3.Connection, **kwargs) -> int:
     }
     if kwargs.get("content_access") in {"public", "partial"}:
         payload["content_access"] = kwargs["content_access"]
+    if kwargs.get("artifact_refs") is not None:
+        payload["_collector_artifacts"] = kwargs["artifact_refs"]
     
     raw_json = json.dumps(payload, ensure_ascii=False)
     
@@ -1214,14 +1223,18 @@ def upsert_forum_detail(connection: sqlite3.Connection, **kwargs) -> int:
 def get_forum_detail_snapshot(connection: sqlite3.Connection, site_name: str, section: str, topic_url: str) -> dict | None:
     cursor = connection.execute(
         """
-        SELECT id, content_hash, fetched_at
+        SELECT id, content_hash, fetched_at, raw_json, content, attachments
         FROM forum_details
         WHERE site_name = ? AND section = ? AND topic_url = ?
         """,
         (site_name, section, topic_url),
     )
     row = cursor.fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    snapshot = dict(row)
+    snapshot["artifact_payload"] = forum_artifact_payload(snapshot)
+    return snapshot
 
 
 def upsert_crawl_job(connection: sqlite3.Connection, **kwargs) -> None:

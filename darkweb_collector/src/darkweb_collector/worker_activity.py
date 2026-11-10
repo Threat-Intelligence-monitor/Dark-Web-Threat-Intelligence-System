@@ -93,6 +93,31 @@ def activity_expired(payload: dict) -> bool:
             or time.time() >= payload["deadline_at"] + 300)
 
 
+def request_recovery() -> bool:
+    """Ask the supervisor to stop this owner before resolving an uncertain task."""
+    value = os.environ.get("DARKWEB_WORKER_ACTIVITY_FILE")
+    if not value:
+        return False
+    path = Path(value)
+    with _activity_lock(path):
+        payload = read_activity(path)
+        if (payload is None or payload["worker_pid"] != os.getpid()
+                or payload["worker_started"] != psutil.Process().create_time()):
+            return False
+        payload["recovery_required"] = True
+        temporary = path.with_suffix(f".{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                os.chmod(temporary, 0o600)
+                json.dump(payload, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return True
+
+
 @contextmanager
 def track_task(job_id: str, site_name: str, target_url: str, slot_owner: str, timeout_seconds: float):
     path_value = os.environ.get("DARKWEB_WORKER_ACTIVITY_FILE")

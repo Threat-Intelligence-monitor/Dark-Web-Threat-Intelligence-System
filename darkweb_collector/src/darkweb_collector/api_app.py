@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Literal
 from threading import Lock, Thread
+from urllib.parse import unquote
+from darkweb_collector.detail_artifacts import native_artifact_path
 
 from fastapi import FastAPI, Query
 from fastapi import HTTPException
@@ -245,7 +247,7 @@ _auth_lock = Lock()
 _auth_sessions: dict[str, dict[str, object]] = {}
 _api_auto_reload_enabled = os.environ.get("DARKWEB_API_AUTO_RELOAD") == "1"
 collector_output_dir = output_root()
-collector_output_dir.mkdir(parents=True, exist_ok=True)
+native_artifact_path(collector_output_dir).mkdir(parents=True, exist_ok=True)
 
 AUTH_EXEMPT_PATHS = {
     "/api/auth/login",
@@ -442,13 +444,17 @@ app.add_middleware(ApiGZipMiddleware, minimum_size=1024, compresslevel=5)
 
 app.mount(
     "/collector-output",
-    StaticFiles(directory=str(collector_output_dir), html=False),
+    StaticFiles(directory=str(native_artifact_path(collector_output_dir)), html=False),
     name="collector-output",
 )
 
 
 def _is_private_collector_output_path(path: str) -> bool:
-    normalized = "/" + str(path or "").strip().lstrip("/")
+    normalized = "/" + unquote(unquote(str(path or ""))).replace("\\", "/").strip().lstrip("/").lower()
+    if normalized.startswith("/collector-output/") and any(
+        part.startswith((".pending-", ".candidate-", ".artifact-lock-")) for part in normalized.split("/")
+    ):
+        return True
     private_prefix = "/collector-output/platform_sessions"
     return normalized == private_prefix or normalized.startswith(f"{private_prefix}/")
 

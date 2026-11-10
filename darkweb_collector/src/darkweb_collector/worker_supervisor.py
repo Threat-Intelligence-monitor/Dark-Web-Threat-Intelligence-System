@@ -462,7 +462,11 @@ def supervise(name: str, queues: list[str], hostname: str, workdir: str | None =
                         if stop_pending:
                             raise RuntimeError("worker activity changed during recovery")
                         pending_activity = activity
-                    if activity_expired(activity) and not stop_pending:
+                    if activity.get("recovery_required") is True and not stop_pending:
+                        logger.warning("Worker task finalization requires ownership recovery")
+                        stop_pending = True
+                        stop_reason = "finalization"
+                    elif activity_expired(activity) and not stop_pending:
                         logger.warning("Worker task exceeded its total execution deadline")
                         stop_pending = True
                         stop_reason = "timeout"

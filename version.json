@@ -4,6 +4,7 @@
   "branch": "main",
   "channel": "stable",
   "data_schema": 1,
+  "artifact_reference_format": 1,
   "repository": "Threat-Intelligence-monitor/Dark-Web-Threat-Intelligence-System",
   "updated_at": "2026-11-10T00:00:00+08:00"
 }

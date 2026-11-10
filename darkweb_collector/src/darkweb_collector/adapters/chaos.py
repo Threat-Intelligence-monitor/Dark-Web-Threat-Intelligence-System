@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from darkweb_collector.detail_artifacts import detail_artifact_paths, persist_detail_artifacts
+
 from contextlib import nullcontext
 from darkweb_collector.adapters.base import SiteAdapter
 from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
@@ -14,9 +16,10 @@ from darkweb_collector.utils import dump_json, dump_text, safe_stem
 from urllib.parse import urlparse
 
 
-def _detail_artifacts_exist(output_dir, artifact_stem: str) -> bool:
+def _detail_artifacts_exist(output_dir, artifact_stem: str, snapshot=None, site_name="", target_url="", source_version="") -> bool:
     details_dir = output_dir / "details"
-    return detail_artifacts_complete(details_dir, artifact_stem)
+    return detail_artifacts_complete(details_dir, artifact_stem, (snapshot or {}).get("artifact_payload", (snapshot or {}).get("detail_raw_json")),
+                                     root=output_dir, site_name=site_name, target_url=target_url, source_version=source_version)
 
 
 class ChaosAdapter(SiteAdapter):
@@ -69,7 +72,8 @@ class ChaosAdapter(SiteAdapter):
                     snapshot
                     and snapshot["content_hash"] == victim["content_hash"]
                     and snapshot["last_detail_fetch_status"] == "ok"
-                    and _detail_artifacts_exist(config.output_dir, artifact_stem)
+                    and _detail_artifacts_exist(config.output_dir, artifact_stem, snapshot, self.site_name,
+                                               str(victim.get("detail_url") or ""), str(victim.get("content_hash") or ""))
                 ):
                     continue
                 tasks.append(
@@ -86,7 +90,10 @@ class ChaosAdapter(SiteAdapter):
                             "frontier_artifact_only": bool(
                                 snapshot and snapshot["content_hash"] == victim["content_hash"]
                                 and snapshot["last_detail_fetch_status"] == "ok"
-                                and all((config.output_dir / "details" / f"{artifact_stem}.{suffix}").exists() for suffix in ("html", "json"))
+                                and {"html", "json"} <= detail_artifact_paths(
+                                    config.output_dir, config.output_dir / "details", artifact_stem,
+                                    snapshot.get("artifact_payload", snapshot.get("detail_raw_json")), site_name=self.site_name,
+                                    target_url=str(victim.get("detail_url") or "")).keys()
                             ),
                         },
                     )
@@ -106,24 +113,39 @@ class ChaosAdapter(SiteAdapter):
         restored = restore_detail_artifacts(detail_task, config, screenshot_selector=screenshot_selector)
         if restored is not None:
             return restored
+        detail, parsed_html = {}, None
+        def validate(html):
+            nonlocal detail, parsed_html
+            if html == parsed_html:
+                return True
+            raise_if_error_page(html)
+            parsed = parse_chaos_detail(detail_task.target_url, html)
+            if not str(parsed.get("content") or "").strip() or not parsed.get("victims"):
+                raise CollectionFailure("parse", "chaos detail has no recognized victim content")
+            detail, parsed_html = parsed, html
+            return True
+        metadata = dict(detail_task.metadata)
+        metadata.pop("artifact_error", None)
         html, screenshot_png = fetch_page_artifacts(
             url=detail_task.target_url,
             mode=config.detail_fetch_mode,
             timeout_seconds=config.fetch_timeout_seconds,
             render_wait_seconds=config.render_wait_seconds,
             screenshot_selector=screenshot_selector,
+            validate_html=validate,
+            on_artifact_error=lambda message: metadata.update(artifact_error=message),
         )
-        raise_if_error_page(html)
-        detail = parse_chaos_detail(detail_task.target_url, html)
-        if not str(detail.get("content") or "").strip() or not detail.get("victims"):
-            raise CollectionFailure("parse", "chaos detail has no recognized victim content")
+        validate(html)
+        if not screenshot_png:
+            metadata.setdefault("artifact_error", "artifact: victim evidence capture produced no image")
+            detail["_collector_artifact_error"] = metadata["artifact_error"]
         return DetailResult(
             site_name=self.site_name,
             target_url=detail_task.target_url,
             payload=detail,
             raw_html=html,
             screenshot_png=screenshot_png,
-            metadata=detail_task.metadata,
+            metadata=metadata,
         )
 
     def persist(
@@ -147,11 +169,7 @@ class ChaosAdapter(SiteAdapter):
             with (nullcontext(connection) if connection is not None else get_db_connection()) as detail_connection:
                 for detail_result in detail_results:
                     artifact_stem = detail_result.metadata.get("artifact_stem") or safe_stem(detail_result.target_url)
-                    if detail_result.raw_html is not None:
-                        dump_text(details_dir / f"{artifact_stem}.html", detail_result.raw_html)
-                    if detail_result.screenshot_png is not None:
-                        (details_dir / f"{artifact_stem}.png").write_bytes(detail_result.screenshot_png)
-                    dump_json(details_dir / f"{artifact_stem}.json", {**detail_result.payload, "_collector_artifacts_complete": detail_result.screenshot_png is not None})
+                    persist_detail_artifacts(detail_connection, config, detail_result, details_dir, artifact_stem)
                     record_victim_detail(
                         detail_connection,
                         site_name=self.site_name,
