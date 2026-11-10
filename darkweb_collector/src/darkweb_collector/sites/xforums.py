@@ -208,7 +208,7 @@ def parse_xforums_detail(url: str, html: str) -> dict:
         raise CollectionFailure("parse", "XForums response does not contain the original post")
     message_body = post.first(cls="message-body") or post.first(cls="message-userContent")
     body = (message_body.first(cls="bbWrapper") or message_body) if message_body else None
-    original = extract_body_content(body)
+    original = extract_body_content(body, base_url=url)
     content = original["content"]
     title = _text(root.first("h1", "p-title-value")) or _text(root.first("title")).split(" | ", 1)[0]
 
@@ -233,6 +233,8 @@ def parse_xforums_detail(url: str, html: str) -> dict:
         if re.match(r"/attachments/", urlsplit(urljoin(url, link.attrs.get("href") or "")).path)
         and urlsplit(urljoin(url, link.attrs.get("href") or "")).netloc == urlsplit(url).netloc
     ))
+    media_links = original.get("media_links", [])
+    attachments.extend(link for link in media_links if link not in attachments)
     victims = extract_victims_from_content(content, title)
     return {
         "site_name": "xforums", "source_url": url, "domain": urlsplit(url).netloc,
@@ -241,6 +243,7 @@ def parse_xforums_detail(url: str, html: str) -> dict:
         "content_access": original["content_access"],
         "content_quote_only": original["content_quote_only"],
         "quote_attributions": original["quote_attributions"],
+        **({"media_links": media_links} if media_links else {}),
         "attachments": attachments,
         "victims": [{"name": victim, "industry": determine_industry(victim, f"{title} {content}"), "region": determine_region(victim)} for victim in victims],
         "attackers": extract_attackers_from_content(content),

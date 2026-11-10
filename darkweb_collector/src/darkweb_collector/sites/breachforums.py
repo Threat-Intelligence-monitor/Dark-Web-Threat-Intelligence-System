@@ -49,7 +49,7 @@ def parse_breachforums_detail(url: str, html: str) -> dict:
     detail["published_at_utc"] = normalize_breachforums_timestamp(
         detail.get("timestamp"), collected_at_utc=detail["collected_at_utc"],
     )
-    detail["content_hash"] = content_hash(detail["content"], detail["author"])
+    detail["content_hash"] = content_hash(detail["content"], detail["author"], *detail.get("media_links", []))
     return detail
 
 

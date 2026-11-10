@@ -309,11 +309,11 @@ def failure_details(error: Exception) -> dict:
 def summarize_failures(message: str, failures: list[tuple[str, Exception]]) -> CollectionFailure:
     if not failures:
         return CollectionFailure("unknown", safe_failure_text(message))
-    priority = ("retry_budget", "rate_limited", "infrastructure", "source_moved", "source_closed", "blocked", "auth_required", "restricted", "unavailable", "timeout", "network", "not_found", "parse", "unknown")
+    priority = ("retry_budget", "rate_limited", "infrastructure", "source_moved", "source_closed", "blocked", "auth_required", "restricted", "unavailable", "timeout", "network", "not_found", "empty_content", "parse", "unknown")
     details = [(safe_failure_text(label)[:80], failure_details(error)) for label, error in failures]
     candidates = details
     last_route, last_failure = details[-1]
-    if last_failure["kind"] == "not_found" and (last_route == "browser" or last_route.startswith("browser_")):
+    if last_failure["kind"] in {"not_found", "empty_content"} and (last_route == "browser" or last_route.startswith("browser_")):
         # A final browser response may have cleared the earlier HTTP login or
         # verification wall. Keep those diagnostics, without pausing the site
         # for a gate that the browser has already passed.

@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
 
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page
 from darkweb_collector.normalize import content_hash
+from darkweb_collector.sites.forum_post_content import extract_body_content
 from darkweb_collector.sites.darkforums import (
     determine_industry,
     determine_region,
@@ -169,6 +170,7 @@ def parse_spear_detail(url: str, html: str) -> dict:
         raise CollectionFailure("parse", "Spear original post has no recognized body")
     partial = _strip_noncontent(body)
     content = _text(body)
+    media_links = []
     if (partial and not re.sub(r"\b(?:downloads?|links?|mirrors?|samples?|hidden content)\b|[\W_]", "", content, flags=re.IGNORECASE)) or re.fullmatch(
         r"(?:hidden content[\s:.-]*)?(?:you (?:must|need to|have to) (?:register|log in|login|reply|like)|"
         r"(?:please )?(?:register|log in|login)|only registered members).{0,300}",
@@ -176,7 +178,9 @@ def parse_spear_detail(url: str, html: str) -> dict:
     ):
         raise CollectionFailure("restricted", "Spear original post requires login or an interaction")
     if not content:
-        raise CollectionFailure("parse", "Spear original post has no visible text")
+        original = extract_body_content(body, base_url=url)
+        content = original["content"]
+        media_links = original.get("media_links", [])
     title = _text(root.first("h1")) or re.sub(r"\s*\|\s*Spear.*$", "", _text(root.first("title")), flags=re.IGNORECASE)
     author = _author(post.first(cls="post-username"), url) or "Unknown"
     timestamp = _timestamp(post.first(cls="post_date"))
@@ -187,6 +191,7 @@ def parse_spear_detail(url: str, html: str) -> dict:
             target_url = urlunsplit(target)
             if target_url not in attachments:
                 attachments.append(target_url)
+    attachments.extend(link for link in media_links if link not in attachments)
     victims = extract_victims_from_content(content, title)
     collected_at = utc_now_iso()
     published_at = normalize_spear_timestamp(timestamp, collected_at_utc=collected_at)
@@ -197,6 +202,7 @@ def parse_spear_detail(url: str, html: str) -> dict:
         "author": author, "timestamp": timestamp,
         "published_at_utc": published_at,
         "content_access": content_access, "attachments": attachments,
+        **({"media_links": media_links} if media_links else {}),
         "victims": [{"name": victim, "industry": determine_industry(victim, f"{title} {content}"), "region": determine_region(victim)} for victim in victims],
         "attackers": extract_attackers_from_content(content),
         "content_hash": content_hash(title, content, author, published_at, content_access, *attachments),

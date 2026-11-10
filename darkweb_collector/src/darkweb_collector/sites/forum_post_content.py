@@ -174,7 +174,7 @@ def pagination_label(node) -> str:
     return _normal(" ".join(parts))
 
 
-def extract_body_content(body) -> dict:
+def extract_body_content(body, *, base_url: str = "") -> dict:
     if body is None:
         raise CollectionFailure("parse", "forum original post has no recognized body container")
     parent = body
@@ -185,13 +185,40 @@ def extract_body_content(body) -> dict:
         parent = getattr(parent, "parent", None)
     attributions = []
     restricted = any(_restricted(node) for node in _nodes(body))
+    media, media_urls, unsupported_media = [], set(), []
+    own_media = False
 
     def render(node, *, quotes=True, in_quote=False):
+        nonlocal own_media
         if _ignored(node) or _restricted(node) or (_post(node) and not in_quote):
             return ""
         citation = node.tag == "cite" or bool(_classes(node) & _QUOTE_TITLES)
         if in_quote and citation:
             return ""
+        if quotes and node.tag in {"img", "video", "audio", "source", "iframe", "object", "embed", "svg", "canvas", "picture"}:
+            label = {"img": "图片", "video": "视频", "audio": "音频"}.get(node.tag)
+            if node.tag == "source":
+                label = {"video": "视频", "audio": "音频"}.get(getattr(getattr(node, "parent", None), "tag", ""))
+            raw = str(node.attrs.get("data-src") or node.attrs.get("data-lazy-src") or
+                      node.attrs.get("data-original") or node.attrs.get("src") or "").strip()
+            try:
+                target = urlsplit(urljoin(base_url, raw.replace(" ", "%20")))
+                valid = (label and raw and not raw.startswith("#") and "\\" not in raw
+                         and not any(ord(char) < 32 or char in '<>"' for char in raw) and target.scheme in {"http", "https"}
+                         and target.hostname and target.username is None and target.password is None)
+                target.port  # Reject malformed authorities before retaining a resource URL.
+            except ValueError:
+                valid = False
+            if valid:
+                resource = target.geturl()
+                own_media = own_media or not in_quote
+                if resource not in media_urls:
+                    media_urls.add(resource)
+                    media.append((label, resource, in_quote))
+            else:
+                unsupported_media.append(node.tag)
+        if quotes and node.tag == "a" and str(node.attrs.get("href") or "").strip():
+            unsupported_media.append("link")
         if node.tag == "blockquote":
             if not quotes:
                 return ""
@@ -216,16 +243,47 @@ def extract_body_content(body) -> dict:
 
     content = _normal(render(body))
     own_content = _normal(render(body, quotes=False))
+    media_links = []
     if not content:
-        if restricted:
+        if media:
+            if any("," in resource for _, resource, _ in media):
+                raise CollectionFailure("parse", "forum media resource URL cannot be represented by current attachment format")
+            media_types = {}
+            for label, resource, in_quote in media:
+                kind = ("引用" if in_quote else "") + label
+                media_types[kind] = media_types.get(kind, 0) + 1
+                media_links.append(resource)
+            content = "[媒体原帖] " + "，".join(f"{kind}资源 {count} 项" for kind, count in media_types.items())
+            own_content = content if own_media else ""
+        elif restricted:
             raise CollectionFailure("restricted", "post body only contains an access or interaction prompt")
-        media = any(node.tag in {"img", "video", "audio", "iframe", "object", "embed"} and not _ignored(node) for node in _nodes(body))
-        raise CollectionFailure("parse", "forum original post contains media without readable text" if media
-                                else "forum original post has no visible text")
+        else:
+            owner = getattr(body, "parent", None)
+            while owner is not None and not (_post(owner) or re.fullmatch(r"post_\d+", str(owner.attrs.get("id") or ""))):
+                owner = getattr(owner, "parent", None)
+            for attachment in _nodes(owner) if owner is not None else ():
+                if not _classes(attachment) & {"post_attachments", "attachments", "message-attachments"} or _ancillary(attachment):
+                    continue
+                if not any(node.tag in {"img", "video", "audio", "iframe", "object", "embed", "svg", "canvas"}
+                           or node.tag == "a" and node.attrs.get("href") for node in _nodes(attachment)):
+                    continue
+                parent = attachment
+                while parent is not None and parent is not owner and not (
+                    _ignored(parent) or _restricted(parent) or _post(parent)
+                    or re.fullmatch(r"post_\d+", str(parent.attrs.get("id") or ""))
+                ):
+                    parent = getattr(parent, "parent", None)
+                if parent is owner:
+                    unsupported_media.append("attachment")
+                    break
+            if unsupported_media:
+                raise CollectionFailure("parse", "forum original post contains media or attachments without usable public media links")
+            raise CollectionFailure("empty_content", "forum original post has no visible content")
     if _PROMPT.fullmatch(content):
         raise CollectionFailure("restricted", "post body only contains an access or interaction prompt")
     return {"content": content, "content_access": "partial" if restricted else "public",
-            "content_quote_only": not bool(own_content), "quote_attributions": attributions}
+            "content_quote_only": not bool(own_content), "quote_attributions": attributions,
+            **({"media_links": media_links} if media_links else {})}
 
 
 def extract_mybb_post(url: str, html: str) -> dict:
@@ -250,6 +308,17 @@ def extract_mybb_post(url: str, html: str) -> dict:
         while parent is not None:
             if _ignored(parent) or _restricted(parent):
                 kind = "restricted" if _restricted(parent) else "parse"
+                bodies = [node for node in _nodes(first) if "post_body" in _classes(node) and not _ancillary(node)]
+                if kind == "parse" and bodies:
+                    # Inspect only the access outcome of the original body; its
+                    # hidden outer post must never become publishable content.
+                    inner = _Document(html[bodies[0].start:bodies[0].end])
+                    inner_body = next(node for node in _nodes(inner.root) if "post_body" in _classes(node))
+                    try:
+                        extract_body_content(inner_body, base_url=url)
+                    except CollectionFailure as exc:
+                        if exc.kind == "restricted":
+                            kind = "restricted"
                 raise CollectionFailure(kind, "forum original post is not publicly visible")
             parent = parent.parent
         end = min(first.end, posts[1].start) if len(posts) > 1 else first.end
@@ -264,7 +333,7 @@ def extract_mybb_post(url: str, html: str) -> dict:
     if not preferred or not posts and len(preferred) != 1:
         raise CollectionFailure("parse", "forum response has no identifiable original post body")
     body = preferred[0]
-    result = extract_body_content(body)
+    result = extract_body_content(body, base_url=url)
     # Metadata keeps its original parsing rules, but must not read quoted authors
     # or dates from the body or a later reply.
     metadata = scoped[:body.start] + " " + scoped[body.end:]

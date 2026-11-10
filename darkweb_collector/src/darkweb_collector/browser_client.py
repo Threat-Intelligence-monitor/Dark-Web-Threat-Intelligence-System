@@ -67,6 +67,16 @@ _CAPTURE_READY_SCRIPT = r"""
             .filter(body => !body.parentElement?.closest(ancillary)) : [];
         content = original ? candidates.find(body => postOwner(body) === original) : (posts.length === 0 && candidates.length === 1 ? candidates[0] : null);
     }
+    if (options.inspectEmpty === true) {
+        if (!scoped || !content || !isExposed(content) || document.readyState !== 'complete') return false;
+        const owner = postOwner(content);
+        const roots = [content];
+        if (owner) roots.push(...Array.from(owner.querySelectorAll('.post_attachments, .attachments, .message-attachments'))
+            .filter(element => postOwner(element) === owner && isExposed(element)));
+        return roots.every(root => !root.textContent.trim() && !Array.from(
+            root.querySelectorAll('img, video, audio, iframe, object, embed, svg, a[href]')
+        ).some(isExposed));
+    }
     if (scoped && (!content || !isVisible(content) || !isExposed(content))) {
         if (waitForImages) throw new Error('required original-post content scope is unavailable; screenshot skipped');
         return false;
@@ -403,6 +413,9 @@ class BrowserClient:
                 verified_document()
                 self._task_count += 1
                 return finish_capture(None)
+            except CollectionFailure:
+                verified_document(validate_content=False)
+                raise
             except Exception as exc:
                 raise CollectionFailure("timeout", "browser content did not become ready within the request deadline") from exc
             verified_document()
@@ -697,6 +710,15 @@ def _wait_for_capture_ready(page, *, timeout_ms: int, capture_ready_script: str 
         if capture_ready_script:
             page.wait_for_function(capture_ready_script, polling=100, timeout=max(1, int((deadline - time.monotonic()) * 1000)))
     except PlaywrightTimeoutError as exc:
+        if not wait_for_images and capture_content_selector is not None:
+            # Classify only after the existing render deadline; delayed content
+            # keeps the full wait and an unfinished loading document stays a timeout.
+            try:
+                empty = page.evaluate(_CAPTURE_READY_SCRIPT, {**options, "inspectEmpty": True})
+            except Exception:
+                empty = False
+            if empty:
+                raise CollectionFailure("empty_content", "original post is empty after browser rendering") from exc
         if capture_content_selector is not None and not page.locator(capture_content_selector).count():
             raise _CaptureScopeUnavailable("required original-post content scope was not found; screenshot skipped") from exc
         raise RuntimeError("page remained in a loading state; screenshot skipped") from exc
