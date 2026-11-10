@@ -260,13 +260,26 @@ def classify_failure(error: Exception) -> CollectionFailure:
     if isinstance(error, SiteAuthenticationRequired):
         return CollectionFailure("auth_required", str(error), scope="site")
     name = type(error).__name__.lower()
+    # Driver subclasses such as DeadlockDetected must stay infrastructure errors,
+    # including when their message contains "timeout". Never copy SQL or credentials.
+    if any(part in base.__name__.lower() for base in type(error).__mro__
+           for part in ("databaseerror", "operationalerror", "interfaceerror", "poolerror", "postgresqlbackenderror")):
+        sqlstate = str(getattr(error, "pgcode", None) or getattr(error, "sqlstate", "") or "")
+        if not re.fullmatch(r"[0-9A-Z]{5}", sqlstate):
+            sqlstate = ""
+        reason = {
+            "40P01": "collection database transaction deadlock",
+            "40001": "collection database serialization conflict",
+            "55P03": "collection database lock unavailable",
+            "57014": "collection database query canceled",
+        }.get(sqlstate, "collection storage or message service unavailable")
+        detail = type(error).__name__ + (f", SQLSTATE {sqlstate}" if sqlstate else "")
+        return CollectionFailure("infrastructure", f"{reason} ({detail})", scope="site")
     message = str(error).lower()
     if "timeout" in name or "timed out" in message or "timeout" in message:
         return CollectionFailure("timeout", "collection operation timed out")
     if any(part in name for part in ("proxyfetch", "torfetch", "connectionerror")):
         return CollectionFailure("network", "source connection failed")
-    if any(part in name for part in ("operationalerror", "interfaceerror", "poolerror")):
-        return CollectionFailure("infrastructure", "collection storage or message service unavailable", scope="site")
     if isinstance(error, (ValueError, TypeError, KeyError)):
         return CollectionFailure("parse", "document did not match the expected source schema")
     if isinstance(error, OSError):

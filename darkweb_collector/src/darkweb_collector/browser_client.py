@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import atexit
+import logging
+import os
 from pathlib import Path
-from threading import Lock, current_thread
+import pickle
+from queue import Empty, Queue
+import signal
+import struct
+import subprocess
+import sys
+from threading import Lock, Thread, current_thread
 import traceback
 import time
 from dataclasses import dataclass
@@ -12,6 +20,9 @@ from urllib.parse import urlparse
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt
 from darkweb_collector.tor_fetch import raise_for_http_status
 from darkweb_collector.source_sessions import read_browser_session, persist_browser_session, same_source
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -180,6 +191,8 @@ class BrowserClient:
 
         if self._proxy.engine not in {"chromium", "firefox"}:
             raise ValueError(f"unsupported browser engine: {self._proxy.engine}")
+        started = time.monotonic()
+        logger.info("capture phase=launch-start engine=%s", self._proxy.engine)
         self._playwright_context = sync_playwright()
         try:
             self._playwright = self._playwright_context.start()
@@ -196,6 +209,7 @@ class BrowserClient:
             self._browser = browser_type.launch(**launch_kwargs)
             self._created_monotonic = time.monotonic()
             self._task_count = 0
+            logger.info("capture phase=launch-done engine=%s elapsed=%.3f", self._proxy.engine, time.monotonic() - started)
         except Exception:
             try:
                 self.close()
@@ -598,6 +612,7 @@ class BrowserClient:
             page.route("**/*", render_document)
             deadline = time.monotonic() + timeout_seconds
             page.goto(base_url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+            logger.info("capture phase=static-render-start engine=%s", self._proxy.engine)
             _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)),
                                     javascript_enabled=False, capture_content_selector=capture_content_selector)
             screenshot_png = None
@@ -656,19 +671,24 @@ class BrowserClient:
             self._task_count += 1
             return screenshot_png
         finally:
+            logger.info("capture phase=context-close-start engine=%s", self._proxy.engine)
             context.close()
+            logger.info("capture phase=context-close-done engine=%s", self._proxy.engine)
 
     def close(self) -> None:
         browser, playwright, context = self._browser, self._playwright, self._playwright_context
         self._browser = self._playwright = self._playwright_context = None
         try:
             if browser is not None:
+                logger.info("capture phase=browser-close-start engine=%s", self._proxy.engine)
                 browser.close()
         finally:
             if playwright is not None:
                 playwright.stop()
             elif context is not None:
                 context.__exit__()
+            if browser is not None:
+                logger.info("capture phase=browser-close-done engine=%s", self._proxy.engine)
 
 
 _GLOBAL_CLIENTS: dict[object, tuple[BrowserProxyConfig, BrowserClient]] = {}
@@ -855,6 +875,8 @@ def fetch_page_artifacts_with_browser(
     capture_content_selector: str | None = None,
     verification_provider: str = "",
 ) -> tuple[str, bytes | None]:
+    started = time.monotonic()
+    logger.info("capture phase=live-start engine=%s", browser_engine)
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine, verification_provider=verification_provider)
     try:
         client = _get_or_create_client(requested_proxy)
@@ -880,6 +902,8 @@ def fetch_page_artifacts_with_browser(
     except Exception:
         close_browser_client()
         raise
+    finally:
+        logger.info("capture phase=live-end engine=%s elapsed=%.3f", browser_engine, time.monotonic() - started)
 
 
 def screenshot_html_with_browser(
@@ -898,26 +922,185 @@ def screenshot_html_with_browser(
     user_agent: str | None = None,
     capture_content_selector: str | None = None,
 ) -> bytes:
+    started = time.monotonic()
+    deadline = started + max(0.1, timeout_seconds)
+    options = dict(
+        html=html, base_url=base_url, wait_seconds=wait_seconds, timeout_seconds=timeout_seconds,
+        proxy_server=proxy_server, browser_engine=browser_engine,
+        screenshot_selector=screenshot_selector, screenshot_selectors=screenshot_selectors,
+        hide_selectors=hide_selectors, screenshot_styles=screenshot_styles,
+        storage_state_path=storage_state_path, cookie_header=cookie_header, user_agent=user_agent,
+        capture_content_selector=capture_content_selector,
+    )
+    logger.info("capture phase=static-start engine=%s", browser_engine)
+    thread_key = current_thread()
     requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
-    client = _get_or_create_client(requested_proxy)
+    with _GLOBAL_CLIENT_LOCK:
+        worker = _GLOBAL_STATIC_WORKERS.get(thread_key)
     try:
-        return client.screenshot_html_content(
-            html=html,
-            base_url=base_url,
-            wait_seconds=wait_seconds,
-            timeout_seconds=timeout_seconds,
-            screenshot_selector=screenshot_selector,
-            screenshot_selectors=screenshot_selectors,
-            hide_selectors=hide_selectors,
-            screenshot_styles=screenshot_styles,
-            storage_state_path=storage_state_path,
-            cookie_header=cookie_header,
-            user_agent=user_agent,
-            capture_content_selector=capture_content_selector,
-        )
+        if worker is None or worker._closed or worker.proxy != requested_proxy or worker.process.poll() is not None:
+            if worker is not None:
+                worker.close(graceful=True)
+            worker = _StaticCaptureWorker(requested_proxy)
+            with _GLOBAL_CLIENT_LOCK:
+                _GLOBAL_STATIC_WORKERS[thread_key] = worker
+        return worker.capture(options, deadline)
     except Exception:
-        close_browser_client()
+        with _GLOBAL_CLIENT_LOCK:
+            _GLOBAL_STATIC_WORKERS.pop(thread_key, None)
+        if worker is not None:
+            worker.close()
         raise
+    finally:
+        logger.info("capture phase=static-end engine=%s elapsed=%.3f", browser_engine, time.monotonic() - started)
+
+
+_CAPTURE_PACKET_LIMIT = 256 * 1024 * 1024
+
+
+def _write_capture_packet(stream, value) -> None:
+    payload = pickle.dumps(value)
+    if len(payload) > _CAPTURE_PACKET_LIMIT:
+        raise ValueError("static screenshot packet exceeds the size limit")
+    stream.write(struct.pack("!I", len(payload)) + payload)
+    stream.flush()
+
+
+def _read_capture_packet(stream):
+    header = stream.read(4)
+    if len(header) != 4:
+        raise EOFError("static screenshot channel closed")
+    size = struct.unpack("!I", header)[0]
+    if not 0 < size <= _CAPTURE_PACKET_LIMIT:
+        raise ValueError("static screenshot packet size is invalid")
+    payload = stream.read(size)
+    if len(payload) != size:
+        raise EOFError("static screenshot result was incomplete")
+    return pickle.loads(payload)
+
+
+class _StaticCaptureWorker:
+    """One serial screenshot process owned by its caller thread, with bounded IPC."""
+
+    def __init__(self, proxy: BrowserProxyConfig):
+        self.proxy = proxy
+        self.process, self.job, self.exchange_thread = None, None, None
+        self._closed = False
+        assigned = False
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH"))))
+        # The private pipes connect only to this trusted child. HTML/cookies
+        # never enter command arguments, logs, or temporary documents.
+        command = [sys.executable, "-c", "from darkweb_collector.browser_client import _screenshot_html_process; _screenshot_html_process()"]
+        try:
+            if os.name == "nt":
+                from uuid import uuid4
+                from darkweb_collector.worker_supervisor import _WorkerJob
+
+                self.job = _WorkerJob(f"Local\\dwti-worker-screenshot-{uuid4().hex}")
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                            env=env, creationflags=(subprocess.CREATE_NO_WINDOW | 0x00000004) if self.job else 0,
+                                            start_new_session=os.name != "nt")
+            if self.job is not None:
+                self.job.assign_and_resume(self.process)
+                assigned = True
+        except Exception:
+            if self.process is not None and not assigned:
+                self.process.kill()
+            self.close()
+            raise
+
+    def capture(self, options: dict | None, deadline: float) -> bytes:
+        response = Queue(maxsize=1)
+
+        def exchange():
+            try:
+                _write_capture_packet(self.process.stdin, options)
+                while True:
+                    kind, value = _read_capture_packet(self.process.stdout)
+                    if kind == "phase":
+                        logger.info("%s", value)
+                    else:
+                        response.put(value)
+                        return
+            except Exception:
+                response.put((False, CollectionFailure("infrastructure", "static screenshot process exited without a complete result")))
+
+        # Both a blocked send and a partial response frame stay in this daemon
+        # thread. The caller's deadline bounds the complete exchange, not a poll.
+        self.exchange_thread = Thread(target=exchange, name="static-screenshot-io", daemon=True)
+        self.exchange_thread.start()
+        try:
+            succeeded, result = response.get(timeout=max(0.001, deadline - time.monotonic()))
+        except Empty as exc:
+            raise TimeoutError("static screenshot execution deadline exhausted") from exc
+        self.exchange_thread.join(timeout=max(0, deadline - time.monotonic()))
+        if not succeeded:
+            raise result
+        return result
+
+    def close(self, *, graceful: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        deadline = time.monotonic() + 3
+        if (graceful and self.process is not None and self.process.poll() is None
+                and (self.exchange_thread is None or not self.exchange_thread.is_alive())):
+            try:
+                self.capture(None, deadline)
+            except Exception:
+                pass
+        # The private Job/session retains ownership if the child exits first.
+        if self.job is not None:
+            self.job.close()
+        elif self.process is not None:
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if self.process is not None:
+            try:
+                self.process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+            if self.exchange_thread is not None:
+                self.exchange_thread.join(timeout=max(0, deadline - time.monotonic()))
+            if self.exchange_thread is None or not self.exchange_thread.is_alive():
+                self.process.stdin.close()
+                self.process.stdout.close()
+
+
+_GLOBAL_STATIC_WORKERS: dict[object, _StaticCaptureWorker] = {}
+
+
+class _CapturePhaseHandler(logging.Handler):
+    def emit(self, record):
+        _write_capture_packet(sys.stdout.buffer, ("phase", record.getMessage()))
+
+
+def _screenshot_html_process() -> None:
+    logger.addHandler(_CapturePhaseHandler())
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        while True:
+            try:
+                options = _read_capture_packet(sys.stdin.buffer)
+            except EOFError:
+                return
+            if options is None:
+                close_browser_client()
+                _write_capture_packet(sys.stdout.buffer, ("result", (True, b"")))
+                return
+            proxy = BrowserProxyConfig(server=options.pop("proxy_server"), engine=options.pop("browser_engine"))
+            try:
+                result = (True, _get_or_create_client(proxy).screenshot_html_content(**options))
+            except Exception as exc:
+                result = (False, exc)
+                close_browser_client()
+            _write_capture_packet(sys.stdout.buffer, ("result", result))
+    finally:
+        close_browser_client()
 
 
 def close_browser_client(*, all_threads: bool = False) -> None:
@@ -926,9 +1109,15 @@ def close_browser_client(*, all_threads: bool = False) -> None:
         if all_threads:
             clients = [client for _, client in _GLOBAL_CLIENTS.values()]
             _GLOBAL_CLIENTS.clear()
+            workers = list(_GLOBAL_STATIC_WORKERS.values())
+            _GLOBAL_STATIC_WORKERS.clear()
         else:
             entry = _GLOBAL_CLIENTS.pop(thread_key, None)
             clients = [entry[1]] if entry is not None else []
+            worker = _GLOBAL_STATIC_WORKERS.pop(thread_key, None)
+            workers = [worker] if worker is not None else []
+    for worker in workers:
+        worker.close(graceful=True)
     for client in clients:
         try:
             client.close()
