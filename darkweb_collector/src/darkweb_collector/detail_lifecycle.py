@@ -91,7 +91,8 @@ def reset_site_failures(connection, site_name: str) -> None:
             AND (next_retry <= ? OR failure_kind NOT IN ('rate_limited', 'blocked', 'auth_required'))""",
             (site_name, time.time()))
     else:
-        connection.execute("DELETE FROM crawl_site_control WHERE site_name = ?", (site_name,))
+        connection.execute("""DELETE FROM crawl_site_control WHERE site_name = ?
+            AND (next_retry <= ? OR failure_kind <> 'rate_limited')""", (site_name, time.time()))
     connection.execute("DELETE FROM crawl_detail_site_control WHERE site_name = ?", (site_name,))
     connection.execute("""UPDATE crawl_detail_control SET failure_count = 0, failure_kind = '',
         next_retry = 0, request_count = 0, budget_until = 0, last_error = ''
@@ -243,11 +244,13 @@ def fail_detail(connection, site_name: str, target_url: str, token: str, error: 
         delay = (60, 300)[count - 1] if count < 3 else 3600
     delay = max(float(delay), failure.retry_after)
     retry_at = timestamp + delay
-    connection.execute("""UPDATE crawl_detail_control SET failure_count = ?, failure_kind = ?,
+    updated = connection.execute("""UPDATE crawl_detail_control SET failure_count = ?, failure_kind = ?,
         next_retry = ?, last_error = ?, owner_token = '', owner_until = 0, worker_pid = 0, worker_started = 0,
         updated_at = ? WHERE site_name = ? AND target_url = ? AND owner_token = ?""",
         (count, "artifact" if artifact_interruption else failure.kind, retry_at,
          str(failure)[:500], timestamp, site_name, target_url, token))
+    if updated.rowcount == 0:
+        return 0.0
     if failure.scope == "site":
         observed = getattr(failure, "_forum_backoff", None)
         site_delay = max(0, float(observed[1]) - timestamp) if observed and observed[0] == site_name else delay

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from darkweb_collector.detail_artifacts import persist_detail_artifacts
+
 from contextlib import nullcontext
 import hashlib
 from urllib.parse import urlparse
@@ -35,10 +37,11 @@ def _detail_artifact_stem(url: str) -> str:
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
 
 
-def _detail_artifacts_exist(output_dir, section_name: str, topic_url: str) -> bool:
+def _detail_artifacts_exist(output_dir, section_name: str, topic_url: str, snapshot=None, site_name="", source_version="") -> bool:
     artifact_stem = _detail_artifact_stem(topic_url)
     details_dir = output_dir / section_name / "details"
-    return detail_artifacts_complete(details_dir, artifact_stem)
+    return detail_artifacts_complete(details_dir, artifact_stem, (snapshot or {}).get("artifact_payload", (snapshot or {}).get("raw_json")),
+                                     root=output_dir, site_name=site_name, target_url=topic_url, forum=True, source_version=source_version)
 
 
 class PwnfrmAdapter(SiteAdapter):
@@ -116,6 +119,7 @@ class PwnfrmAdapter(SiteAdapter):
                         config.output_dir,
                         section_name,
                         str(topic["full_url"]),
+                        detail_snapshot, self.site_name, str(topic["content_hash"]),
                     )
                     if not topic_changed and detail_snapshot is not None and detail_artifacts_ready:
                         continue
@@ -185,9 +189,11 @@ class PwnfrmAdapter(SiteAdapter):
         if config.detail_fetch_mode == "browser":
             options = browser_session_options(config, url, proxy_server)
             options["browser_engine"] = str(config.extras.get("browser_engine") or "firefox")
+            capture_errors = []
             html, screenshot_png = fetch_page_artifacts_with_browser(
-                url, validate_html=validate, **capture_options, **options,
+                url, validate_html=validate, on_artifact_error=capture_errors.append, **capture_options, **options,
             )
+            artifact_error = capture_errors[-1] if capture_errors else ""
         else:
             http_options = http_session_options(config, url, proxy_server)
             html = fetch_url(
@@ -260,16 +266,14 @@ class PwnfrmAdapter(SiteAdapter):
                         detail_result.metadata.get("artifact_stem")
                         or _detail_artifact_stem(detail_result.target_url)
                     )
-                    if detail_result.raw_html is not None:
-                        dump_text(section_dir / f"{artifact_stem}.html", detail_result.raw_html)
-                    if detail_result.screenshot_png is not None:
-                        (section_dir / f"{artifact_stem}.png").write_bytes(detail_result.screenshot_png)
-                    dump_json(section_dir / f"{artifact_stem}.json", {**detail_result.payload, "_collector_artifacts_complete": detail_result.screenshot_png is not None})
+                    artifacts = persist_detail_artifacts(detail_connection, config, detail_result, section_dir,
+                                                         artifact_stem, section=section_name)
                     upsert_forum_detail(
                         detail_connection,
                         site_name=self.site_name,
                         section=section_name,
                         topic_url=detail_result.target_url,
+                        artifact_refs=artifacts,
                         content=detail_result.payload.get("content", ""),
                         authors=detail_result.payload.get("author", ""),
                         timestamps=detail_result.payload.get("timestamp", ""),

@@ -399,6 +399,8 @@ def _recover_activity(path: Path, payload: dict | None, reason: str) -> bool:
 
 
 def supervise(name: str, queues: list[str], hostname: str, workdir: str | None = None) -> None:
+    from darkweb_collector.browser_temp import request_browser_temp_cleanup
+
     workdir = str(Path(workdir or Path(__file__).resolve().parents[2]).resolve())
     recover_orphaned_activities(worker_name=name)
     path = _health_directory() / f"{name}.json"
@@ -439,6 +441,7 @@ def supervise(name: str, queues: list[str], hostname: str, workdir: str | None =
     started_at = 0.0
     try:
         while True:
+            request_browser_temp_cleanup()
             now = time.monotonic()
             try:
                 if job is None and state["worker_job"] and os.name == "nt":
@@ -462,7 +465,11 @@ def supervise(name: str, queues: list[str], hostname: str, workdir: str | None =
                         if stop_pending:
                             raise RuntimeError("worker activity changed during recovery")
                         pending_activity = activity
-                    if activity_expired(activity) and not stop_pending:
+                    if activity.get("recovery_required") is True and not stop_pending:
+                        logger.warning("Worker task finalization requires ownership recovery")
+                        stop_pending = True
+                        stop_reason = "finalization"
+                    elif activity_expired(activity) and not stop_pending:
                         logger.warning("Worker task exceeded its total execution deadline")
                         stop_pending = True
                         stop_reason = "timeout"

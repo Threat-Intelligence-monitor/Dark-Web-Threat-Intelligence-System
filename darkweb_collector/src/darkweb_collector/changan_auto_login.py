@@ -491,7 +491,9 @@ def perform_changan_login(
         _ensure_tor_connected()
         result["tor_connected"] = True
         from playwright.sync_api import sync_playwright
+        from darkweb_collector.browser_temp import ensure_browser_temp
 
+        ensure_browser_temp()
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,

@@ -6,6 +6,7 @@ import json
 from darkweb_collector.browser_client import screenshot_html_with_browser
 from darkweb_collector.collection_errors import CollectionFailure, has_detail_body, raise_if_error_page, safe_failure_text
 from darkweb_collector.db import get_db_connection, get_forum_detail_snapshot, get_victim_snapshot
+from darkweb_collector.detail_artifacts import ARTIFACTS_KEY, detail_artifact_paths
 from darkweb_collector.models import DetailResult, DetailTask, SiteConfig
 from darkweb_collector.source_sessions import browser_session_options, http_session_options
 from darkweb_collector.tor_fetch import browser_proxy_server_for_url
@@ -15,11 +16,24 @@ from darkweb_collector.tor_fetch import browser_proxy_server_for_url
 FORUM_CAPTURE_CONTENT_SELECTOR = ".post_body, .post_content:not(:has(.post_body)), .messageContent:not(:has(.post_body))"
 
 
-def detail_artifacts_complete(directory, stem: str) -> bool:
-    if not all((directory / f"{stem}.{suffix}").is_file() for suffix in ("html", "json", "png")):
+def detail_artifacts_complete(directory, stem: str, raw_payload=None, *, root=None, site_name="", target_url="", forum=False, source_version="") -> bool:
+    try:
+        stored = raw_payload if isinstance(raw_payload, dict) else json.loads(raw_payload or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    manifest = stored.get(ARTIFACTS_KEY)
+    if isinstance(manifest, dict) and source_version and manifest.get("source_version") != source_version:
+        return False
+    if ARTIFACTS_KEY not in stored and stored.get("artifact_stem") not in (None, "", stem):
+        return False
+    paths = detail_artifact_paths(root or directory, directory, stem, raw_payload,
+                                  site_name=site_name, target_url=target_url, forum=forum)
+    if not {"html", "json", "png"} <= paths.keys():
         return False
     try:
-        payload = json.loads((directory / f"{stem}.json").read_text(encoding="utf-8"))
+        payload = json.loads(paths["json"].read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     return isinstance(payload, dict) and payload.get("_collector_artifacts_complete") is not False
@@ -42,12 +56,6 @@ def restore_detail_artifacts(
     stem = str(detail_task.metadata.get("artifact_stem") or hashlib.sha1(detail_task.target_url.encode("utf-8")).hexdigest()[:10])
     directory = config.output_dir / section / "details"
     try:
-        payload = json.loads((directory / f"{stem}.json").read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or not has_detail_body(payload):
-            return None
-        # Legacy Changan payloads omit source_url; their body is verified in SQL.
-        if payload.get("source_url") not in (None, detail_task.target_url):
-            return None
         with get_db_connection() as connection:
             version = str(detail_task.metadata.get("source_version") or "")
             frontier = connection.execute("""SELECT fetched_version, claimed_version, lease_token
@@ -60,33 +68,52 @@ def restore_detail_artifacts(
                 return None
             if section:
                 snapshot = get_forum_detail_snapshot(connection, detail_task.site_name, section, detail_task.target_url)
-                if snapshot is None or snapshot["content_hash"] != payload.get("content_hash"):
-                    return None
-                body = connection.execute("SELECT content FROM forum_details WHERE id = ?", (snapshot["id"],)).fetchone()
-                if body is None or body[0] != payload.get("content"):
-                    return None
+                stored_payload = (snapshot or {}).get("artifact_payload", (snapshot or {}).get("raw_json"))
             else:
                 snapshot = get_victim_snapshot(
                     connection, detail_task.site_name, str(detail_task.metadata["source_url"]),
                     str(detail_task.metadata["name"]), detail_task.metadata.get("domain"),
                     str(detail_task.metadata.get("status", "active")),
                 )
+                stored_payload = (snapshot or {}).get("artifact_payload", (snapshot or {}).get("detail_raw_json"))
+            if snapshot is None:
+                return None
+            paths = detail_artifact_paths(config.output_dir, directory, stem, stored_payload,
+                site_name=detail_task.site_name, target_url=detail_task.target_url, forum=bool(section))
+            stored = stored_payload if isinstance(stored_payload, dict) else json.loads(stored_payload or "{}")
+            versioned = ARTIFACTS_KEY in stored
+            if versioned and stored[ARTIFACTS_KEY].get("source_version") != version:
+                return None
+            payload_bytes = paths["json"].read_bytes()
+            if versioned and hashlib.sha256(payload_bytes).hexdigest() != paths["json"].stem:
+                return None
+            payload = json.loads(payload_bytes)
+            if not isinstance(payload, dict) or not has_detail_body(payload):
+                return None
+            # Legacy Changan payloads omit source_url; their body is verified in SQL.
+            if payload.get("source_url") not in (None, detail_task.target_url):
+                return None
+            if section:
+                if snapshot["content_hash"] != payload.get("content_hash"):
+                    return None
+                body = connection.execute("SELECT content FROM forum_details WHERE id = ?", (snapshot["id"],)).fetchone()
+                if body is None or body[0] != payload.get("content"):
+                    return None
+            else:
                 if (
-                    snapshot is None or snapshot["last_detail_fetch_status"] != "ok"
+                    snapshot["last_detail_fetch_status"] != "ok"
                     or snapshot["content_hash"] != detail_task.metadata.get("source_version")
                     or payload.get("source_url") != detail_task.target_url
                 ):
                     return None
-                body = connection.execute("""SELECT raw_json FROM victim_details WHERE victim_id = ?
-                    ORDER BY id DESC LIMIT 1""", (snapshot["id"],)).fetchone()
-                if body is None:
-                    return None
-                stored = json.loads(body[0])
                 if not isinstance(stored, dict) or stored.get("fetch_status") != "ok" or payload.get("fetch_status") != "ok":
                     return None
                 if any(stored.get(key) != payload.get(key) for key in ("page_title", "content", "text_excerpt", "outbound_link_count")):
                     return None
-        html = (directory / f"{stem}.html").read_text(encoding="utf-8")
+        html_bytes = paths["html"].read_bytes()
+        if versioned and hashlib.sha256(html_bytes).hexdigest() != paths["html"].stem:
+            return None
+        html = html_bytes.decode("utf-8")
         if not html.strip():
             return None
     except (OSError, ValueError, TypeError, KeyError):

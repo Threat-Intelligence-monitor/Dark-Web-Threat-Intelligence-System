@@ -1,6 +1,8 @@
 """Lynx site adapter for darkweb_collector."""
 from __future__ import annotations
 
+from darkweb_collector.detail_artifacts import detail_artifact_paths, persist_detail_artifacts
+
 from contextlib import nullcontext
 from darkweb_collector.adapters.base import SiteAdapter
 from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
@@ -14,9 +16,10 @@ from darkweb_collector.tor_fetch import fetch_page_artifacts, fetch_url
 from darkweb_collector.utils import dump_json, dump_text, safe_stem
 
 
-def _detail_artifacts_exist(output_dir, artifact_stem: str) -> bool:
+def _detail_artifacts_exist(output_dir, artifact_stem: str, snapshot=None, site_name="", target_url="", source_version="") -> bool:
     details_dir = output_dir / "details"
-    return detail_artifacts_complete(details_dir, artifact_stem)
+    return detail_artifacts_complete(details_dir, artifact_stem, (snapshot or {}).get("artifact_payload", (snapshot or {}).get("detail_raw_json")),
+                                     root=output_dir, site_name=site_name, target_url=target_url, source_version=source_version)
 
 
 class LynxAdapter(SiteAdapter):
@@ -97,7 +100,8 @@ class LynxAdapter(SiteAdapter):
                     snapshot
                     and snapshot.get("content_hash") == victim.get("content_hash")
                     and snapshot.get("last_detail_fetch_status") == "ok"
-                    and _detail_artifacts_exist(config.output_dir, artifact_stem)
+                    and _detail_artifacts_exist(config.output_dir, artifact_stem, snapshot, self.site_name,
+                                               str(victim.get("detail_url") or ""), str(victim.get("content_hash") or ""))
                 ):
                     continue
 
@@ -117,7 +121,10 @@ class LynxAdapter(SiteAdapter):
                             "frontier_artifact_only": bool(
                                 snapshot and snapshot.get("content_hash") == victim.get("content_hash")
                                 and snapshot.get("last_detail_fetch_status") == "ok"
-                                and all((config.output_dir / "details" / f"{artifact_stem}.{suffix}").exists() for suffix in ("html", "json"))
+                                and {"html", "json"} <= detail_artifact_paths(
+                                    config.output_dir, config.output_dir / "details", artifact_stem,
+                                    snapshot.get("artifact_payload", snapshot.get("detail_raw_json")), site_name=self.site_name,
+                                    target_url=str(victim.get("detail_url") or "")).keys()
                             ),
                         },
                     )
@@ -145,21 +152,36 @@ class LynxAdapter(SiteAdapter):
         restored = restore_detail_artifacts(detail_task, config, screenshot_selectors=selectors)
         if restored is not None:
             return restored
+        detail, parsed_html = {}, None
+        def validate(html):
+            nonlocal detail, parsed_html
+            if html == parsed_html:
+                return True
+            raise_if_error_page(html)
+            parsed = parse_lynx_detail_page(detail_task.target_url, html)
+            if not str(parsed.get("content") or "").strip() or not any(marker in html for marker in ("chat__block", 'class="detailed"')):
+                raise CollectionFailure("parse", "lynx detail has no recognized publication content")
+            detail, parsed_html = parsed, html
+            return True
+        metadata = dict(detail_task.metadata)
+        metadata.pop("artifact_error", None)
         html, screenshot_png = fetch_page_artifacts(
             url=detail_task.target_url,
             mode=config.detail_fetch_mode,
             timeout_seconds=config.fetch_timeout_seconds,
             render_wait_seconds=config.render_wait_seconds,
             screenshot_selectors=selectors,
+            validate_html=validate,
+            on_artifact_error=lambda message: metadata.update(artifact_error=message),
         )
-        raise_if_error_page(html)
-        detail = parse_lynx_detail_page(detail_task.target_url, html)
-        if not str(detail.get("content") or "").strip() or not any(marker in html for marker in ("chat__block", 'class="detailed"')):
-            raise CollectionFailure("parse", "lynx detail has no recognized publication content")
+        validate(html)
         detail["artifact_stem"] = detail_task.metadata.get("artifact_stem") or ""
+        if not screenshot_png:
+            metadata.setdefault("artifact_error", "artifact: victim evidence capture produced no image")
+            detail["_collector_artifact_error"] = metadata["artifact_error"]
         return DetailResult(
             site_name=self.site_name, target_url=detail_task.target_url, payload=detail,
-            raw_html=html, screenshot_png=screenshot_png, metadata=detail_task.metadata,
+            raw_html=html, screenshot_png=screenshot_png, metadata=metadata,
         )
 
     def persist(
@@ -196,7 +218,6 @@ class LynxAdapter(SiteAdapter):
         # Persist detail results
         if detail_results:
             details_dir = config.output_dir / "details"
-            details_dir.mkdir(parents=True, exist_ok=True)
 
             with (nullcontext(connection) if connection is not None else get_db_connection()) as detail_connection:
                 for detail_result in detail_results:
@@ -209,14 +230,7 @@ class LynxAdapter(SiteAdapter):
                     )
                     detail_result.payload["artifact_stem"] = artifact_stem
 
-                    # Save raw HTML
-                    if detail_result.raw_html is not None:
-                        dump_text(details_dir / f"{artifact_stem}.html", detail_result.raw_html)
-                    if detail_result.screenshot_png is not None:
-                        (details_dir / f"{artifact_stem}.png").write_bytes(detail_result.screenshot_png)
-
-                    # Save parsed JSON
-                    dump_json(details_dir / f"{artifact_stem}.json", {**detail_result.payload, "_collector_artifacts_complete": detail_result.screenshot_png is not None})
+                    persist_detail_artifacts(detail_connection, config, detail_result, details_dir, artifact_stem)
 
                     # Record in database
                     record_victim_detail(

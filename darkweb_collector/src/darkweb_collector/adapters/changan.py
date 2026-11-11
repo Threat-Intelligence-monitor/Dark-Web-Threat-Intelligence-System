@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from darkweb_collector.detail_artifacts import detail_artifact_paths, persist_detail_artifacts
+
 from contextlib import nullcontext
 from html import escape
 import hashlib
@@ -231,11 +233,15 @@ class ChanganAdapter(SiteAdapter):
                 detail_snapshot = get_forum_detail_snapshot(connection, self.site_name, SECTION, topic_url)
                 stem = _artifact_stem(topic_url)
                 detail_dir = config.output_dir / SECTION / "details"
-                artifacts_ready = detail_artifacts_complete(detail_dir, stem)
+                stored_payload = (detail_snapshot or {}).get("artifact_payload", (detail_snapshot or {}).get("raw_json"))
+                paths = detail_artifact_paths(config.output_dir, detail_dir, stem, stored_payload,
+                                              site_name=self.site_name, target_url=topic_url, forum=True)
+                artifacts_ready = detail_artifacts_complete(detail_dir, stem, stored_payload,
+                    root=config.output_dir, site_name=self.site_name, target_url=topic_url, forum=True, source_version=str(topic["content_hash"]))
                 if artifacts_ready:
                     artifacts_ready = _stored_capture_is_complete(
-                        detail_dir / f"{stem}.html",
-                        detail_dir / f"{stem}.json",
+                        paths["html"],
+                        paths["json"],
                     )
                 unchanged = topic_snapshot is not None and topic_snapshot["content_hash"] == topic["content_hash"]
                 if unchanged and detail_snapshot is not None and artifacts_ready:
@@ -290,10 +296,11 @@ class ChanganAdapter(SiteAdapter):
                 hide_selectors=("header", ".header", ".sidebar", ".nav"),
                 storage_state_path=storage_state_path,
                 capture_ready_script=_capture_ready_script(bool(detail.get("attachments"))),
+                on_artifact_error=lambda message: metadata.update(artifact_error=message),
             )
             raise_if_error_page(rendered_html)
             if not screenshot_png:
-                raise CollectionFailure("artifact", "changan detail evidence capture produced no image")
+                raise CollectionFailure("artifact", metadata.get("artifact_error") or "changan detail evidence capture produced no image")
             if "product-detail-info" not in rendered_html:
                 raise CollectionFailure("artifact", "changan detail evidence has no recognized product content")
             raw_html = rendered_html
@@ -345,20 +352,16 @@ class ChanganAdapter(SiteAdapter):
 
         if detail_results:
             detail_dir = config.output_dir / SECTION / "details"
-            detail_dir.mkdir(parents=True, exist_ok=True)
             with (nullcontext(connection) if connection is not None else get_db_connection()) as detail_connection:
                 for result in detail_results:
                     stem = str(result.metadata.get("artifact_stem") or _artifact_stem(result.target_url))
-                    if result.raw_html is not None:
-                        dump_text(detail_dir / f"{stem}.html", result.raw_html)
-                    if result.screenshot_png is not None:
-                        (detail_dir / f"{stem}.png").write_bytes(result.screenshot_png)
-                    dump_json(detail_dir / f"{stem}.json", {**result.payload, "_collector_artifacts_complete": result.screenshot_png is not None})
+                    artifacts = persist_detail_artifacts(detail_connection, config, result, detail_dir, stem, section=SECTION)
                     upsert_forum_detail(
                         detail_connection,
                         site_name=self.site_name,
                         section=SECTION,
                         topic_url=result.target_url,
+                        artifact_refs=artifacts,
                         content=result.payload.get("content", ""),
                         authors=result.payload.get("author", ""),
                         timestamps=result.payload.get("timestamp", ""),

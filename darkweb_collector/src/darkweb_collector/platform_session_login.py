@@ -21,12 +21,14 @@ def build_parser() -> ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     from playwright.sync_api import sync_playwright
+    from darkweb_collector.browser_temp import ensure_browser_temp
 
     user_data_dir = Path(args.user_data_dir).expanduser().resolve()
     storage_state_path = Path(args.storage_state).expanduser().resolve()
     user_data_dir.mkdir(parents=True, exist_ok=True)
     storage_state_path.parent.mkdir(parents=True, exist_ok=True)
 
+    ensure_browser_temp()
     with sync_playwright() as playwright:  # pragma: no cover - interactive flow
         browser = None
         last_error = None

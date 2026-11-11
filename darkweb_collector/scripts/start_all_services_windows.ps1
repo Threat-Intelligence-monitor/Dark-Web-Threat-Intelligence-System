@@ -80,6 +80,7 @@ $BrowserConcurrency = $BrowserPublicConcurrency + $BrowserOnionConcurrency
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CollectorRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $ProjectRoot = (Resolve-Path (Join-Path $CollectorRoot "..")).Path
+$ControllerProjectRoot = $ProjectRoot
 if ($ServiceRoot) {
     if (-not [IO.Path]::IsPathRooted($ServiceRoot) -or $ServiceRoot.StartsWith("\\")) {
         throw "ServiceRoot must be an absolute local release directory."
@@ -501,6 +502,15 @@ function Assert-DataRootCapacity {
     }
     if ($drive.AvailableFreeSpace -lt 20GB) {
         Write-Warn "Data root has only $([Math]::Round($drive.AvailableFreeSpace / 1GB, 2)) GiB free: $DefaultUserDataDir"
+    }
+}
+
+function Assert-UpdateStateCapacity {
+    foreach ($path in @($ControlRoot, $UpdateStateRoot) | Select-Object -Unique) {
+        $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($path))
+        if ($drive.AvailableFreeSpace -lt 64MB) {
+            Stop-WithError "Update state directory $path has only $($drive.AvailableFreeSpace) bytes free; at least 64 MiB is required to preserve update status and logs. Free space before retrying."
+        }
     }
 }
 
@@ -2253,6 +2263,7 @@ function Test-ProjectManagedCommandLine {
         "crawl.py",
         "darkweb_collector.celery_app",
         "darkweb_collector.worker_supervisor",
+        "prepare_legacy_artifacts.py",
         "celery",
         "node_modules\.bin",
         "vite\bin\vite.js",
@@ -3028,41 +3039,28 @@ function Ensure-CollectorDependencies {
 
 function Test-PlaywrightBrowsers {
     param([switch]$FilesOnly)
+    $script:PlaywrightRuntimeError = 'Playwright browser validation failed.'
+    if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+        $script:PlaywrightRuntimeError = 'Playwright browser validation failed: Python executable is unavailable.'
+        return $false
+    }
+    $previousErrorAction = $ErrorActionPreference
     try {
-        $code = @"
-from importlib.metadata import version
-from pathlib import Path
-import sys
-from pip._vendor.packaging.version import Version
-from playwright.sync_api import sync_playwright
-
-if Version(version('playwright')) < Version('1.49'):
-    raise SystemExit(1)
-
-with sync_playwright() as playwright:
-    modes = ((playwright.chromium, {}),
-             (playwright.chromium, {'channel': 'chromium'}),
-             (playwright.firefox, {}))
-    for browser_type, launch_options in modes:
-        if not Path(browser_type.executable_path).exists():
-            raise SystemExit(1)
-        if sys.argv[1] != 'files':
-            browser = browser_type.launch(headless=True, **launch_options)
-            try:
-                page = browser.new_page()
-                page.set_content('<title>DWTI runtime check</title><p>ready</p>',
-                                 wait_until='domcontentloaded', timeout=5000)
-                if page.title() != 'DWTI runtime check':
-                    raise SystemExit(1)
-            finally:
-                browser.close()
-"@
-        & $VenvPython -B -c $code $(if ($FilesOnly) { "files" } else { "launch" }) *> $null
-        return ($LASTEXITCODE -eq 0)
+        # PowerShell 5.1 otherwise treats native stderr warnings as terminating
+        # errors even when the Python process exits successfully.
+        $ErrorActionPreference = 'Continue'
+        $arguments = @('-B', $DependencyHelper, 'verify-browsers')
+        if ($FilesOnly) { $arguments += '--files-only' }
+        $diagnostic = & $VenvPython @arguments 2>&1
+        if ($LASTEXITCODE -eq 0) { $script:PlaywrightRuntimeError = ''; return $true }
+        $reason = @($diagnostic | Where-Object { $_.ToString() -like 'Playwright browser validation failed*' } | Select-Object -Last 1)
+        if ($reason.Count) { $script:PlaywrightRuntimeError = $reason[0].ToString() }
+        return $false
     }
     catch {
         return $false
     }
+    finally { $ErrorActionPreference = $previousErrorAction }
 }
 
 function Ensure-PlaywrightRuntime {
@@ -3070,8 +3068,9 @@ function Ensure-PlaywrightRuntime {
         Write-Info "Reusing verified shared Playwright browsers"
         return
     }
+    $launchFailure = $script:PlaywrightRuntimeError
     if (Test-PlaywrightBrowsers -FilesOnly) {
-        Stop-WithError "Existing Playwright browser files cannot launch; preserving them without downloading replacements."
+        Stop-WithError "Existing Playwright browser files cannot launch; preserving them without downloading replacements. $launchFailure"
     }
     Write-Info "Installing Playwright browser runtimes"
     $previousGc = [Environment]::GetEnvironmentVariable("PLAYWRIGHT_SKIP_BROWSER_GC", "Process")
@@ -3085,7 +3084,7 @@ function Ensure-PlaywrightRuntime {
         else { $env:PLAYWRIGHT_SKIP_BROWSER_GC = $previousGc }
     }
     if (-not (Test-PlaywrightBrowsers)) {
-        Stop-WithError "Playwright browsers were installed but cannot launch. Check the local browser runtime dependencies."
+        Stop-WithError "Playwright browsers were installed but cannot launch. $script:PlaywrightRuntimeError"
     }
 }
 
@@ -3442,6 +3441,7 @@ function Ensure-PostgreSqlMigrationTarget {
 }
 
 function Ensure-Environment {
+    Invoke-TimedStep "Assert-UpdateStateCapacity" { Assert-UpdateStateCapacity }
     Invoke-TimedStep "Assert-DataRootCapacity" { Assert-DataRootCapacity }
     Invoke-TimedStep "Ensure-PythonRuntime" { Ensure-PythonRuntime | Out-Null }
     Invoke-TimedStep "Ensure-NodeRuntime" { Ensure-NodeRuntime | Out-Null }
@@ -3473,6 +3473,9 @@ function Ensure-Environment {
 }
 
 function Prepare-UpdateEnvironment {
+    Assert-ArtifactReferenceRuntime
+    Invoke-TimedStep "Assert-UpdateStateCapacity" { Assert-UpdateStateCapacity }
+    Invoke-TimedStep "Assert-DataRootCapacity" { Assert-DataRootCapacity }
     if (-not (Test-Path -LiteralPath (Join-Path $CollectorRoot "scripts\serve_api.py") -PathType Leaf)) {
         Stop-WithError "API launcher not found under collector scripts."
     }
@@ -3505,7 +3508,67 @@ function Assert-DarkwebHealth {
     Write-Info "Darkweb services passed the strict health check"
 }
 
+function Assert-ArtifactReferenceRuntime {
+    $version = Get-Content -LiteralPath (Join-Path $ControllerProjectRoot 'version.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $format = $version.PSObject.Properties['artifact_reference_format']
+    if (-not $format -or [int]$format.Value -lt 1) { return }
+    foreach ($relative in @('darkweb_collector\src\darkweb_collector\detail_artifacts.py',
+                            'darkweb_collector\scripts\prepare_legacy_artifacts.py')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $ControllerProjectRoot $relative) -PathType Leaf)) {
+            Stop-WithError 'The update is missing its evidence compatibility runtime; existing services were preserved.'
+        }
+    }
+}
+
+function Prepare-LegacyArtifactViews {
+    if (-not $ServiceRoot -or (Test-SamePath -Left $ControllerProjectRoot -Right $ProjectRoot)) { return }
+    $targetVersion = Get-Content -LiteralPath (Join-Path $ProjectRoot 'version.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $formatProperty = $targetVersion.PSObject.Properties['artifact_reference_format']
+    if ($formatProperty -and [int]$formatProperty.Value -ge 1) { return }
+
+    # The old updater already invokes this new controller for rollback. Prepare
+    # its file view only after both releases have stopped, before starting apps.
+    $processRows = @(Get-ProcessRows)
+    $processRowMap = New-ProcessRowMap -ProcessRows $processRows
+    $garnetIds = @(Get-ManagedGarnetProcesses | ForEach-Object { $_.Id })
+    $serviceProjectRoot = $script:ProjectRoot
+    try {
+        foreach ($root in @($ControllerProjectRoot, $serviceProjectRoot) | Select-Object -Unique) {
+            $script:ProjectRoot = $root
+            $remaining = @(Get-ProjectManagedProcessRows -ProcessRows $processRows -ProcessRowMap $processRowMap |
+                Where-Object { [int]$_.ProcessId -notin $garnetIds })
+            if ($remaining.Count) {
+                Stop-WithError 'Application processes must stop before preparing legacy evidence views.'
+            }
+        }
+    }
+    finally {
+        $script:ProjectRoot = $serviceProjectRoot
+    }
+    $helper = Join-Path $ScriptDir 'prepare_legacy_artifacts.py'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        Stop-WithError 'The verified legacy evidence preparation helper is missing.'
+    }
+    $previousArtifactController = $env:DARKWEB_ARTIFACT_CONTROLLER_PID
+    $previousArtifactStarted = $env:DARKWEB_ARTIFACT_CONTROLLER_STARTED
+    try {
+        $epoch = [DateTime]::SpecifyKind([DateTime]'1970-01-01', [DateTimeKind]::Utc)
+        $env:DARKWEB_ARTIFACT_CONTROLLER_PID = [string]$PID
+        $birth = ((Get-Process -Id $PID).StartTime.ToUniversalTime() - $epoch).TotalSeconds
+        $env:DARKWEB_ARTIFACT_CONTROLLER_STARTED = $birth.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+        & $VenvPython -B $helper --target-root $ProjectRoot --quiesced
+        if ($LASTEXITCODE -ne 0) {
+            Stop-WithError 'Legacy evidence preparation failed; application services were not started and immutable evidence was retained.'
+        }
+    }
+    finally {
+        $env:DARKWEB_ARTIFACT_CONTROLLER_PID = $previousArtifactController
+        $env:DARKWEB_ARTIFACT_CONTROLLER_STARTED = $previousArtifactStarted
+    }
+}
+
 function Start-Services {
+    Assert-ArtifactReferenceRuntime
     if (Test-DarkwebStackReady) {
         Write-Info "Services already running"
         Write-Info "Frontend: $FrontendUrl"
@@ -3520,6 +3583,8 @@ function Start-Services {
         Write-Warn "Existing $SessionName services are running; stopping them first"
         Stop-Services -PreserveGarnet
     }
+
+    Prepare-LegacyArtifactViews
 
     # A previous run may have lost its PID file, or another dev server may
     # still occupy the fixed ports used by Vite's proxy. Clear those ports

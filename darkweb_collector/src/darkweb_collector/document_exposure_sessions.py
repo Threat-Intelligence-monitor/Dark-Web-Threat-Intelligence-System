@@ -588,6 +588,8 @@ def verify_platform_session(platform_name: str) -> dict[str, Any]:
     current_url = verification_url
     last_error = ""
     valid = False
+    from darkweb_collector.browser_temp import ensure_browser_temp
+    ensure_browser_temp()
     with sync_playwright() as playwright:  # pragma: no cover - browser runtime
         launch_kwargs: dict[str, Any] = {"headless": True}
         if is_onion_url(verification_url):

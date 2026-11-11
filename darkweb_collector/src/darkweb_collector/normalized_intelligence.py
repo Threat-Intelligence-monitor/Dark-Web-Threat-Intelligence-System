@@ -30,6 +30,10 @@ except Exception:  # pragma: no cover - optional until dependencies are installe
 
 from darkweb_collector.config import get_site_config
 from darkweb_collector.detail_i18n import translate_event_title_cached
+from darkweb_collector.detail_artifacts import (
+    detail_artifact_paths, display_artifact_path, forum_artifact_payload, native_artifact_path,
+    referenced_artifact_resources, victim_artifact_payload,
+)
 from darkweb_collector.db import (
     list_document_hit_snapshots,
     list_document_hits,
@@ -1558,11 +1562,12 @@ def _site_output_dir(site_name: str) -> Path | None:
 
 
 def _public_output_url(path: Path) -> str:
-    root = output_root()
+    path = display_artifact_path(path.resolve())
+    root = display_artifact_path(output_root().resolve())
     try:
-        relative_path = path.resolve().relative_to(root.resolve())
+        relative_path = path.relative_to(root)
     except ValueError:
-        return path.resolve().as_uri()
+        return path.as_uri()
     return f"/collector-output/{relative_path.as_posix()}"
 
 
@@ -1587,34 +1592,40 @@ def _resolve_artifact_resources(
     fallback_tokens: list[str],
     *,
     allow_fuzzy: bool = True,
+    raw_payload=None,
+    output_dir: Path | None = None,
+    site_name: str = "",
+    target_url: str = "",
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    resources: list[dict[str, str]] = []
-    screenshots: list[dict[str, str]] = []
-    seen_files: set[Path] = set()
-
-    def add_if_exists(path: Path, label: str, bucket: list[dict[str, str]]) -> None:
-        if path.exists() and path not in seen_files:
-            seen_files.add(path)
-            bucket.append(_resource_entry(path, label))
+    def verified(stem):
+        paths = detail_artifact_paths(output_dir or details_dir, details_dir, stem, raw_payload,
+                                      site_name=site_name, target_url=target_url, forum=False)
+        resources = [_resource_entry(paths[key], label) for key, label in
+                     (("html", "本地HTML镜像"), ("json", "本地JSON镜像")) if key in paths]
+        screenshots = [_resource_entry(paths["png"], "详情截图")] if "png" in paths else []
+        return resources, screenshots
 
     for stem in stems:
-        add_if_exists(details_dir / f"{stem}.html", "本地HTML镜像", resources)
-        add_if_exists(details_dir / f"{stem}.json", "本地JSON镜像", resources)
-        add_if_exists(details_dir / f"{stem}.png", "详情截图", screenshots)
+        resources, screenshots = verified(stem)
+        if resources or screenshots:
+            return resources, screenshots
 
-    if allow_fuzzy and (not screenshots or not resources):
+    if allow_fuzzy:
+        inspected: set[Path] = set()
         for token in fallback_tokens:
             safe_token = safe_stem(token)
             if not safe_token:
                 continue
-            for path in details_dir.glob(f"*{safe_token}*.html"):
-                add_if_exists(path, "本地HTML镜像", resources)
             for path in details_dir.glob(f"*{safe_token}*.json"):
-                add_if_exists(path, "本地JSON镜像", resources)
-            for path in details_dir.glob(f"*{safe_token}*.png"):
-                add_if_exists(path, "详情截图", screenshots)
-
-    return resources, screenshots
+                if path in inspected:
+                    continue
+                if len(inspected) >= 100:
+                    return [], []
+                inspected.add(path)
+                resources, screenshots = verified(path.stem)
+                if resources or screenshots:
+                    return resources, screenshots
+    return [], []
 
 
 def _forum_output_resources(row_dict: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -1623,14 +1634,11 @@ def _forum_output_resources(row_dict: dict[str, Any]) -> tuple[list[dict[str, st
     if output_dir is None or not topic_url:
         return [], []
     section = _normalize_label(row_dict.get("section")) or "section"
-    detail_dir = output_dir / section / "details"
+    detail_dir = native_artifact_path(output_dir / section / "details")
     artifact_stem = _event_hash(topic_url)[:10]
-    return _resolve_artifact_resources(
-        detail_dir,
-        [artifact_stem],
-        [artifact_stem, _clean_display_subject(row_dict.get("title")), topic_url.rsplit("/", 1)[-1]],
-        allow_fuzzy=False,
-    )
+    return referenced_artifact_resources(output_dir, detail_dir, artifact_stem, forum_artifact_payload(row_dict),
+        site_name=str(row_dict.get("site_name") or ""), target_url=topic_url, forum=True,
+        resource_entry=_resource_entry, include_legacy=True)
 
 
 def _victim_output_resources(
@@ -1642,7 +1650,7 @@ def _victim_output_resources(
     output_dir = _site_output_dir(site_name)
     if output_dir is None:
         return [], []
-    detail_raw_json = detail_raw_json or {}
+    detail_raw_json = victim_artifact_payload(row_dict, detail_raw_json or {})
     content_hash = str(raw_json.get("content_hash") or row_dict.get("content_hash") or "")
     detail_content_hash = str(detail_raw_json.get("content_hash") or "")
     domain = str(raw_json.get("domain") or row_dict.get("domain") or "")
@@ -1652,7 +1660,11 @@ def _victim_output_resources(
     detail_url = str(raw_json.get("detail_url") or row_dict.get("detail_url") or "")
     detail_slug = detail_url.rstrip("/").rsplit("/", 1)[-1] if detail_url else ""
     artifact_stem = str(detail_raw_json.get("artifact_stem") or raw_json.get("artifact_stem") or "").strip()
-    detail_dir = output_dir / "details"
+    detail_dir = native_artifact_path(output_dir / "details")
+    referenced = referenced_artifact_resources(output_dir, detail_dir, artifact_stem, detail_raw_json,
+        site_name=site_name, target_url=detail_url, forum=False, resource_entry=_resource_entry)
+    if referenced is not None:
+        return referenced
     stems = _artifact_candidate_stems(
         artifact_stem,
         safe_stem(f"{content_hash[:10]}_{name[:30]}"),
@@ -1681,6 +1693,7 @@ def _victim_output_resources(
             [stem],
             [],
             allow_fuzzy=False,
+            raw_payload=detail_raw_json, output_dir=output_dir, site_name=site_name, target_url=detail_url,
         )
         if resources and screenshots:
             return resources, screenshots
@@ -1693,6 +1706,7 @@ def _victim_output_resources(
         detail_dir,
         stems,
         [item for item in fallback_tokens if item],
+        raw_payload=detail_raw_json, output_dir=output_dir, site_name=site_name, target_url=detail_url,
         allow_fuzzy=False,
     )
 
@@ -2040,7 +2054,7 @@ def _load_normalized_rows_without_refresh(connection) -> list[dict[str, Any]]:
 def _forum_rows(connection) -> Iterator[dict[str, Any]]:
     return _normalization_rows(connection,
         """
-        SELECT d.id, d.site_name, d.section, d.topic_url, d.content, d.attachments,
+        SELECT d.id, d.site_name, d.section, d.topic_url, d.content_hash, d.content, d.attachments,
                d.victims, d.attackers, d.timestamps, d.fetched_at, d.raw_json,
                COALESCE(t.title, d.topic_url) AS title,
                GROUP_CONCAT(fv.victim_name, '||') AS victim_names,
@@ -2063,7 +2077,7 @@ def _victim_rows(connection) -> Iterator[dict[str, Any]]:
         """
         SELECT v.id, v.site_name, v.source_url, v.detail_url, v.name, v.display_label, v.domain,
                v.status, v.published_at_utc, v.claimed_size, v.claimed_size_gb, v.content_hash,
-               v.raw_json, vd.text_excerpt, vd.page_title, vd.fetched_at_utc,
+               v.raw_json, vd.text_excerpt, vd.page_title, vd.outbound_link_count, vd.fetched_at_utc,
                cr.collected_at_utc AS last_seen_at_utc, vd.raw_json AS detail_raw_json
         FROM victims v
         LEFT JOIN collection_runs cr ON cr.id = v.last_seen_run_id
@@ -2106,7 +2120,7 @@ def _build_forum_base_event(row: dict[str, Any], domain_cache: dict[str, Any] | 
     title = _normalize_label(row.get("title")) or _normalize_label(row.get("topic_url")) or "未命名论坛帖子"
     content = _normalize_whitespace(row.get("content"))
     topic_url = _normalize_label(row.get("topic_url"))
-    raw_json = _parse_json(row.get("raw_json"))
+    raw_json = forum_artifact_payload(row)
     disclosure_time = (
         raw_json.get("published_at_utc")
         or _normalize_forum_timestamp(
@@ -2187,6 +2201,7 @@ def _build_forum_base_event(row: dict[str, Any], domain_cache: dict[str, Any] | 
         mirror_resources.append({"label": "原始披露链接", "url": topic_url})
     event = {
         "event_id": f"forum:{row['site_name']}:{row['section']}:{_event_hash(topic_url)}",
+        "_artifact_snapshot": True,
         "source_kind": "forum",
         "raw_source_type": "forum_details",
         "source_site_name": str(row.get("site_name") or ""),
@@ -2264,7 +2279,7 @@ def _pick_victim_from_row(row: dict[str, Any], raw_json: dict[str, Any]) -> tupl
 
 def _build_victim_base_event(row: dict[str, Any], domain_cache: dict[str, Any] | None = None) -> dict[str, Any]:
     raw_json = _parse_json(row.get("raw_json"))
-    detail_raw_json = _parse_json(row.get("detail_raw_json"))
+    detail_raw_json = victim_artifact_payload(row)
     victim, victim_key = _pick_victim_from_row(row, raw_json)
     attacker = _label_source(row.get("site_name"))
     status = _normalize_label(row.get("status") or raw_json.get("status") or "unknown").lower()
@@ -2331,6 +2346,7 @@ def _build_victim_base_event(row: dict[str, Any], domain_cache: dict[str, Any] |
         disclosure_time = row.get("fetched_at_utc") or last_seen_at
     event = {
         "event_id": f"victim:{row['site_name']}:{_event_hash(str(detail_url or victim))}",
+        "_artifact_snapshot": True,
         "source_kind": "victim",
         "raw_source_type": "victims",
         "source_site_name": str(row.get("site_name") or ""),
@@ -3104,6 +3120,7 @@ def _merge_duplicate_events(existing: dict[str, Any], current: dict[str, Any]) -
 
     primary = current if prefer_current else existing
     secondary = existing if prefer_current else current
+    snapshot = bool(primary.get("_artifact_snapshot")) and primary.get("event_type") != "vulnerability"
 
     if primary.get("event_type") == "vulnerability":
         merged_mirror_resources = _merge_unique_resources(existing.get("mirror_resources") or [], current.get("mirror_resources") or [])
@@ -3111,6 +3128,9 @@ def _merge_duplicate_events(existing: dict[str, Any], current: dict[str, Any]) -
             existing.get("screenshot_resources") or [],
             current.get("screenshot_resources") or [],
         )
+    elif snapshot:
+        merged_mirror_resources = primary.get("mirror_resources") or []
+        merged_screenshot_resources = primary.get("screenshot_resources") or []
     else:
         merged_mirror_resources = primary.get("mirror_resources") or secondary.get("mirror_resources") or []
         merged_screenshot_resources = primary.get("screenshot_resources") or secondary.get("screenshot_resources") or []
@@ -3121,9 +3141,17 @@ def _merge_duplicate_events(existing: dict[str, Any], current: dict[str, Any]) -
     }
     merged["mirror_resources"] = merged_mirror_resources
     merged["screenshot_resources"] = merged_screenshot_resources
-    merged["detail_text"] = primary.get("detail_text") or secondary.get("detail_text") or ""
-    merged["json_preview_url"] = primary.get("json_preview_url") or secondary.get("json_preview_url") or ""
+    merged["detail_text"] = primary.get("detail_text") or ("" if snapshot else secondary.get("detail_text")) or ""
+    merged["json_preview_url"] = primary.get("json_preview_url") or ("" if snapshot else secondary.get("json_preview_url")) or ""
+    if not snapshot:
+        merged.pop("_artifact_snapshot", None)
     merged["metadata"] = _merge_event_metadata(existing, current, mirror_resources=merged_mirror_resources)
+    if snapshot:
+        for key in ("section", "raw_json", "updated_time", "content_access"):
+            if key in (primary.get("metadata") or {}):
+                merged["metadata"][key] = primary["metadata"][key]
+            else:
+                merged["metadata"].pop(key, None)
     merged["severity"] = max(
         (existing.get("severity"), current.get("severity")),
         key=lambda value: SEVERITY_ORDER.get(str(value or "").lower(), 0),
@@ -3254,8 +3282,13 @@ def _normalized_spool_rows(spool, updated_at, *, new_only=False):
             LEFT JOIN previous_resources p ON p.event_id = f.event_id {where}
             ORDER BY f.report_time DESC, f.event_id DESC'''):
         event = json.loads(row['payload'])
-        mirror_resources = _merge_unique_resources(_coerce_resource_list(_parse_json(row['mirrors'])), event.get('mirror_resources') or [])
-        screenshot_resources = _merge_unique_resources(_coerce_resource_list(_parse_json(row['screenshots'])), event.get('screenshot_resources') or [])
+        snapshot = bool(event.get('_artifact_snapshot')) and event.get('event_type') != 'vulnerability'
+        if snapshot:
+            mirror_resources = event.get('mirror_resources') or []
+            screenshot_resources = event.get('screenshot_resources') or []
+        else:
+            mirror_resources = _merge_unique_resources(_coerce_resource_list(_parse_json(row['mirrors'])), event.get('mirror_resources') or [])
+            screenshot_resources = _merge_unique_resources(_coerce_resource_list(_parse_json(row['screenshots'])), event.get('screenshot_resources') or [])
         metadata_payload = {
             **event['metadata'], 'country': event.get('country') or '未知', 'country_code': event.get('country_code') or '',
             'macro_region': event.get('region') or '未知', 'confidence_score': int(event.get('confidence_score') or 0),
@@ -3266,7 +3299,7 @@ def _normalized_spool_rows(spool, updated_at, *, new_only=False):
             'risk_score': int(event['risk_score']), 'disclosure_time': event.get('disclosure_time') or '',
             'source_url': event.get('source_url') or '', 'detail_text': event.get('detail_text') or '',
             'mirror_resources_json': _json_dumps(mirror_resources), 'screenshot_resources_json': _json_dumps(screenshot_resources),
-            'json_preview_url': str(event.get('json_preview_url') or row['preview'] or ''),
+            'json_preview_url': str(event.get('json_preview_url') or ('' if snapshot else row['preview']) or ''),
             'risk_reasons_json': _json_dumps(event['metadata'].get('risk_reasons') or []),
             'event_metadata_json': _json_dumps(metadata_payload), 'updated_at': updated_at}
 
@@ -3436,6 +3469,7 @@ def normalized_event_to_detail(event: dict[str, Any]) -> dict[str, Any]:
                 "section": metadata.get("section"),
                 "topic_url": event.get("source_url"),
                 "title": event.get("title"),
+                "raw_json": metadata.get("raw_json"),
             }
         )
         mirror_resources = _merge_unique_resources(mirror_resources, local_mirror_resources)
