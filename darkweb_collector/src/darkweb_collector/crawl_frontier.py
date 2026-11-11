@@ -117,8 +117,16 @@ def observe_frontier(connection, site_name: str, detail_tasks: Iterable[DetailTa
         fetched_version = str(task.metadata.get("frontier_fetched_version") or "")
         artifacts_complete = int(bool(fetched_version and task.metadata.get("frontier_artifacts_complete", True)))
         status = "done" if fetched_version == source_version and artifacts_complete else "pending"
+        repair_evidence = """crawl_frontier.status = 'done'
+            AND excluded.observed_version = crawl_frontier.observed_version
+            AND excluded.observed_version = crawl_frontier.fetched_version
+            AND excluded.fetched_version = crawl_frontier.fetched_version
+            AND excluded.artifacts_complete = 0
+            AND crawl_frontier.lease_until <= excluded.updated_at
+            AND NOT EXISTS (SELECT 1 FROM crawl_detail_control c WHERE c.site_name = crawl_frontier.site_name
+                AND c.target_url = crawl_frontier.target_url AND c.owner_token <> '')"""
         connection.execute(
-            """
+            f"""
             INSERT INTO crawl_frontier (
                 site_name, target_url, section, discovery_lane, metadata_json,
                 observed_version, fetched_version, artifacts_complete, status,
@@ -132,9 +140,11 @@ def observe_frontier(connection, site_name: str, detail_tasks: Iterable[DetailTa
                 observed_version = excluded.observed_version,
                 observed_at = excluded.observed_at,
                 updated_at = excluded.updated_at,
+                artifacts_complete = CASE WHEN {repair_evidence} THEN 0 ELSE crawl_frontier.artifacts_complete END,
                 next_retry = CASE WHEN excluded.observed_version <> crawl_frontier.observed_version
                     THEN 0 ELSE crawl_frontier.next_retry END,
                 status = CASE
+                    WHEN {repair_evidence} THEN 'pending'
                     WHEN crawl_frontier.status = 'legacy_queued' THEN 'legacy_queued'
                     WHEN crawl_frontier.status = 'queued' AND (crawl_frontier.lease_until = 0
                         OR EXISTS (SELECT 1 FROM crawl_jobs j WHERE j.job_id = crawl_frontier.lease_token))

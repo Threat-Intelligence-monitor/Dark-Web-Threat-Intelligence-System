@@ -20,6 +20,9 @@ def recover_stopped_task(payload: dict, reason: str = "timeout") -> bool:
     if not job_id or not site_name or worker_alive(payload.get("worker_pid", 0), payload.get("worker_started", 0)):
         raise RuntimeError("cannot recover a task without confirmed stopped ownership")
     with get_db_connection() as connection:
+        if getattr(connection, "backend_name", "") == "postgresql":
+            connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            connection.execute("SET LOCAL lock_timeout = '10s'")
         job = connection.execute("SELECT site_name, target FROM crawl_jobs WHERE job_id = ?", (job_id,)).fetchone()
         if job and job["site_name"] != site_name:
             raise RuntimeError("stopped task site does not match the stored job")
@@ -31,13 +34,16 @@ def recover_stopped_task(payload: dict, reason: str = "timeout") -> bool:
                           owner["worker_started"] != float(payload["worker_started"])):
                 raise RuntimeError("stopped task worker identity does not match the stored owner")
             if owner:
-                error = CollectionFailure("timeout", "task exceeded its deadline" if reason == "timeout" else "collector process stopped")
+                error = (CollectionFailure("worker_lost", "task finalization could not be confirmed")
+                         if reason == "finalization" else CollectionFailure(
+                             "timeout", "task exceeded its deadline" if reason == "timeout" else "collector process stopped"))
                 retry_at = fail_detail(connection, site_name, job["target"], job_id, error)
                 fail_frontier(connection, site_name, job["target"], job_id,
                               retry_seconds=max(60, retry_at - time.time()), error_message=reason)
                 connection.execute("""UPDATE crawl_jobs SET status = 'failed', finished_at = ?, error_message = ?
                     WHERE job_id = ? AND status IN ('enqueued', 'running') AND finished_at IS NULL""",
-                    (utc_now_iso(), reason + ": collector process stopped", job_id))
+                    (utc_now_iso(), "worker_lost: task finalization could not be confirmed" if reason == "finalization"
+                     else reason + ": collector process stopped", job_id))
             connection.commit()
     if slot_owner:
         get_state_store(prefer_redis=True).release_detail_slot(site_name, slot_owner)

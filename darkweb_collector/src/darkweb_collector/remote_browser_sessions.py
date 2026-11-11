@@ -463,7 +463,9 @@ def _remote_browser_worker(session: RemoteBrowserSession, startup_queue: Queue) 
 
     try:
         from playwright.sync_api import sync_playwright
+        from darkweb_collector.browser_temp import ensure_browser_temp
 
+        ensure_browser_temp()
         playwright = sync_playwright().start()
         browser_env = _browser_child_environment()
         if session.display:

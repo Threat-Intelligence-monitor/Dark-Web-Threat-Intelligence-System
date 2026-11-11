@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import shutil
 import subprocess
-import traceback
 import time
 import os
 import tempfile
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlparse
 
-from darkweb_collector.collection_errors import CollectionFailure, managed_request, request_attempt, raise_if_error_page
+from darkweb_collector.collection_errors import CollectionFailure, managed_request, request_attempt, raise_if_error_page, safe_failure_text
 
 
 class TorFetchError(CollectionFailure):
@@ -248,6 +247,8 @@ def fetch_page_artifacts(
     screenshot_styles: str = "",
     render_html_for_screenshot: bool = False,
     cookie_header: str | None = None,
+    validate_html: Callable[[str], bool] | None = None,
+    on_artifact_error: Callable[[str], None] | None = None,
 ) -> tuple[str, bytes | None]:
     if mode == "browser":
         from darkweb_collector.browser_client import fetch_page_artifacts_with_browser
@@ -262,6 +263,8 @@ def fetch_page_artifacts(
             hide_selectors=hide_selectors,
             screenshot_styles=screenshot_styles,
             cookie_header=cookie_header,
+            validate_html=validate_html,
+            on_artifact_error=on_artifact_error,
         )
         return html, screenshot_png
 
@@ -273,6 +276,8 @@ def fetch_page_artifacts(
         retries=1,
         cookie_header=cookie_header,
     )
+    if validate_html is not None and validate_html(html) is False:
+        raise CollectionFailure("parse", "source detail did not pass content validation")
 
     try:
         if render_html_for_screenshot:
@@ -288,11 +293,12 @@ def fetch_page_artifacts(
                 screenshot_selectors=screenshot_selectors,
                 hide_selectors=hide_selectors,
                 screenshot_styles=screenshot_styles,
+                cookie_header=cookie_header,
             )
         else:
             from darkweb_collector.browser_client import fetch_page_artifacts_with_browser
 
-            _, screenshot_png = fetch_page_artifacts_with_browser(
+            rendered_html, screenshot_png = fetch_page_artifacts_with_browser(
                 url=url,
                 wait_seconds=render_wait_seconds,
                 timeout_seconds=timeout_seconds,
@@ -302,11 +308,19 @@ def fetch_page_artifacts(
                 hide_selectors=hide_selectors,
                 screenshot_styles=screenshot_styles,
                 cookie_header=cookie_header,
+                on_artifact_error=on_artifact_error,
             )
+            if validate_html is not None and validate_html(rendered_html) is False:
+                raise CollectionFailure("parse", "rendered detail did not pass content validation")
+            html = rendered_html
         return html, screenshot_png
     except Exception as exc:
-        print(f"[screenshot] failed for {url}: {type(exc).__name__}: {exc}")
-        traceback.print_exc()
+        if validate_html is not None and validate_html(html) is False:
+            raise CollectionFailure("parse", "stored source detail did not pass content validation") from exc
+        error = safe_failure_text(f"artifact: evidence capture failed ({type(exc).__name__}): {exc}")
+        if on_artifact_error is not None:
+            on_artifact_error(error)
+        print(f"[screenshot] {error}")
         return html, None
 
 

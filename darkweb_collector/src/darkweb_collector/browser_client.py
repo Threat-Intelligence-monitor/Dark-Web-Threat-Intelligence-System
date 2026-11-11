@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 import pickle
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import signal
 import struct
 import subprocess
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import urlparse
 
-from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt
+from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt, safe_failure_text
 from darkweb_collector.tor_fetch import raise_for_http_status
 from darkweb_collector.source_sessions import read_browser_session, persist_browser_session, same_source
 
@@ -188,11 +188,13 @@ class BrowserClient:
 
     def _open(self) -> None:
         from playwright.sync_api import sync_playwright
+        from darkweb_collector.browser_temp import ensure_browser_temp
 
         if self._proxy.engine not in {"chromium", "firefox"}:
             raise ValueError(f"unsupported browser engine: {self._proxy.engine}")
         started = time.monotonic()
         logger.info("capture phase=launch-start engine=%s", self._proxy.engine)
+        ensure_browser_temp()
         self._playwright_context = sync_playwright()
         try:
             self._playwright = self._playwright_context.start()
@@ -253,13 +255,18 @@ class BrowserClient:
         user_agent: str | None = None,
         validate_html: Callable[[str], bool] | None = None,
         capture_content_selector: str | None = None,
+        _request_attempt: Callable[[], None] | None = None,
+        _on_event: Callable[[str, object], None] | None = None,
+        _deadline: float | None = None,
     ) -> tuple[str, bytes | None]:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
         try:
             self._ensure_browser()
         except Exception as exc:
-            raise CollectionFailure("infrastructure", "browser runtime could not be started", scope="site") from exc
+            raise CollectionFailure("infrastructure", safe_failure_text(
+                f"browser runtime could not be started ({type(exc).__name__}): {exc}"
+            ), scope="site") from exc
         assert self._browser is not None
         storage_path = Path(storage_state_path).expanduser().resolve() if storage_state_path else None
         stored_state, session_revision, saved_agent = None, "", None
@@ -294,40 +301,74 @@ class BrowserClient:
         page = context.new_page()
         main_response = None
         main_request = None
-        limited_response = None
-        limited_headers = None
+        terminal_failure = None
         session_eligible = False
+        pending_session = None
+
+        def report(kind, value):
+            if _on_event is not None:
+                _on_event(kind, value)
+
+        def stop_source(failure):
+            nonlocal terminal_failure, session_eligible
+            if terminal_failure is None:
+                terminal_failure = failure
+                session_eligible = False
+                report("failure", failure)
 
         def remember_main_request(received):
             nonlocal main_request
             if received.is_navigation_request() and received.frame == page.main_frame:
                 main_request = received
-
-        def remember_main_response(received):
-            nonlocal main_response, limited_response, limited_headers, session_eligible
-            if received.request.is_navigation_request() and received.frame == page.main_frame:
-                main_response = received
-                if received.status == 429 and limited_response is None:
-                    limited_response, limited_headers = received, received.headers
-                    session_eligible = False
-                    # Stop automatic navigation/retries in this worker-owned
-                    # temporary page; keep the response headers for the caller.
+                report("navigation", None)
+                if time.monotonic() >= deadline:
+                    stop_source(CollectionFailure("timeout", "browser navigation rejected after the execution deadline"))
+                elif not same_source(url, received.url):
+                    stop_source(CollectionFailure("source_moved", "browser navigation left the configured source origin", scope="site"))
                     try:
-                        page.close()
+                        context.close()
                     except Exception:
                         pass
 
+        def remember_main_response(received):
+            nonlocal main_response
+            if received.request.is_navigation_request() and received.frame == page.main_frame:
+                main_response = received
+                if (received.status in {401, 429} or received.status == 403 and validated_html is not None) and terminal_failure is None:
+                    try:
+                        if not same_source(url, received.url):
+                            raise CollectionFailure("source_moved", "browser navigation left the configured source origin", scope="site")
+                        raise_for_http_status(received.status, headers=received.headers)
+                    except CollectionFailure as exc:
+                        stop_source(exc)
+                    # Closing the owned context cancels pending page waits.
+                    # Page.close() can wait for those operations to time out.
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+
+        def guard_request(route):
+            if route.request.is_navigation_request() and route.request.frame == page.main_frame:
+                if time.monotonic() >= deadline:
+                    stop_source(CollectionFailure("timeout", "browser navigation rejected after the execution deadline"))
+                elif not same_source(url, route.request.url):
+                    stop_source(CollectionFailure("source_moved", "browser navigation left the configured source origin", scope="site"))
+            if terminal_failure is not None or time.monotonic() >= deadline:
+                route.abort()
+            else:
+                route.continue_()
+
+        page.route("**/*", guard_request)
         page.on("request", remember_main_request)
         page.on("response", remember_main_response)
         selector_timeout_ms = min(timeout_seconds * 1000, 10_000)
-        deadline = time.monotonic() + timeout_seconds
+        deadline = _deadline if _deadline is not None else time.monotonic() + timeout_seconds
         validated_html = None
 
         def check_rate_limit():
-            if limited_response is not None:
-                if not same_source(url, limited_response.url):
-                    raise CollectionFailure("source_moved", "browser navigation left the configured source origin", scope="site")
-                raise_for_http_status(429, headers=limited_headers)
+            if terminal_failure is not None:
+                raise terminal_failure
 
         early_verification = self._proxy.engine == "chromium" and self._proxy.verification_provider == "dnsproxy"
 
@@ -384,7 +425,7 @@ class BrowserClient:
                 return verified_document(), screenshot
             except Exception as exc:
                 session_eligible = False
-                if isinstance(exc, CollectionFailure) and exc.kind == "rate_limited":
+                if isinstance(exc, CollectionFailure) and exc.kind in {"rate_limited", "auth_required", "blocked", "source_moved"}:
                     raise
                 if validated_html is None:
                     raise
@@ -395,14 +436,20 @@ class BrowserClient:
             # so waiting for networkidle adds a full timeout to otherwise loaded
             # pages. The configured render wait and selectors below handle the
             # dynamic content after DOM readiness.
-            request_attempt()
+            if time.monotonic() >= deadline:
+                raise CollectionFailure("timeout", "browser execution deadline exhausted before navigation")
+            (_request_attempt or request_attempt)()
             try:
                 response = page.goto(url, wait_until="commit" if early_verification else "domcontentloaded",
-                                     timeout=timeout_seconds * 1000)
-            except PlaywrightTimeoutError as exc:
-                raise CollectionFailure("timeout", "browser document navigation timed out") from exc
+                                     timeout=_remaining_timeout_ms(deadline, timeout_seconds * 1000))
+            except (PlaywrightTimeoutError, TimeoutError) as exc:
+                raise CollectionFailure("timeout", safe_failure_text(
+                    f"browser document navigation timed out ({type(exc).__name__}): {exc}"
+                )) from exc
             except Exception as exc:
-                raise CollectionFailure("network", "browser document navigation failed") from exc
+                raise CollectionFailure("network", safe_failure_text(
+                    f"browser document navigation failed ({type(exc).__name__}): {exc}"
+                )) from exc
             status = getattr(response, "status", 0)
             if status in {401, 429}:
                 raise_for_http_status(status, headers=getattr(response, "headers", None))
@@ -421,17 +468,20 @@ class BrowserClient:
             try:
                 _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)),
                                         wait_for_images=False, capture_content_selector=capture_content_selector)
-            except _CaptureScopeUnavailable:
+            except _CaptureScopeUnavailable as exc:
                 # A parser may still validate a legacy body layout; an unknown
                 # evidence scope must remain partial rather than become complete.
                 verified_document()
+                report("artifact_error", exc)
                 self._task_count += 1
                 return finish_capture(None)
             except CollectionFailure:
                 verified_document(validate_content=False)
                 raise
             except Exception as exc:
-                raise CollectionFailure("timeout", "browser content did not become ready within the request deadline") from exc
+                raise CollectionFailure("timeout", safe_failure_text(
+                    f"browser content did not become ready within the request deadline ({type(exc).__name__}): {exc}"
+                )) from exc
             verified_document()
             session_eligible = True
             try:
@@ -442,8 +492,9 @@ class BrowserClient:
                 if screenshot_styles:
                     page.add_style_tag(content=screenshot_styles)
                     page.wait_for_timeout(_remaining_timeout_ms(deadline, 500))
-            except Exception:
+            except Exception as exc:
                 session_eligible = False
+                report("artifact_error", exc)
                 self._task_count += 1
                 return finish_capture(None)
             if not capture_screenshot:
@@ -457,8 +508,9 @@ class BrowserClient:
                     capture_ready_script=capture_ready_script,
                     capture_content_selector=capture_content_selector,
                 )
-            except Exception:
+            except Exception as exc:
                 session_eligible = False
+                report("artifact_error", exc)
                 self._task_count += 1
                 return finish_capture(None)
             screenshot_png = None
@@ -493,8 +545,9 @@ class BrowserClient:
                                 "height": max_y - min_y,
                             },
                         )
-                except Exception:
+                except Exception as exc:
                     session_eligible = False
+                    report("artifact_error", exc)
                     screenshot_png = None
             elif screenshot_selector:
                 try:
@@ -506,8 +559,9 @@ class BrowserClient:
                             timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
                             animations="disabled",
                         )
-                except Exception:
+                except Exception as exc:
                     session_eligible = False
+                    report("artifact_error", exc)
                     screenshot_png = None
             if screenshot_png is None:
                 try:
@@ -517,8 +571,9 @@ class BrowserClient:
                         timeout=_remaining_timeout_ms(deadline, selector_timeout_ms),
                         animations="disabled",
                     )
-                except Exception:
+                except Exception as exc:
                     session_eligible = False
+                    report("artifact_error", exc)
                     screenshot_png = None
             # Capture HTML after the page-specific selectors have had a chance to
             # appear. Some forum pages finish rendering well after the initial
@@ -526,8 +581,11 @@ class BrowserClient:
             # head-only document while the screenshot already contained the post.
             self._task_count += 1
             return finish_capture(screenshot_png)
-        except Exception:
+        except Exception as exc:
+            session_eligible = False
             check_rate_limit()
+            if isinstance(exc, CollectionFailure):
+                stop_source(exc)
             raise
         finally:
             try:
@@ -537,16 +595,29 @@ class BrowserClient:
                         state = context.storage_state()
                         check_rate_limit()
                         if session_eligible:
-                            persist_browser_session(
-                                state, storage_path, url=page.url,
+                            pending_session = dict(
+                                state=state, path=storage_path, url=page.url,
                                 proxy_server=self._proxy.server, user_agent=user_agent,
                                 engine=self._proxy.engine, expected_revision=session_revision,
                             )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        if isinstance(exc, CollectionFailure) and exc.kind in {"rate_limited", "auth_required", "blocked", "source_moved"}:
+                            stop_source(exc)
+                            raise
                 check_rate_limit()
             finally:
+                logger.info("capture phase=context-close-start engine=%s", self._proxy.engine)
                 context.close()
+                logger.info("capture phase=context-close-done engine=%s", self._proxy.engine)
+                check_rate_limit()
+                if pending_session is not None:
+                    if _on_event is not None:
+                        report("session", pending_session)
+                    else:
+                        try:
+                            persist_browser_session(**pending_session)
+                        except Exception:
+                            pass
 
     def screenshot_html_content(
         self,
@@ -562,6 +633,7 @@ class BrowserClient:
         cookie_header: str | None = None,
         user_agent: str | None = None,
         capture_content_selector: str | None = None,
+        _deadline: float | None = None,
     ) -> bytes:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -610,8 +682,8 @@ class BrowserClient:
                 else:
                     route.continue_()
             page.route("**/*", render_document)
-            deadline = time.monotonic() + timeout_seconds
-            page.goto(base_url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+            deadline = _deadline if _deadline is not None else time.monotonic() + timeout_seconds
+            page.goto(base_url, wait_until="domcontentloaded", timeout=_remaining_timeout_ms(deadline, timeout_seconds * 1000))
             logger.info("capture phase=static-render-start engine=%s", self._proxy.engine)
             _wait_for_capture_ready(page, timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)),
                                     javascript_enabled=False, capture_content_selector=capture_content_selector)
@@ -832,28 +904,13 @@ def fetch_html_with_browser(
     capture_content_selector: str | None = None,
     verification_provider: str = "",
 ) -> str:
-    requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine, verification_provider=verification_provider)
-    try:
-        client = _get_or_create_client(requested_proxy)
-    except Exception as exc:
-        raise CollectionFailure("infrastructure", "browser runtime could not be started", scope="site") from exc
-    try:
-        html, _ = client.fetch_page_artifacts(
-            url=url,
-            wait_seconds=wait_seconds,
-            timeout_seconds=timeout_seconds,
-            capture_screenshot=False,
-            storage_state_path=storage_state_path,
-            persist_storage_state=persist_storage_state,
-            cookie_header=cookie_header,
-            user_agent=user_agent,
-            validate_html=validate_html,
-            capture_content_selector=capture_content_selector,
-        )
-        return html
-    except Exception:
-        close_browser_client()
-        raise
+    options = dict(url=url, wait_seconds=wait_seconds, timeout_seconds=timeout_seconds,
+                   capture_screenshot=False, proxy_server=proxy_server, browser_engine=browser_engine,
+                   verification_provider=verification_provider, storage_state_path=storage_state_path,
+                   persist_storage_state=persist_storage_state, cookie_header=cookie_header, user_agent=user_agent,
+                   capture_content_selector=capture_content_selector)
+    html, _ = _run_browser_request("fetch", options, validate_html=validate_html)
+    return html
 
 
 def fetch_page_artifacts_with_browser(
@@ -874,36 +931,16 @@ def fetch_page_artifacts_with_browser(
     validate_html: Callable[[str], bool] | None = None,
     capture_content_selector: str | None = None,
     verification_provider: str = "",
+    on_artifact_error: Callable[[str], None] | None = None,
 ) -> tuple[str, bytes | None]:
-    started = time.monotonic()
-    logger.info("capture phase=live-start engine=%s", browser_engine)
-    requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine, verification_provider=verification_provider)
-    try:
-        client = _get_or_create_client(requested_proxy)
-    except Exception as exc:
-        raise CollectionFailure("infrastructure", "browser runtime could not be started", scope="site") from exc
-    try:
-        return client.fetch_page_artifacts(
-            url=url,
-            wait_seconds=wait_seconds,
-            timeout_seconds=timeout_seconds,
-            screenshot_selector=screenshot_selector,
-            screenshot_selectors=screenshot_selectors,
-            hide_selectors=hide_selectors,
-            screenshot_styles=screenshot_styles,
-            storage_state_path=storage_state_path,
-            persist_storage_state=persist_storage_state,
-            capture_ready_script=capture_ready_script,
-            cookie_header=cookie_header,
-            user_agent=user_agent,
-            validate_html=validate_html,
-            capture_content_selector=capture_content_selector,
-        )
-    except Exception:
-        close_browser_client()
-        raise
-    finally:
-        logger.info("capture phase=live-end engine=%s elapsed=%.3f", browser_engine, time.monotonic() - started)
+    options = dict(url=url, wait_seconds=wait_seconds, timeout_seconds=timeout_seconds,
+                   proxy_server=proxy_server, browser_engine=browser_engine, verification_provider=verification_provider,
+                   screenshot_selector=screenshot_selector, screenshot_selectors=screenshot_selectors,
+                   hide_selectors=hide_selectors, screenshot_styles=screenshot_styles,
+                   storage_state_path=storage_state_path, persist_storage_state=persist_storage_state,
+                   capture_ready_script=capture_ready_script, cookie_header=cookie_header, user_agent=user_agent,
+                   capture_content_selector=capture_content_selector)
+    return _run_browser_request("fetch", options, validate_html=validate_html, on_artifact_error=on_artifact_error)
 
 
 def screenshot_html_with_browser(
@@ -922,8 +959,6 @@ def screenshot_html_with_browser(
     user_agent: str | None = None,
     capture_content_selector: str | None = None,
 ) -> bytes:
-    started = time.monotonic()
-    deadline = started + max(0.1, timeout_seconds)
     options = dict(
         html=html, base_url=base_url, wait_seconds=wait_seconds, timeout_seconds=timeout_seconds,
         proxy_server=proxy_server, browser_engine=browser_engine,
@@ -932,27 +967,42 @@ def screenshot_html_with_browser(
         storage_state_path=storage_state_path, cookie_header=cookie_header, user_agent=user_agent,
         capture_content_selector=capture_content_selector,
     )
-    logger.info("capture phase=static-start engine=%s", browser_engine)
+    return _run_browser_request("screenshot", options)
+
+
+def _run_browser_request(operation: str, options: dict, *, validate_html=None, on_artifact_error=None):
+    started = time.monotonic()
+    deadline = started + max(0.1, options["timeout_seconds"])
+    label = "static" if operation == "screenshot" else "live"
+    logger.info("capture phase=%s-start engine=%s", label, options["browser_engine"])
     thread_key = current_thread()
-    requested_proxy = BrowserProxyConfig(server=proxy_server, engine=browser_engine)
+    requested_proxy = BrowserProxyConfig(server=options.get("proxy_server"), engine=options["browser_engine"],
+                                        verification_provider=options.get("verification_provider", ""))
     with _GLOBAL_CLIENT_LOCK:
-        worker = _GLOBAL_STATIC_WORKERS.get(thread_key)
+        worker = _GLOBAL_BROWSER_WORKERS.get(thread_key)
     try:
         if worker is None or worker._closed or worker.proxy != requested_proxy or worker.process.poll() is not None:
             if worker is not None:
-                worker.close(graceful=True)
-            worker = _StaticCaptureWorker(requested_proxy)
+                worker.close(graceful=True, deadline=deadline + 3)
+            worker = _BrowserWorker(requested_proxy, cleanup_deadline=deadline + 3)
             with _GLOBAL_CLIENT_LOCK:
-                _GLOBAL_STATIC_WORKERS[thread_key] = worker
-        return worker.capture(options, deadline)
-    except Exception:
+                _GLOBAL_BROWSER_WORKERS[thread_key] = worker
+        return worker.capture({"operation": operation, "options": options}, deadline,
+                              validate_html=validate_html, on_artifact_error=on_artifact_error)
+    except Exception as exc:
         with _GLOBAL_CLIENT_LOCK:
-            _GLOBAL_STATIC_WORKERS.pop(thread_key, None)
+            _GLOBAL_BROWSER_WORKERS.pop(thread_key, None)
         if worker is not None:
-            worker.close()
+            worker.close(deadline=deadline + 3)
+        from darkweb_collector.forum_rate_limit import note_current_source_failure
+
+        note_current_source_failure(exc)
         raise
     finally:
-        logger.info("capture phase=static-end engine=%s elapsed=%.3f", browser_engine, time.monotonic() - started)
+        if worker is not None and worker._closed:
+            with _GLOBAL_CLIENT_LOCK:
+                _GLOBAL_BROWSER_WORKERS.pop(thread_key, None)
+        logger.info("capture phase=%s-end engine=%s elapsed=%.3f", label, options["browser_engine"], time.monotonic() - started)
 
 
 _CAPTURE_PACKET_LIMIT = 256 * 1024 * 1024
@@ -979,19 +1029,20 @@ def _read_capture_packet(stream):
     return pickle.loads(payload)
 
 
-class _StaticCaptureWorker:
-    """One serial screenshot process owned by its caller thread, with bounded IPC."""
+class _BrowserWorker:
+    """One serial browser process; business callbacks stay on the caller thread."""
 
-    def __init__(self, proxy: BrowserProxyConfig):
+    def __init__(self, proxy: BrowserProxyConfig, *, cleanup_deadline: float | None = None):
         self.proxy = proxy
         self.process, self.job, self.exchange_thread = None, None, None
+        self.reply_queue = None
         self._closed = False
         assigned = False
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH"))))
         # The private pipes connect only to this trusted child. HTML/cookies
         # never enter command arguments, logs, or temporary documents.
-        command = [sys.executable, "-c", "from darkweb_collector.browser_client import _screenshot_html_process; _screenshot_html_process()"]
+        command = [sys.executable, "-c", "from darkweb_collector.browser_client import _browser_process; _browser_process()"]
         try:
             if os.name == "nt":
                 from uuid import uuid4
@@ -1007,47 +1058,158 @@ class _StaticCaptureWorker:
         except Exception:
             if self.process is not None and not assigned:
                 self.process.kill()
-            self.close()
+            self.close(deadline=cleanup_deadline)
             raise
 
-    def capture(self, options: dict | None, deadline: float) -> bytes:
+    def capture(self, request: dict | None, deadline: float, *, validate_html=None, on_artifact_error=None):
         response = Queue(maxsize=1)
+        self.reply_queue = replies = Queue(maxsize=1)
+        state_lock = Lock()
+        state = {"html": None, "failure": None, "artifact_error": None, "navigation": 0, "session": None}
+        callback_error = None
+        live = request is not None and request["operation"] == "fetch"
+        label = "live browser" if live else ("browser session save" if request is not None and request["operation"] == "commit_session" else "static screenshot")
+        # The page may need a final read to distinguish an empty post from a
+        # loading shell. This is cleanup time, not another navigation budget.
+        receive_deadline = deadline + 2 if live else deadline
+        cleanup_deadline = deadline + 3
+
+        def deliver(kind, value):
+            try:
+                response.put((kind, value), timeout=max(0, receive_deadline - time.monotonic()))
+                return True
+            except Full:
+                return False
 
         def exchange():
             try:
-                _write_capture_packet(self.process.stdin, options)
+                _write_capture_packet(self.process.stdin, {**request, "deadline": deadline} if request is not None else None)
                 while True:
                     kind, value = _read_capture_packet(self.process.stdout)
                     if kind == "phase":
                         logger.info("%s", value)
-                    else:
-                        response.put(value)
+                    elif kind == "navigation":
+                        with state_lock:
+                            state["html"] = None
+                            state["session"] = None
+                            state["navigation"] += 1
+                    elif kind == "session":
+                        with state_lock:
+                            state["session"] = value
+                    elif kind == "artifact_error":
+                        with state_lock:
+                            state["artifact_error"] = value
+                    elif kind == "failure":
+                        with state_lock:
+                            state["failure"] = value
+                        deliver(kind, value)
                         return
+                    elif kind == "callback":
+                        if not deliver(kind, value):
+                            return
+                        reply = replies.get(timeout=max(0, receive_deadline - time.monotonic()))
+                        _write_capture_packet(self.process.stdin, ("reply", reply))
+                    elif kind == "result":
+                        deliver(kind, value)
+                        return
+                    else:
+                        raise ValueError("unsupported browser response message")
             except Exception:
-                response.put((False, CollectionFailure("infrastructure", "static screenshot process exited without a complete result")))
+                deliver("result", (False, CollectionFailure("infrastructure", "browser process exited without a complete result")))
+
+        def raise_failure(failure):
+            if callback_error is not None and (not isinstance(callback_error, CollectionFailure)
+                    or isinstance(failure, CollectionFailure) and failure.kind == callback_error.kind):
+                if not isinstance(callback_error, CollectionFailure):
+                    self.close(deadline=cleanup_deadline)
+                    from darkweb_collector.forum_rate_limit import note_current_source_failure
+
+                    try:
+                        note_current_source_failure(failure)
+                    except Exception:
+                        logger.warning("capture phase=source-backoff-save-failed engine=%s", self.proxy.engine)
+                raise callback_error
+            raise failure
+
+        def partial_or_raise(error):
+            self.close(deadline=cleanup_deadline)
+            with state_lock:
+                html, failure = state["html"], state["failure"]
+            if failure is not None:
+                raise_failure(failure)
+            if callback_error is not None:
+                raise callback_error
+            if live and html is not None:
+                if on_artifact_error is not None:
+                    on_artifact_error(safe_failure_text(f"artifact: browser evidence capture failed ({type(error).__name__}): {error}"))
+                return html, None
+            if live and isinstance(error, TimeoutError):
+                raise CollectionFailure("timeout", "live browser execution deadline exhausted") from error
+            raise error
 
         # Both a blocked send and a partial response frame stay in this daemon
         # thread. The caller's deadline bounds the complete exchange, not a poll.
-        self.exchange_thread = Thread(target=exchange, name="static-screenshot-io", daemon=True)
+        self.exchange_thread = Thread(target=exchange, name="browser-io", daemon=True)
         self.exchange_thread.start()
-        try:
-            succeeded, result = response.get(timeout=max(0.001, deadline - time.monotonic()))
-        except Empty as exc:
-            raise TimeoutError("static screenshot execution deadline exhausted") from exc
-        self.exchange_thread.join(timeout=max(0, deadline - time.monotonic()))
-        if not succeeded:
-            raise result
-        return result
+        while True:
+            try:
+                kind, value = response.get(timeout=max(0, receive_deadline - time.monotonic()))
+            except Empty:
+                return partial_or_raise(TimeoutError(f"{label} execution deadline exhausted"))
+            if kind == "callback":
+                name, argument = value
+                if time.monotonic() >= (receive_deadline if name == "validate_html" else deadline):
+                    return partial_or_raise(TimeoutError(f"{label} execution deadline exhausted"))
+                with state_lock:
+                    navigation = state["navigation"]
+                try:
+                    if name == "request_attempt":
+                        result = request_attempt()
+                    elif name == "validate_html":
+                        result = validate_html(argument) if validate_html is not None else True
+                        with state_lock:
+                            if result and validate_html is not None and state["navigation"] == navigation:
+                                state["html"] = argument
+                    else:
+                        raise ValueError("unsupported browser callback")
+                    reply = (True, result)
+                except Exception as exc:
+                    callback_error, reply = exc, (False, exc)
+                if time.monotonic() >= (receive_deadline if name == "validate_html" else deadline):
+                    return partial_or_raise(TimeoutError(f"{label} execution deadline exhausted"))
+                replies.put_nowait(reply)
+                continue
+            if kind == "failure":
+                raise_failure(value)
+            succeeded, result = value
+            self.exchange_thread.join(timeout=max(0, receive_deadline - time.monotonic()))
+            if callback_error is not None:
+                raise callback_error
+            if not succeeded:
+                return partial_or_raise(result)
+            if live and result[1] is not None and state["session"] is not None:
+                try:
+                    if time.monotonic() < deadline:
+                        self.capture({"operation": "commit_session", "options": state["session"]}, deadline)
+                except Exception:
+                    logger.warning("capture phase=session-save-failed engine=%s", self.proxy.engine)
+            if live and result[1] is None and state["artifact_error"] is not None and on_artifact_error is not None:
+                error = state["artifact_error"]
+                on_artifact_error(safe_failure_text(f"artifact: browser evidence capture failed ({type(error).__name__}): {error}"))
+            return result
 
-    def close(self, *, graceful: bool = False) -> None:
+    def close(self, *, graceful: bool = False, deadline: float | None = None) -> None:
         if self._closed:
             return
         self._closed = True
-        deadline = time.monotonic() + 3
+        deadline = min(time.monotonic() + 3, deadline) if deadline is not None else time.monotonic() + 3
         if (graceful and self.process is not None and self.process.poll() is None
                 and (self.exchange_thread is None or not self.exchange_thread.is_alive())):
             try:
                 self.capture(None, deadline)
+                # The ACK precedes the child's final scratch-directory cleanup.
+                # Let that finish within this same shutdown budget before killing its Job.
+                self.process.wait(timeout=max(0, deadline - time.monotonic()))
             except Exception:
                 pass
         # The private Job/session retains ownership if the child exits first.
@@ -1057,6 +1219,11 @@ class _StaticCaptureWorker:
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
             except ProcessLookupError:
+                pass
+        if self.reply_queue is not None:
+            try:
+                self.reply_queue.put_nowait((False, TimeoutError("browser request was cancelled")))
+            except Full:
                 pass
         if self.process is not None:
             try:
@@ -1068,9 +1235,11 @@ class _StaticCaptureWorker:
             if self.exchange_thread is None or not self.exchange_thread.is_alive():
                 self.process.stdin.close()
                 self.process.stdout.close()
+        from darkweb_collector.browser_temp import request_browser_temp_cleanup
+        request_browser_temp_cleanup()
 
 
-_GLOBAL_STATIC_WORKERS: dict[object, _StaticCaptureWorker] = {}
+_GLOBAL_BROWSER_WORKERS: dict[object, _BrowserWorker] = {}
 
 
 class _CapturePhaseHandler(logging.Handler):
@@ -1078,29 +1247,61 @@ class _CapturePhaseHandler(logging.Handler):
         _write_capture_packet(sys.stdout.buffer, ("phase", record.getMessage()))
 
 
-def _screenshot_html_process() -> None:
+def _browser_process() -> None:
     logger.addHandler(_CapturePhaseHandler())
     logger.setLevel(logging.INFO)
     logger.propagate = False
+
+    def callback(name, argument):
+        _write_capture_packet(sys.stdout.buffer, ("callback", (name, argument)))
+        kind, reply = _read_capture_packet(sys.stdin.buffer)
+        if kind != "reply":
+            raise ValueError("invalid browser callback reply")
+        succeeded, value = reply
+        if not succeeded:
+            raise value
+        return value
+
+    def report(kind, value):
+        _write_capture_packet(sys.stdout.buffer, (kind, value))
+
     try:
         while True:
             try:
-                options = _read_capture_packet(sys.stdin.buffer)
+                request = _read_capture_packet(sys.stdin.buffer)
             except EOFError:
                 return
-            if options is None:
+            if request is None:
                 close_browser_client()
                 _write_capture_packet(sys.stdout.buffer, ("result", (True, b"")))
                 return
-            proxy = BrowserProxyConfig(server=options.pop("proxy_server"), engine=options.pop("browser_engine"))
+            operation, options = request["operation"], request["options"]
             try:
-                result = (True, _get_or_create_client(proxy).screenshot_html_content(**options))
+                if operation == "commit_session":
+                    result = (True, persist_browser_session(**options) if time.monotonic() < request["deadline"] else False)
+                else:
+                    proxy = BrowserProxyConfig(server=options.pop("proxy_server"), engine=options.pop("browser_engine"),
+                                               verification_provider=options.pop("verification_provider", ""))
+                    client = _get_or_create_client(proxy)
+                    if operation == "screenshot":
+                        result = (True, client.screenshot_html_content(**options, _deadline=request["deadline"]))
+                    elif operation == "fetch":
+                        result = (True, client.fetch_page_artifacts(
+                            **options, validate_html=lambda html: callback("validate_html", html),
+                            _request_attempt=lambda: callback("request_attempt", None), _on_event=report,
+                            _deadline=request["deadline"],
+                        ))
+                    else:
+                        raise ValueError("unsupported browser operation")
             except Exception as exc:
-                result = (False, exc)
+                _write_capture_packet(sys.stdout.buffer, ("result", (False, exc)))
                 close_browser_client()
+                continue
             _write_capture_packet(sys.stdout.buffer, ("result", result))
     finally:
         close_browser_client()
+        from darkweb_collector.browser_temp import cleanup_browser_temp
+        cleanup_browser_temp(include_current=True)
 
 
 def close_browser_client(*, all_threads: bool = False) -> None:
@@ -1109,12 +1310,12 @@ def close_browser_client(*, all_threads: bool = False) -> None:
         if all_threads:
             clients = [client for _, client in _GLOBAL_CLIENTS.values()]
             _GLOBAL_CLIENTS.clear()
-            workers = list(_GLOBAL_STATIC_WORKERS.values())
-            _GLOBAL_STATIC_WORKERS.clear()
+            workers = list(_GLOBAL_BROWSER_WORKERS.values())
+            _GLOBAL_BROWSER_WORKERS.clear()
         else:
             entry = _GLOBAL_CLIENTS.pop(thread_key, None)
             clients = [entry[1]] if entry is not None else []
-            worker = _GLOBAL_STATIC_WORKERS.pop(thread_key, None)
+            worker = _GLOBAL_BROWSER_WORKERS.pop(thread_key, None)
             workers = [worker] if worker is not None else []
     for worker in workers:
         worker.close(graceful=True)

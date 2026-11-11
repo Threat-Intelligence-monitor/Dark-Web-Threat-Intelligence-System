@@ -130,6 +130,7 @@ class XforumsAdapter(DarkforumsAdapter):
                     url, screenshot_selector=self.detail_screenshot_selector,
                     capture_content_selector=self.detail_capture_content_selector,
                     hide_selectors=self.screenshot_hide_selectors, validate_html=validate,
+                    on_artifact_error=lambda message: metadata.update(artifact_error=message),
                     **self._browser_options(config, url, verification_provider),
                 )
             except Exception as browser_error:

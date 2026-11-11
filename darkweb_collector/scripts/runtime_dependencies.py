@@ -64,6 +64,60 @@ class _CollectorDependencyError(ValueError):
     pass
 
 
+class _BrowserRuntimeError(ValueError):
+    pass
+
+
+def verify_browsers(*, files_only: bool = False) -> None:
+    from packaging.version import Version
+
+    if Version(metadata.version("playwright")) < Version("1.49"):
+        raise _BrowserRuntimeError("Playwright browser validation failed: Playwright 1.49 or later is required.")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from darkweb_collector.browser_temp import cleanup_browser_temp, ensure_browser_temp
+    from darkweb_collector.collection_errors import safe_failure_text
+
+    temporary = ""
+    mode = "driver"
+    try:
+        if files_only:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as playwright:
+                for browser in (playwright.chromium, playwright.firefox):
+                    if not Path(browser.executable_path).is_file():
+                        raise FileNotFoundError(browser.executable_path)
+            return
+        temporary = str(ensure_browser_temp())
+        from darkweb_collector.browser_client import _run_browser_request, close_browser_client
+
+        # Exercise the same isolated, deadline-bounded renderer as collection.
+        # This document has no external resources or source-site requests.
+        for mode, engine, provider in (("chromium-headless-shell", "chromium", ""),
+                                       ("chromium", "chromium", "dnsproxy"),
+                                       ("firefox", "firefox", "")):
+            try:
+                image = _run_browser_request("screenshot", {
+                    "html": "<html><head><title>DWTI runtime check</title></head><body><p>ready</p></body></html>",
+                    "base_url": "https://runtime.invalid/", "wait_seconds": 0, "timeout_seconds": 15,
+                    "proxy_server": None, "browser_engine": engine, "verification_provider": provider,
+                })
+                if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise RuntimeError("browser did not return a rendered PNG")
+            finally:
+                close_browser_client(all_threads=True)
+    except Exception as exc:
+        lines = str(exc).splitlines()
+        detail = " ".join(lines[:1] + [line for line in lines[1:] if "[err]" in line or "FATAL" in line])
+        raise _BrowserRuntimeError(
+            f"Playwright browser validation failed ({mode}; temp={temporary}): "
+            f"{type(exc).__name__}: {safe_failure_text(detail, limit=2000)}"
+        ) from None
+    finally:
+        if temporary:
+            cleanup_browser_temp(include_current=True)
+
+
 def verify_collector(requirements: Path) -> None:
     from importlib import import_module
 
@@ -270,6 +324,7 @@ def main() -> int:
         commands = parser.add_subparsers(dest="command", required=True)
         commands.add_parser("python-profile").add_argument("--requirements", required=True, type=Path)
         commands.add_parser("verify-collector").add_argument("--requirements", required=True, type=Path)
+        commands.add_parser("verify-browsers").add_argument("--files-only", action="store_true")
         for name in ("node-profile", "check-node", "check-node-paths"):
             commands.add_parser(name).add_argument("--dashboard", required=True, type=Path)
         dashboard = commands.add_parser("dashboard-profile")
@@ -280,6 +335,9 @@ def main() -> int:
             result = python_profile(args.requirements)
         elif args.command == "verify-collector":
             verify_collector(args.requirements)
+            return 0
+        elif args.command == "verify-browsers":
+            verify_browsers(files_only=args.files_only)
             return 0
         elif args.command == "node-profile":
             result = node_profile(args.dashboard)
@@ -293,7 +351,7 @@ def main() -> int:
             return 0
         print(json.dumps(result, sort_keys=True))
         return 0
-    except _CollectorDependencyError as exc:
+    except (_CollectorDependencyError, _BrowserRuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except Exception:

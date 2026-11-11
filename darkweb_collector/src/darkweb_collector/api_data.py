@@ -23,6 +23,7 @@ from darkweb_collector.adapters.registry import ADAPTERS
 from darkweb_collector.config import get_site_config, load_site_configs
 from darkweb_collector.crawl_frontier import frontier_counts, list_page_cursors
 from darkweb_collector.detail_i18n import translate_event_detail_text_with_meta
+from darkweb_collector.detail_artifacts import display_artifact_path, forum_artifact_payload, native_artifact_path, referenced_artifact_resources
 from darkweb_collector.document_exposure import (
     build_document_exposure_event_detail,
     build_document_exposure_event_records,
@@ -44,6 +45,7 @@ from darkweb_collector.job_diagnostics import (
     failure_threshold,
 )
 from darkweb_collector.normalized_intelligence import (
+    _victim_output_resources as _normalized_victim_output_resources,
     _build_vulnerability_base_event,
     _coerce_bool,
     _format_date as _normalized_disclosure_date,
@@ -540,11 +542,12 @@ def _site_output_dir(site_name: str) -> Path | None:
 
 
 def _public_output_url(path: Path) -> str:
-    root = output_root()
+    path = display_artifact_path(path.resolve())
+    root = display_artifact_path(output_root().resolve())
     try:
-        relative_path = path.resolve().relative_to(root.resolve())
+        relative_path = path.relative_to(root)
     except ValueError:
-        return path.resolve().as_uri()
+        return path.as_uri()
     return f"/collector-output/{relative_path.as_posix()}"
 
 
@@ -564,47 +567,14 @@ def _forum_output_resources(row_dict: dict[str, Any]) -> tuple[list[dict[str, st
         return [], []
     section = str(row_dict.get("section") or "section")
     artifact_stem = _event_hash(topic_url)[:10]
-    detail_dir = output_dir / section / "details"
-    resources = []
-    screenshots = []
-    html_path = detail_dir / f"{artifact_stem}.html"
-    json_path = detail_dir / f"{artifact_stem}.json"
-    png_path = detail_dir / f"{artifact_stem}.png"
-    if html_path.exists():
-        resources.append(_resource_entry(html_path, "本地HTML镜像"))
-    if json_path.exists():
-        resources.append(_resource_entry(json_path, "本地JSON镜像"))
-    if png_path.exists():
-        screenshots.append(_resource_entry(png_path, "详情截图"))
-    return resources, screenshots
+    detail_dir = native_artifact_path(output_dir / section / "details")
+    return referenced_artifact_resources(output_dir, detail_dir, artifact_stem, forum_artifact_payload(row_dict),
+        site_name=row_dict["site_name"], target_url=topic_url, forum=True,
+        resource_entry=_resource_entry, include_legacy=True)
 
 
 def _victim_output_resources(row_dict: dict[str, Any], raw_json: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    output_dir = _site_output_dir(row_dict["site_name"])
-    if output_dir is None:
-        return [], []
-
-    content_hash = str(raw_json.get("content_hash") or row_dict.get("content_hash") or "")
-    domain = str(raw_json.get("domain") or row_dict.get("domain") or "")
-    name = str(raw_json.get("name") or row_dict.get("name") or "")
-    if row_dict["site_name"] in {"dragonforce", "lynx"}:
-        artifact_stem = safe_stem(f"{content_hash[:10]}_{name[:30]}")
-    else:
-        artifact_stem = safe_stem(f"{content_hash[:10]}_{domain or name}")
-
-    detail_dir = output_dir / "details"
-    resources = []
-    screenshots = []
-    html_path = detail_dir / f"{artifact_stem}.html"
-    json_path = detail_dir / f"{artifact_stem}.json"
-    png_path = detail_dir / f"{artifact_stem}.png"
-    if html_path.exists():
-        resources.append(_resource_entry(html_path, "本地HTML镜像"))
-    if json_path.exists():
-        resources.append(_resource_entry(json_path, "本地JSON镜像"))
-    if png_path.exists():
-        screenshots.append(_resource_entry(png_path, "详情截图"))
-    return resources, screenshots
+    return _normalized_victim_output_resources(row_dict, raw_json, _parse_json(row_dict.get("detail_raw_json")))
 
 
 def _build_forum_event_payload(row_dict: dict[str, Any]) -> dict[str, Any]:
@@ -631,8 +601,11 @@ def _build_forum_event_payload(row_dict: dict[str, Any]) -> dict[str, Any]:
         "id": event_id,
         "event_type": "forum",
         "raw_source_type": "forum_details",
+        "_committed_evidence": True,
         "title": row_dict.get("title") or row_dict.get("topic_url") or "未命名论坛帖子",
         "disclosure_time": _format_dt(disclosure_time),
+        "updated_time": _format_dt(row_dict.get("fetched_at")),
+        "updated_time_raw": row_dict.get("fetched_at") or "",
         "attacker": attackers or _label_source(row_dict.get("site_name")),
         "disclosure_url": row_dict.get("topic_url") or "",
         "detail_text": row_dict.get("content") or "",
@@ -664,8 +637,11 @@ def _build_victim_event_payload(row_dict: dict[str, Any]) -> dict[str, Any]:
         "id": event_id,
         "event_type": "victim",
         "raw_source_type": "victims",
+        "_committed_evidence": True,
         "title": row_dict.get("display_label") or row_dict.get("name") or "未知受害者",
         "disclosure_time": _format_dt(row_dict.get("published_at_utc") or row_dict.get("fetched_at_utc")),
+        "updated_time": _format_dt(row_dict.get("fetched_at_utc")),
+        "updated_time_raw": row_dict.get("fetched_at_utc") or "",
         "attacker": _label_source(row_dict.get("site_name")),
         "disclosure_url": disclosure_url,
         "detail_text": row_dict.get("text_excerpt") or raw_json.get("description") or "",
@@ -853,7 +829,7 @@ def _build_forum_event_detail_by_id(
     rows = _iter_detail_rows(
         connection,
         f"""
-        SELECT d.site_name, d.section, d.topic_url, d.content, d.attachments, d.victims, d.attackers, d.fetched_at, d.raw_json,
+        SELECT d.site_name, d.section, d.topic_url, d.content_hash, d.content, d.attachments, d.victims, d.attackers, d.fetched_at, d.raw_json,
                COALESCE(t.title, d.topic_url) AS title,
                COALESCE((SELECT industry FROM forum_victims fv WHERE fv.forum_detail_id = d.id LIMIT 1), 'other') AS industry,
                COALESCE((SELECT region FROM forum_victims fv WHERE fv.forum_detail_id = d.id LIMIT 1), 'unknown') AS region
@@ -898,7 +874,7 @@ def _build_victim_event_detail_by_id(
                    CASE WHEN COALESCE(v.detail_url, '') = '' THEN v.raw_json ELSE '' END AS raw_json
             FROM victims v LEFT JOIN victim_details vd ON vd.victim_id = v.id
             WHERE v.site_name = ?
-            ORDER BY COALESCE(vd.fetched_at_utc, v.published_at_utc, '') DESC, v.id DESC
+            ORDER BY COALESCE(vd.fetched_at_utc, v.published_at_utc, '') DESC, v.id DESC, vd.id DESC
             """,
             (site_name,),
         )
@@ -916,12 +892,13 @@ def _build_victim_event_detail_by_id(
         connection,
         f"""
         SELECT v.site_name, v.source_url, v.name, v.display_label, v.detail_url, v.status, v.published_at_utc, v.raw_json,
-               v.last_detail_fetch_status, v.content_hash, v.domain, vd.text_excerpt, vd.page_title, vd.fetched_at_utc
+               v.last_detail_fetch_status, v.content_hash, v.domain, vd.text_excerpt, vd.page_title, vd.outbound_link_count, vd.fetched_at_utc,
+               vd.raw_json AS detail_raw_json
         FROM victims v
         LEFT JOIN victim_details vd
           ON vd.victim_id = v.id
         WHERE v.site_name = ? AND {condition}
-        ORDER BY COALESCE(vd.fetched_at_utc, v.published_at_utc, '') DESC, v.id DESC
+        ORDER BY COALESCE(vd.fetched_at_utc, v.published_at_utc, '') DESC, v.id DESC, vd.id DESC
         LIMIT 1
         """,
         (site_name, source_record_id or source_url),
@@ -987,6 +964,19 @@ def _build_raw_event_detail_by_id(connection, event_id: str, source_event: dict[
 
 def _merge_event_detail_payload(base: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
+    if fallback.get("_committed_evidence"):
+        # The raw row is authoritative and legacy evidence is checked against it.
+        # A lagging projection must not add older body text or unchecked files.
+        for key in ("detail_text", "disclosure_url", "json_preview_url", "updated_time", "updated_time_raw"):
+            merged[key] = fallback.get(key) or ""
+        for key in ("mirror_resources", "screenshot_resources"):
+            merged[key] = list(fallback.get(key) or [])
+        merged["summary"] = merged["original_summary"] = merged["detail_text"]
+        merged["summary_unavailable"] = not bool(merged["detail_text"])
+        merged["reference_urls"] = list(merged["mirror_resources"])
+        merged.pop("content_access", None)
+        if "content_access" in fallback:
+            merged["content_access"] = fallback["content_access"]
     for key in ("disclosure_url", "detail_text", "victim"):
         if not merged.get(key) and fallback.get(key):
             merged[key] = fallback[key]
@@ -1018,18 +1008,21 @@ def _merge_event_detail_payload(base: dict[str, Any], fallback: dict[str, Any]) 
 
 
 def _annotate_detail_resources(payload: dict[str, Any]) -> dict[str, Any]:
+    payload.pop("_committed_evidence", None)
     statuses: dict[str, str] = {}
-    root = output_root().resolve()
+    root = display_artifact_path(native_artifact_path(output_root()).resolve())
 
     def availability(url: str) -> str:
         if not url.startswith("/collector-output/"):
             return ""
         if url not in statuses:
             try:
-                path = (root / unquote(urlsplit(url).path).removeprefix("/collector-output/")).resolve()
+                path = native_artifact_path(root / unquote(urlsplit(url).path).removeprefix("/collector-output/")).resolve()
+                path = display_artifact_path(path)
                 relative = path.relative_to(root)
-                private = bool(relative.parts and relative.parts[0].casefold() == "platform_sessions")
-                statuses[url] = "available" if not private and path.is_file() else "missing"
+                private = bool(relative.parts and relative.parts[0].casefold() == "platform_sessions") or any(
+                    part.casefold().startswith((".pending-", ".candidate-", ".artifact-lock-")) for part in relative.parts)
+                statuses[url] = "available" if not private and native_artifact_path(path).is_file() else "missing"
             except (OSError, RuntimeError, ValueError):
                 statuses[url] = "missing"
         return statuses[url]

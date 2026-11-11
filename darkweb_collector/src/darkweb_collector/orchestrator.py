@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import hashlib
 import logging
+import os
 import time
 import uuid
 from typing import Callable
@@ -34,9 +35,10 @@ from darkweb_collector.db import (
 from darkweb_collector.collection_errors import CollectionFailure, classify_failure, has_detail_body, request_budget, safe_failure_text
 from darkweb_collector.detail_lifecycle import (
     claim_detail, complete_detail, consume_request, count_detail_writes, detail_timeout,
-    fail_detail, owns_detail, reconcile_detail_owners, release_detail, reset_site_failures, site_retry_at, source_version,
+    fail_detail, owns_detail, reconcile_detail_owners, release_detail, reset_site_failures, site_retry_at, source_version, worker_alive,
 )
-from darkweb_collector.worker_activity import track_task
+from darkweb_collector.worker_activity import clear_activity, read_activity, request_recovery, track_task
+from darkweb_collector.forum_rate_limit import source_request_scope
 from darkweb_collector.job_diagnostics import is_in_failure_cooldown
 from darkweb_collector.models import DetailTask, RunContext, SiteConfig
 from darkweb_collector.queueing import queue_for_detail, queue_for_seed
@@ -246,7 +248,8 @@ def execute_seed_job(
             return {"site_name": site_name, "seed_job_id": run_ctx.job_id, "reason": "source_cooldown",
                     "detail_job_ids": [], "detail_task_count": 0, "detail_dispatched_count": 0}
     try:
-        seed_result = adapter.collect_seed(config, run_ctx)
+        with source_request_scope(site_name):
+            seed_result = adapter.collect_seed(config, run_ctx)
     except CollectionFailure as failure:
         from darkweb_collector.forum_rate_limit import note_source_failure
 
@@ -310,6 +313,59 @@ def execute_detail_job(
     adapter = get_adapter(site_name)
     result = {"site_name": site_name, "detail_job_id": token, "target_url": detail_task.target_url}
 
+    def committed_result(connection):
+        row = connection.execute("""SELECT outcome, new_count, updated_count, unchanged_count
+            FROM crawl_detail_results WHERE job_id = ? AND site_name = ? AND target_url = ?
+                AND outcome IN ('succeeded', 'partial')""",
+            (token, site_name, detail_task.target_url)).fetchone()
+        if row is None:
+            return None
+        # This receipt commits with the body, evidence reference and frontier.
+        # A lost COMMIT acknowledgement must not turn that completion into failure.
+        result.update(artifacts_pending=row["outcome"] == "partial",
+                      **{key: int(row[key]) for key in ("new_count", "updated_count", "unchanged_count")})
+        return result
+
+    def clear_finalized_activity():
+        value = os.environ.get("DARKWEB_WORKER_ACTIVITY_FILE")
+        if not value:
+            return
+        path = Path(value)
+        activity = read_activity(path)
+        if activity is None:
+            return
+        if (activity["job_id"] != token or activity["site_name"] != site_name
+                or activity["worker_pid"] != os.getpid()
+                or not worker_alive(activity["worker_pid"], activity["worker_started"])):
+            raise RuntimeError("committed detail journal ownership changed; retaining journal")
+        clear_activity(path, activity)
+
+    def recovery_outcome(connection):
+        if getattr(connection, "backend_name", "") == "postgresql":
+            connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            connection.execute("SET LOCAL lock_timeout = '10s'")
+        completed = committed_result(connection)
+        if completed is not None:
+            connection.rollback()
+            return completed, False
+        # COMMIT may still be in progress after a transport error. Acquiring the
+        # owned control row waits for that transaction before rechecking its receipt.
+        owned = owns_detail(connection, site_name, detail_task.target_url, token)
+        completed = committed_result(connection)
+        if completed is not None:
+            connection.rollback()
+        return completed, owned
+
+    def record_failure(connection, failure, *, finalization=False):
+        reason = safe_failure_text(str(failure))
+        message = f"{failure.kind}: task finalization failed; {reason}" if finalization else f"{failure.kind}: {reason}"
+        connection.execute("""UPDATE crawl_jobs SET status = ?, finished_at = ?, duration_ms = ?, error_message = ?
+            WHERE job_id = ? AND site_name = ? AND target = ?
+                AND status IN ('enqueued', 'running') AND finished_at IS NULL""",
+            ("skipped" if failure.kind in {"auth_required", "restricted", "unavailable"} and not finalization else "failed",
+             utc_now_iso(), int((time.perf_counter() - start_perf) * 1000), message,
+             token, site_name, detail_task.target_url))
+
     def skip_stale(connection, reason):
         release_detail(connection, site_name, detail_task.target_url, token)
         connection.execute("""UPDATE crawl_jobs SET status = 'skipped', finished_at = ?, error_message = ?
@@ -366,7 +422,7 @@ def execute_detail_job(
     try:
         with track_task(token, site_name, detail_task.target_url, slot_owner or token + ":local", detail_timeout(config)):
             try:
-                with request_budget(count_request):
+                with source_request_scope(site_name), request_budget(count_request):
                     detail_result = adapter.collect_detail(detail_task, config, run_ctx)
                 if detail_result is None or not detail_result.payload or not has_detail_body(detail_result.payload):
                     raise CollectionFailure("parse", "adapter returned no validated detail body")
@@ -403,33 +459,47 @@ def execute_detail_job(
                     connection.commit()
                     result.update(artifacts_pending=artifacts_pending, **counts)
             except Exception as error:
-                failure = classify_failure(error)
                 with get_db_connection() as connection:
+                    completed, owned = recovery_outcome(connection)
+                    if completed is not None:
+                        logger.warning("Confirmed committed detail after an acknowledgement error (%s)", type(error).__name__)
+                        return completed
+                    if not owned:
+                        return skip_stale(connection, "stale_delivery")
+                    failure = classify_failure(error)
                     retry_at = fail_detail(connection, site_name, detail_task.target_url, token, failure)
                     if frontier_token:
                         fail_frontier(connection, site_name, detail_task.target_url, frontier_token,
                                       retry_seconds=max(60, retry_at - time.time()), error_message=failure.kind)
-                    upsert_crawl_job(connection, job_id=token, site_name=site_name, job_type="detail",
-                                    queue_name=queue_name, target=detail_task.target_url,
-                                    status="skipped" if failure.kind in {"auth_required", "restricted", "unavailable"} else "failed",
-                                    finished_at=utc_now_iso(), duration_ms=int((time.perf_counter() - start_perf) * 1000),
-                                    error_message=f"{failure.kind}: {str(failure)[:500]}")
+                    record_failure(connection, failure)
                     connection.commit()
     except Exception as error:
         # Journal creation can fail before entering the task context.
         # Keep a durable owner only when its journal can still be recovered.
-        with get_db_connection() as connection:
-            if owns_detail(connection, site_name, detail_task.target_url, token):
-                entry_failure = classify_failure(error)
-                retry_at = fail_detail(connection, site_name, detail_task.target_url, token, entry_failure)
-                if frontier_token:
-                    fail_frontier(connection, site_name, detail_task.target_url, frontier_token,
-                                  retry_seconds=max(60, retry_at - time.time()), error_message=entry_failure.kind)
-                upsert_crawl_job(connection, job_id=token, site_name=site_name, job_type="detail",
-                                queue_name=queue_name, target=detail_task.target_url, status="failed",
-                                finished_at=utc_now_iso(), duration_ms=int((time.perf_counter() - start_perf) * 1000),
-                                error_message=entry_failure.kind + ": task finalization failed")
-                connection.commit()
+        try:
+            with get_db_connection() as connection:
+                completed, owned = recovery_outcome(connection)
+                if completed is None and owned:
+                    entry_failure = classify_failure(error)
+                    retry_at = fail_detail(connection, site_name, detail_task.target_url, token, entry_failure)
+                    if frontier_token:
+                        fail_frontier(connection, site_name, detail_task.target_url, frontier_token,
+                                      retry_seconds=max(60, retry_at - time.time()), error_message=entry_failure.kind)
+                    record_failure(connection, entry_failure, finalization=True)
+                    connection.commit()
+            if completed is not None or owned:
+                clear_finalized_activity()
+            else:
+                request_recovery()
+            if completed is not None:
+                logger.warning("Confirmed committed detail during task recovery (%s)", type(error).__name__)
+                return completed
+        except Exception:
+            try:
+                request_recovery()
+            except Exception as recovery_error:
+                logger.warning("Could not signal task recovery (%s)", type(recovery_error).__name__)
+            raise
         raise
     if failure is not None:
         raise failure

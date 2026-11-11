@@ -33,7 +33,9 @@ def _get_browser():
         if existing is not None:
             return existing
         from playwright.sync_api import sync_playwright
+        from darkweb_collector.browser_temp import ensure_browser_temp
 
+        ensure_browser_temp()
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(
             headless=True,
