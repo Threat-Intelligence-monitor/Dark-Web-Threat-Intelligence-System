@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 import json
 import os
@@ -1790,9 +1790,15 @@ def iter_normalized_intelligence_events(connection, *, preview_characters: int |
 _NORMALIZED_INTELLIGENCE_SEARCH_EXPRESSION = SEARCH_EXPRESSION
 
 
-def _normalized_intelligence_filters(event_type: str = "", query: str = "") -> tuple[str, list[object]]:
-    conditions = []
-    parameters: list[object] = []
+def _normalized_intelligence_filters(
+    event_type: str = "",
+    query: str = "",
+    *,
+    extra: tuple[str, Sequence[object]] = ("", ()),
+) -> tuple[str, list[object]]:
+    extra_sql, extra_parameters = extra
+    conditions = [extra_sql] if extra_sql else []
+    parameters = list(extra_parameters)
     if event_type:
         conditions.append("event_type = ?")
         parameters.append(event_type)
@@ -1803,6 +1809,62 @@ def _normalized_intelligence_filters(event_type: str = "", query: str = "") -> t
     return where, parameters
 
 
+def _search_metadata_text(connection, key: str) -> str:
+    if getattr(connection, "backend_name", "sqlite") == "postgresql":
+        metadata = "NULLIF(TRIM(event_metadata_json), '')::jsonb"
+        if getattr(getattr(connection, "_raw", None), "server_version", 160000) >= 160000:
+            metadata = f"CASE WHEN pg_input_is_valid(event_metadata_json, 'jsonb') THEN {metadata} END"
+        return f"({metadata}) ->> '{key}'"
+    metadata = "CASE WHEN json_valid(event_metadata_json) THEN event_metadata_json ELSE '{}' END"
+    return f"json_extract({metadata}, '$.{key}')"
+
+
+def _event_search_filters(
+    connection,
+    *,
+    types: tuple[str, ...],
+    since: str | None,
+    severity: str | None = None,
+    industry: str | None = None,
+    region: str | None = None,
+    country: str | None = None,
+    attacker: str | None = None,
+    min_risk_score: int | None = None,
+) -> tuple[str, list[object]]:
+    conditions = []
+    parameters: list[object] = []
+    if types:
+        conditions.append("event_type IN (" + ", ".join("?" for _ in types) + ")")
+        parameters.extend(types)
+    if since is not None:
+        conditions.append(f"{REPORT_TIME} >= ?")
+        parameters.append(since)
+    severity = (severity or "").strip().lower()
+    if severity:
+        conditions.append("LOWER(severity) = ?")
+        parameters.append(severity)
+    if min_risk_score is not None:
+        conditions.append("risk_score >= ?")
+        parameters.append(min_risk_score)
+
+    text_filters = [(industry, ("industry",)), (attacker, ("attacker",))]
+    if region:
+        text_filters.append((region, ("region", _search_metadata_text(connection, "macro_region"))))
+    if country:
+        country_fields = (
+            _search_metadata_text(connection, "country"),
+            _search_metadata_text(connection, "country_code"),
+        )
+        text_filters.append((country, country_fields))
+    for value, fields in text_filters:
+        value = (value or "").strip().lower()
+        if value:
+            escaped = value.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            conditions.append("(" + " OR ".join(f"LOWER({field}) LIKE ? ESCAPE '!'" for field in fields) + ")")
+            parameters.extend([f"%{escaped}%"] * len(fields))
+    return " AND ".join(conditions), parameters
+
+
 def list_normalized_intelligence_events(
     connection: sqlite3.Connection,
     *,
@@ -1811,6 +1873,7 @@ def list_normalized_intelligence_events(
     offset: int = 0,
     query: str = "",
     sort: str = "latest",
+    extra: tuple[str, Sequence[object]] = ("", ()),
 ) -> list[dict]:
     order_by = SEARCH_ORDER.get(sort)
     if order_by is None:
@@ -1819,7 +1882,7 @@ def list_normalized_intelligence_events(
         raise ValueError("offset must not be negative")
     if offset and limit is None:
         raise ValueError("offset requires limit")
-    where, parameters = _normalized_intelligence_filters(event_type, query)
+    where, parameters = _normalized_intelligence_filters(event_type, query, extra=extra)
     limit_sql = " LIMIT ? OFFSET ?" if limit is not None else ""
     if limit is not None:
         parameters.extend((int(limit), int(offset)))
@@ -1840,6 +1903,19 @@ def list_normalized_intelligence_events(
     return [dict(row) for row in cursor.fetchall()]
 
 
+def _count_search_matches(connection, where, parameters, recent_since=None):
+    recent_sql = f"COUNT(CASE WHEN {REPORT_TIME} >= ? THEN 1 END)" if recent_since is not None else "0"
+    args = (recent_since, *parameters) if recent_since is not None else tuple(parameters)
+    rows = connection.execute(
+        f"SELECT event_type, COUNT(*), {recent_sql} FROM normalized_intelligence_events{where} GROUP BY event_type",
+        args,
+    ).fetchall()
+    return (
+        {str(row[0]): int(row[1]) for row in rows},
+        {str(row[0]): int(row[2]) for row in rows},
+    )
+
+
 def search_normalized_intelligence_events(
     connection: sqlite3.Connection,
     *,
@@ -1849,6 +1925,11 @@ def search_normalized_intelligence_events(
     limit: int = 20,
     page: int = 1,
     counts: dict[str, int] | None = None,
+    types: tuple[str, ...] = (),
+    since: str | None = None,
+    filters: dict[str, str | int | None] | None = None,
+    recent_since: str | None = None,
+    recent_counts: dict[str, int] | None = None,
 ) -> dict:
     """Share an uncached substring scan between counts and a narrow page sort."""
     if sort not in SEARCH_ORDER:
@@ -1857,29 +1938,31 @@ def search_normalized_intelligence_events(
     if limit < 1:
         raise ValueError("limit must be positive")
     page = max(1, int(page))
+    extra = _event_search_filters(connection, types=types, since=since, **(filters or {}))
     indexed = search_indexed_events(
         connection, query=query, event_type=event_type, sort=sort,
-        limit=limit, page=page, counts=counts,
+        limit=limit, page=page, counts=counts, filters=extra, recent_since=recent_since,
     ) if str(query or "").strip() else None
     if indexed is not None:
         return indexed
+    where, parameters = _normalized_intelligence_filters(query=query, extra=extra)
     if (counts is not None or not str(query or "").strip()
             or getattr(connection, "backend_name", "sqlite") != "postgresql"):
-        if counts is None:
-            counts = count_normalized_intelligence_events_by_type(connection, query=query)
+        if counts is None or (recent_since is not None and recent_counts is None):
+            counts, recent_counts = _count_search_matches(connection, where, parameters, recent_since)
         total = counts.get(event_type, 0) if event_type else sum(counts.values())
         page = min(page, max(1, (total + limit - 1) // limit))
         rows = list_normalized_intelligence_events(
             connection, event_type=event_type, query=query, sort=sort,
-            limit=limit, offset=(page - 1) * limit,
+            limit=limit, offset=(page - 1) * limit, extra=extra,
         ) if total else []
-        return {"rows": rows, "counts": counts, "page": page}
+        return {"rows": rows, "counts": counts, "recent_counts": recent_counts or {}, "page": page}
 
-    where, parameters = _normalized_intelligence_filters(query=query)
     order = {
         "latest": "missing_time ASC, report_time DESC, event_id DESC",
         "oldest": "missing_time ASC, report_time ASC, event_id ASC",
         "severity": "severity_rank DESC, risk_score DESC, missing_time ASC, report_time DESC, event_id DESC",
+        "risk": "risk_score DESC, missing_time ASC, report_time DESC, event_id DESC",
     }[sort]
     # Materialize only identifiers and small sort keys, not article bodies or JSON.
     # The LEFT JOIN retains the count row even when the selected category is empty.
@@ -1894,6 +1977,9 @@ def search_normalized_intelligence_events(
             SELECT COUNT(CASE WHEN event_type = 'data_leak' THEN 1 END) AS search_data_leak,
                    COUNT(CASE WHEN event_type = 'ransomware' THEN 1 END) AS search_ransomware,
                    COUNT(CASE WHEN event_type = 'vulnerability' THEN 1 END) AS search_vulnerability,
+                    COUNT(CASE WHEN event_type = 'data_leak' AND report_time >= ? THEN 1 END) AS search_recent_data_leak,
+                    COUNT(CASE WHEN event_type = 'ransomware' AND report_time >= ? THEN 1 END) AS search_recent_ransomware,
+                    COUNT(CASE WHEN event_type = 'vulnerability' AND report_time >= ? THEN 1 END) AS search_recent_vulnerability,
                    COUNT(CASE WHEN ? = '' OR event_type = ? THEN 1 END) AS search_total
             FROM matches
         ), bounds AS (
@@ -1906,24 +1992,25 @@ def search_normalized_intelligence_events(
             SELECT * FROM matches WHERE ? = '' OR event_type = ?
             ORDER BY {order} LIMIT ? OFFSET (SELECT (search_page - 1) * ? FROM bounds)
         )
-        SELECT n.*, bounds.search_data_leak, bounds.search_ransomware,
-               bounds.search_vulnerability, bounds.search_page
+        SELECT n.*, bounds.*
         FROM bounds LEFT JOIN selected s ON 1 = 1
         LEFT JOIN normalized_intelligence_events n ON n.event_id = s.event_id
         ORDER BY {', '.join('s.' + item.strip() for item in order.split(','))}
         """,
-        tuple(parameters + [event_type, event_type, page, limit, limit, limit, limit,
-                            page, event_type, event_type, limit, limit]),
+        (*parameters, recent_since, recent_since, recent_since, event_type, event_type,
+         page, limit, limit, limit, limit, page, event_type, event_type, limit, limit),
     ).fetchall()
     first = records[0]
-    result_counts = {kind: int(first[f"search_{kind}"]) for kind in
-                     ("data_leak", "ransomware", "vulnerability")}
+    kinds = ("data_leak", "ransomware", "vulnerability")
+    result_counts = {kind: int(first[f"search_{kind}"]) for kind in kinds}
+    result_recent = {kind: int(first[f"search_recent_{kind}"]) for kind in kinds}
     rows = []
     for record in records:
         if record["event_id"] is not None:
             rows.append({key: value for key, value in dict(record).items()
                          if not key.startswith("search_")})
-    return {"rows": rows, "counts": result_counts, "page": int(first["search_page"])}
+    return {"rows": rows, "counts": result_counts, "recent_counts": result_recent,
+            "page": int(first["search_page"])}
 
 
 def count_normalized_intelligence_events(
@@ -1944,16 +2031,8 @@ def count_normalized_intelligence_events_by_type(
     query: str = "",
 ) -> dict[str, int]:
     where, parameters = _normalized_intelligence_filters(query=query)
-    rows = connection.execute(
-        f"""
-        SELECT event_type, COUNT(*) AS event_count
-        FROM normalized_intelligence_events
-        {where}
-        GROUP BY event_type
-        """,
-        tuple(parameters),
-    ).fetchall()
-    return {str(row[0]): int(row[1]) for row in rows}
+    counts, _ = _count_search_matches(connection, where, parameters)
+    return counts
 
 
 def get_normalized_intelligence_event(

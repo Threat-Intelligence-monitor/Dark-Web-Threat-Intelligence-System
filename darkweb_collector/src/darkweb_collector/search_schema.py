@@ -49,6 +49,7 @@ SEARCH_ORDER = {
     "latest": f"{MISSING_TIME} ASC, {REPORT_TIME} DESC, event_id DESC",
     "oldest": f"{MISSING_TIME} ASC, {REPORT_TIME} ASC, event_id ASC",
     "severity": f"{SEVERITY_RANK} DESC, risk_score DESC, {MISSING_TIME} ASC, {REPORT_TIME} DESC, event_id DESC",
+    "risk": f"risk_score DESC, {MISSING_TIME} ASC, {REPORT_TIME} DESC, event_id DESC",
 }
 
 
