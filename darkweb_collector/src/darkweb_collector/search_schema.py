@@ -49,6 +49,7 @@ SEARCH_ORDER = {
     "latest": f"{MISSING_TIME} ASC, {REPORT_TIME} DESC, event_id DESC",
     "oldest": f"{MISSING_TIME} ASC, {REPORT_TIME} ASC, event_id ASC",
     "severity": f"{SEVERITY_RANK} DESC, risk_score DESC, {MISSING_TIME} ASC, {REPORT_TIME} DESC, event_id DESC",
+    "risk": f"risk_score DESC, {MISSING_TIME} ASC, {REPORT_TIME} DESC, event_id DESC",
 }
 
 
@@ -106,9 +107,17 @@ def _ensure_search_indexes(connection) -> None:
                 connection.executemany(f"UPDATE intelligence_search_documents SET report_time={placeholder} "
                                        f"WHERE event_id={placeholder}", updates)
             after = records[-1][0]
+        if postgres:
+            from psycopg2 import sql
+
+            connection.execute("SELECT current_schema()")
+            index_schema = connection.fetchone()[0]
         for suffix in ("", "_type"):
-            connection.execute(f"DROP INDEX IF EXISTS idx_intelligence_report_order{suffix}")
-            connection.execute(f"DROP INDEX IF EXISTS idx_intelligence_severity_order{suffix}")
+            for name in (f"idx_intelligence_report_order{suffix}", f"idx_intelligence_severity_order{suffix}"):
+                statement = f"DROP INDEX IF EXISTS {name}"
+                if postgres:
+                    statement = sql.SQL("DROP INDEX IF EXISTS {}").format(sql.Identifier(index_schema, name))
+                connection.execute(statement)
     for suffix, prefix in (("", ""), ("_type", "event_type, ")):
         connection.execute(
             f"CREATE INDEX IF NOT EXISTS idx_intelligence_report_order{suffix} "

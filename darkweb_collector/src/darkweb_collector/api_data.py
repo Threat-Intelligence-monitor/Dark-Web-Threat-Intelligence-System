@@ -725,12 +725,23 @@ def build_event_search_payload(
     query: str = "",
     event_type: str = "all",
     sort: str = "latest",
+    types: tuple[str, ...] = (),
+    days: int | None = None,
+    filters: dict[str, str | int | None] | None = None,
     timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     started = monotonic()
     if timings is None:
         timings = {}
     database_event_type = EVENT_SEARCH_TYPES[event_type]
+    now = _now_utc().replace(microsecond=0)
+    # Pages that share cached statistics must use the same rolling cutoff.
+    statistics_time = now - timedelta(seconds=now.second % _SEARCH_CACHE_TTL)
+    recent_since = (statistics_time - timedelta(days=1)).isoformat(timespec="microseconds")
+    since = None
+    if days:
+        cutoff = now - timedelta(days=days) if days < now.toordinal() else datetime.min.replace(tzinfo=timezone.utc)
+        since = cutoff.isoformat(timespec="microseconds")
     with get_db_connection() as connection:
         timings["connection"] = (monotonic() - started) * 1000
         phase = monotonic()
@@ -741,7 +752,8 @@ def build_event_search_payload(
         state = get_normalized_intelligence_cache_state(connection)
         timings["revision"] = (monotonic() - phase) * 1000
         counts_key = (
-            identity, state["source_signature"], state["refreshed_at"], state["event_count"], query
+            identity, state["source_signature"], state["refreshed_at"], state["event_count"],
+            query, types, since, recent_since, tuple(sorted((filters or {}).items())),
         ) if identity and state else None
         page_key = (counts_key, event_type, sort, page, page_size) if counts_key else None
         cached = _search_cache_get(_SEARCH_PAGE_CACHE, page_key)
@@ -750,15 +762,17 @@ def build_event_search_payload(
             timings["total"] = (monotonic() - started) * 1000
             return cached
         phase = monotonic()
+        cached_counts, cached_recent = _search_cache_get(_SEARCH_COUNTS_CACHE, counts_key) or (None, None)
         result = search_normalized_intelligence_events(
             connection, event_type=database_event_type, query=query, sort=sort,
-            limit=page_size, page=page,
-            counts=_search_cache_get(_SEARCH_COUNTS_CACHE, counts_key),
+            limit=page_size, page=page, types=types, since=since, filters=filters,
+            counts=cached_counts, recent_counts=cached_recent, recent_since=recent_since,
         )
         timings["query"] = (monotonic() - phase) * 1000
         timings.update(result.get("timings", {}))
         database_counts = result["counts"]
-        _search_cache_put(_SEARCH_COUNTS_CACHE, counts_key, database_counts)
+        recent_counts = result["recent_counts"]
+        _search_cache_put(_SEARCH_COUNTS_CACHE, counts_key, (database_counts, recent_counts))
         counts = {
             "ransomware": int(database_counts.get("ransomware") or 0),
             "data-leak": int(database_counts.get("data_leak") or 0),
@@ -766,6 +780,11 @@ def build_event_search_payload(
         }
         counts["all"] = sum(counts.values())
         total = counts[event_type]
+        stats_types = (database_event_type,) if database_event_type else (
+            types or tuple(kind for kind in EVENT_SEARCH_TYPES.values() if kind)
+        )
+        type_counts = {kind: database_counts.get(kind, 0) for kind in stats_types}
+        recent_by_type = {kind: recent_counts.get(kind, 0) for kind in stats_types}
         page_count = max(1, (total + page_size - 1) // page_size)
         normalized_page = result["page"]
         phase = monotonic()
@@ -783,6 +802,9 @@ def build_event_search_payload(
         "event_type": event_type,
         "sort": sort,
         "counts": counts,
+        "typeCounts": type_counts,
+        "recent24h": sum(recent_by_type.values()),
+        "recent24hByType": recent_by_type,
         "revision": f"{state['source_signature']}:{state['refreshed_at']}" if state else "",
     }
     _search_cache_put(_SEARCH_PAGE_CACHE, page_key, payload)

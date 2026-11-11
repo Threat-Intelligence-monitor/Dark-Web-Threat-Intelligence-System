@@ -6,7 +6,7 @@ import os
 import secrets
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from threading import Lock, Thread
 
 from fastapi import FastAPI, Query
@@ -863,31 +863,55 @@ def event_search(
     q: str = "",
     event_type: str = "all",
     sort: str = "latest",
+    types: str = "",
+    keyword: str = "",
+    days: Annotated[int | None, Query(ge=0)] = None,
+    severity: str = "",
+    industry: str = "",
+    region: str = "",
+    country: str = "",
+    attacker: str = "",
+    min_risk_score: Annotated[int | None, Query(ge=0, le=100)] = None,
 ) -> dict:
     if page < 1:
         raise HTTPException(status_code=422, detail="page 必须大于等于 1")
     if not 1 <= page_size <= 100:
         raise HTTPException(status_code=422, detail="page_size 必须在 1 到 100 之间")
-    if len(q) > 200:
+    query = q or keyword
+    if len(query) > 200:
         raise HTTPException(status_code=422, detail="检索关键词不能超过 200 个字符")
-    if event_type not in {"all", "ransomware", "data-leak", "vulnerability"}:
+    event_types = api_data_module.EVENT_SEARCH_TYPES
+    selected_types = {
+        kind.strip().lower().replace("_", "-")
+        for kind in types.split(",")
+        if kind.strip()
+    }
+    if event_type not in event_types or selected_types.difference(event_types):
         raise HTTPException(status_code=422, detail="不支持的事件类型")
-    if sort not in {"latest", "oldest", "severity"}:
+    if sort not in api_data_module.SEARCH_ORDER:
         raise HTTPException(status_code=422, detail="不支持的排序方式")
+    database_types = () if "all" in selected_types else tuple(sorted(event_types[kind] for kind in selected_types))
+    query = query.strip()
     timings: dict[str, float] = {}
     payload = _reload_api_modules().build_event_search_payload(
         page=page,
         page_size=page_size,
-        query=q.strip(),
+        query=query,
         event_type=event_type,
         sort=sort,
+        types=database_types,
+        days=days,
+        filters={
+            "severity": severity, "industry": industry, "region": region, "country": country,
+            "attacker": attacker, "min_risk_score": min_risk_score,
+        },
         timings=timings,
     )
     response.headers["Server-Timing"] = ", ".join(
         f"{phase};dur={duration:.2f}" for phase, duration in timings.items()
     )
     logger.info("intelligence search query_chars=%d type=%s page=%d timings_ms=%s",
-                len(q.strip()), event_type, page,
+                len(query), event_type, page,
                 {phase: round(duration, 2) for phase, duration in timings.items()})
     return payload
 
