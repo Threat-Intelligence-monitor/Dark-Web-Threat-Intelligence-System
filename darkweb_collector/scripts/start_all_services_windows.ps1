@@ -505,6 +505,15 @@ function Assert-DataRootCapacity {
     }
 }
 
+function Assert-UpdateStateCapacity {
+    foreach ($path in @($ControlRoot, $UpdateStateRoot) | Select-Object -Unique) {
+        $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($path))
+        if ($drive.AvailableFreeSpace -lt 64MB) {
+            Stop-WithError "Update state directory $path has only $($drive.AvailableFreeSpace) bytes free; at least 64 MiB is required to preserve update status and logs. Free space before retrying."
+        }
+    }
+}
+
 function New-AuthPassword {
     return "123456"
 }
@@ -3030,41 +3039,28 @@ function Ensure-CollectorDependencies {
 
 function Test-PlaywrightBrowsers {
     param([switch]$FilesOnly)
+    $script:PlaywrightRuntimeError = 'Playwright browser validation failed.'
+    if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+        $script:PlaywrightRuntimeError = 'Playwright browser validation failed: Python executable is unavailable.'
+        return $false
+    }
+    $previousErrorAction = $ErrorActionPreference
     try {
-        $code = @"
-from importlib.metadata import version
-from pathlib import Path
-import sys
-from pip._vendor.packaging.version import Version
-from playwright.sync_api import sync_playwright
-
-if Version(version('playwright')) < Version('1.49'):
-    raise SystemExit(1)
-
-with sync_playwright() as playwright:
-    modes = ((playwright.chromium, {}),
-             (playwright.chromium, {'channel': 'chromium'}),
-             (playwright.firefox, {}))
-    for browser_type, launch_options in modes:
-        if not Path(browser_type.executable_path).exists():
-            raise SystemExit(1)
-        if sys.argv[1] != 'files':
-            browser = browser_type.launch(headless=True, **launch_options)
-            try:
-                page = browser.new_page()
-                page.set_content('<title>DWTI runtime check</title><p>ready</p>',
-                                 wait_until='domcontentloaded', timeout=5000)
-                if page.title() != 'DWTI runtime check':
-                    raise SystemExit(1)
-            finally:
-                browser.close()
-"@
-        & $VenvPython -B -c $code $(if ($FilesOnly) { "files" } else { "launch" }) *> $null
-        return ($LASTEXITCODE -eq 0)
+        # PowerShell 5.1 otherwise treats native stderr warnings as terminating
+        # errors even when the Python process exits successfully.
+        $ErrorActionPreference = 'Continue'
+        $arguments = @('-B', $DependencyHelper, 'verify-browsers')
+        if ($FilesOnly) { $arguments += '--files-only' }
+        $diagnostic = & $VenvPython @arguments 2>&1
+        if ($LASTEXITCODE -eq 0) { $script:PlaywrightRuntimeError = ''; return $true }
+        $reason = @($diagnostic | Where-Object { $_.ToString() -like 'Playwright browser validation failed*' } | Select-Object -Last 1)
+        if ($reason.Count) { $script:PlaywrightRuntimeError = $reason[0].ToString() }
+        return $false
     }
     catch {
         return $false
     }
+    finally { $ErrorActionPreference = $previousErrorAction }
 }
 
 function Ensure-PlaywrightRuntime {
@@ -3072,8 +3068,9 @@ function Ensure-PlaywrightRuntime {
         Write-Info "Reusing verified shared Playwright browsers"
         return
     }
+    $launchFailure = $script:PlaywrightRuntimeError
     if (Test-PlaywrightBrowsers -FilesOnly) {
-        Stop-WithError "Existing Playwright browser files cannot launch; preserving them without downloading replacements."
+        Stop-WithError "Existing Playwright browser files cannot launch; preserving them without downloading replacements. $launchFailure"
     }
     Write-Info "Installing Playwright browser runtimes"
     $previousGc = [Environment]::GetEnvironmentVariable("PLAYWRIGHT_SKIP_BROWSER_GC", "Process")
@@ -3087,7 +3084,7 @@ function Ensure-PlaywrightRuntime {
         else { $env:PLAYWRIGHT_SKIP_BROWSER_GC = $previousGc }
     }
     if (-not (Test-PlaywrightBrowsers)) {
-        Stop-WithError "Playwright browsers were installed but cannot launch. Check the local browser runtime dependencies."
+        Stop-WithError "Playwright browsers were installed but cannot launch. $script:PlaywrightRuntimeError"
     }
 }
 
@@ -3444,6 +3441,7 @@ function Ensure-PostgreSqlMigrationTarget {
 }
 
 function Ensure-Environment {
+    Invoke-TimedStep "Assert-UpdateStateCapacity" { Assert-UpdateStateCapacity }
     Invoke-TimedStep "Assert-DataRootCapacity" { Assert-DataRootCapacity }
     Invoke-TimedStep "Ensure-PythonRuntime" { Ensure-PythonRuntime | Out-Null }
     Invoke-TimedStep "Ensure-NodeRuntime" { Ensure-NodeRuntime | Out-Null }
@@ -3476,6 +3474,8 @@ function Ensure-Environment {
 
 function Prepare-UpdateEnvironment {
     Assert-ArtifactReferenceRuntime
+    Invoke-TimedStep "Assert-UpdateStateCapacity" { Assert-UpdateStateCapacity }
+    Invoke-TimedStep "Assert-DataRootCapacity" { Assert-DataRootCapacity }
     if (-not (Test-Path -LiteralPath (Join-Path $CollectorRoot "scripts\serve_api.py") -PathType Leaf)) {
         Stop-WithError "API launcher not found under collector scripts."
     }

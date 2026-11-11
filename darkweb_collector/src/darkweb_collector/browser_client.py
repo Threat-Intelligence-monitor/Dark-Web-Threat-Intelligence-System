@@ -188,11 +188,13 @@ class BrowserClient:
 
     def _open(self) -> None:
         from playwright.sync_api import sync_playwright
+        from darkweb_collector.browser_temp import ensure_browser_temp
 
         if self._proxy.engine not in {"chromium", "firefox"}:
             raise ValueError(f"unsupported browser engine: {self._proxy.engine}")
         started = time.monotonic()
         logger.info("capture phase=launch-start engine=%s", self._proxy.engine)
+        ensure_browser_temp()
         self._playwright_context = sync_playwright()
         try:
             self._playwright = self._playwright_context.start()
@@ -1205,6 +1207,9 @@ class _BrowserWorker:
                 and (self.exchange_thread is None or not self.exchange_thread.is_alive())):
             try:
                 self.capture(None, deadline)
+                # The ACK precedes the child's final scratch-directory cleanup.
+                # Let that finish within this same shutdown budget before killing its Job.
+                self.process.wait(timeout=max(0, deadline - time.monotonic()))
             except Exception:
                 pass
         # The private Job/session retains ownership if the child exits first.
@@ -1230,6 +1235,8 @@ class _BrowserWorker:
             if self.exchange_thread is None or not self.exchange_thread.is_alive():
                 self.process.stdin.close()
                 self.process.stdout.close()
+        from darkweb_collector.browser_temp import request_browser_temp_cleanup
+        request_browser_temp_cleanup()
 
 
 _GLOBAL_BROWSER_WORKERS: dict[object, _BrowserWorker] = {}
@@ -1293,6 +1300,8 @@ def _browser_process() -> None:
             _write_capture_packet(sys.stdout.buffer, ("result", result))
     finally:
         close_browser_client()
+        from darkweb_collector.browser_temp import cleanup_browser_temp
+        cleanup_browser_temp(include_current=True)
 
 
 def close_browser_client(*, all_threads: bool = False) -> None:

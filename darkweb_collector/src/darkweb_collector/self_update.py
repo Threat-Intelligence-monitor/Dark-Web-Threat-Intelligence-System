@@ -223,6 +223,19 @@ def _ensure_update_enabled() -> None:
         raise SelfUpdateError("在线更新已被 DARKWEB_SELF_UPDATE_ENABLED 禁用")
     if os.name != "nt":
         raise SelfUpdateError("当前无 Git 更新器暂仅支持 Windows")
+    state_root = _state_dir()
+    existing = state_root
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    try:
+        free_bytes = shutil.disk_usage(existing).free
+    except OSError as exc:
+        raise SelfUpdateError(f"无法检查更新状态目录的磁盘空间：{state_root}；{exc}") from exc
+    if free_bytes < 64 * 1024 * 1024:
+        raise SelfUpdateError(
+            f"更新状态目录 {state_root} 所在磁盘空间不足，仅剩 {free_bytes} 字节；"
+            "至少需要 64 MiB 保存更新状态和日志，请释放空间后重试"
+        )
 
 
 def _load_manifest_for_update(current: dict[str, Any]) -> dict[str, Any]:

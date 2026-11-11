@@ -543,7 +543,9 @@ def _run_claimed_scan(run_id: str, watchlist: dict[str, Any], discoverer: Callab
         if discoverer is not None:
             return _execute_scan(run_id, watchlist, discoverer, hydrator or fetch_public_post)
         from playwright.sync_api import sync_playwright
+        from darkweb_collector.browser_temp import ensure_browser_temp
 
+        ensure_browser_temp()
         with sync_playwright() as playwright:
             launch_options = {"headless": True}
             if os.name == "nt" and not Path(playwright.chromium.executable_path).is_file():
