@@ -17,6 +17,7 @@ ORDERS = {
     "latest": f"{MISSING_TIME} ASC, report_time DESC, event_id DESC",
     "oldest": f"{MISSING_TIME} ASC, report_time ASC, event_id ASC",
     "severity": f"severity_rank DESC, risk_score DESC, {MISSING_TIME} ASC, report_time DESC, event_id DESC",
+    "risk": f"risk_score DESC, {MISSING_TIME} ASC, report_time DESC, event_id DESC",
 }
 
 
@@ -274,7 +275,8 @@ def _query_plan(query, pg):
     return sorted(grams - covered), checks
 
 
-def search_indexed_events(connection, *, query, event_type="", sort="latest", limit=20, page=1, counts=None):
+def search_indexed_events(connection, *, query, event_type="", sort="latest", limit=20, page=1, counts=None,
+                          filters=("", ()), recent_since=None):
     started = perf_counter()
     if sort not in ORDERS:
         raise ValueError(f"unsupported normalized intelligence sort: {sort}")
@@ -299,6 +301,10 @@ def search_indexed_events(connection, *, query, event_type="", sort="latest", li
         else:
             conditions.append("search_text LIKE ?")
             parameters.append(pattern)
+    filter_sql, filter_parameters = filters
+    if filter_sql:
+        conditions.append(f"event_id IN (SELECT event_id FROM normalized_intelligence_events WHERE {filter_sql})")
+        parameters.extend(filter_parameters)
     where = " WHERE " + " AND ".join(conditions) if conditions else ""
     # Fetch only narrow matches. Both totals and page selection reuse this result;
     # bodies/JSON are fetched for the selected page alone.
@@ -309,17 +315,21 @@ def search_indexed_events(connection, *, query, event_type="", sort="latest", li
             # The planner underprices decompressing every large TOAST gram array.
             # Prefer GIN only for this candidate lookup, not other application SQL.
             connection.execute("SET LOCAL enable_seqscan = off")
-    matched = connection.execute("SELECT event_id, event_type FROM intelligence_search_documents"
+    matched = connection.execute("SELECT event_id, event_type, report_time FROM intelligence_search_documents"
         + where + " ORDER BY " + ORDERS[sort], parameters).fetchall()
     if previous_seqscan == "on":
         connection.execute("SET LOCAL enable_seqscan = on")
     # A failed SELECT aborts the transaction; caller rollback also restores SET LOCAL.
     result_counts = {kind: 0 for kind in KINDS}
+    recent_counts = dict.fromkeys(KINDS, 0)
     selected = []
     for row in matched:
-        if row["event_type"] in result_counts:
-            result_counts[row["event_type"]] += 1
-        if not event_type or row["event_type"] == event_type:
+        kind = row["event_type"]
+        if kind in result_counts:
+            result_counts[kind] += 1
+            if recent_since and (row["report_time"] or "") >= recent_since:
+                recent_counts[kind] += 1
+        if not event_type or kind == event_type:
             selected.append(row["event_id"])
     page = min(max(1, int(page)), max(1, (len(selected) + limit - 1) // limit))
     selected = selected[(page - 1) * limit:page * limit]
@@ -329,5 +339,5 @@ def search_indexed_events(connection, *, query, event_type="", sort="latest", li
             "SELECT * FROM normalized_intelligence_events WHERE event_id IN ("
             + ",".join("?" for _ in selected) + ")", selected).fetchall()}
         rows = [by_id[event_id] for event_id in selected]
-    return {"rows": rows, "counts": result_counts, "page": page,
+    return {"rows": rows, "counts": result_counts, "recent_counts": recent_counts, "page": page,
             "timings": {"index": (perf_counter() - started) * 1000}}
