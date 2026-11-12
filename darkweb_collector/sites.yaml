@@ -53,7 +53,8 @@
       "seed_urls": [
         "https://darkforums.as/Forum-Databases",
         "https://darkforums.as/Forum-Other-Leaks",
-        "https://darkforums.as/Forum-Sellers-Place"
+        "https://darkforums.as/Forum-Sellers-Place",
+        "https://darkforums.as/Forum-Leaks-Market"
       ],
       "seed_fetch_mode": "browser",
       "detail_fetch_mode": "browser",
