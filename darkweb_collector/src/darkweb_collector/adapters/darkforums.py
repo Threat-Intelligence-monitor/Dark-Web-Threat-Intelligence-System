@@ -396,8 +396,12 @@ class DarkforumsAdapter(SiteAdapter):
             detail, parsed_html = parsed, html
             return True
 
+        # While the feed is the preferred source, threads outside it are almost always
+        # unreachable from this egress; a browser attempt would burn ~90s before failing,
+        # so keep those to the cheap direct probe. Set `darkforums_feed_first: false` to
+        # restore the old browser route.
         routes = [] if is_onion_url(url) else ["direct"]
-        if config.detail_fetch_mode == "browser":
+        if config.detail_fetch_mode == "browser" and not self._feed_preferred(config):
             routes.append("browser")
         elif is_onion_url(url) or proxy_server:
             routes.append("proxy")
