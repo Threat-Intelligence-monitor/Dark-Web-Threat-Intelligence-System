@@ -283,7 +283,24 @@ def _raise_for_status(status: int, html: str, headers: Mapping[str, Any] | None)
     raise_for_http_status(status, html, headers=dict(headers or {}))
 
 
-def _raise_for_signal(signal: ProtectionSignal, url: str, *, headers: Mapping[str, Any] | None) -> None:
+def _raise_if_error_page(html: str) -> None:
+    """Let the collector's own error templates win over the generic verdict.
+
+    A 403 is often the source's permission or login page rather than an edge
+    block: MyBB answers "You are either not logged in or do not have permission
+    to view this page." with 403.  Reporting that as an unknown edge block sends
+    the adapter down the browser route and burns the request budget on a wall
+    that only a session can pass, so the specific diagnosis has to be tried
+    first.
+    """
+
+    from darkweb_collector.collection_errors import raise_if_error_page
+
+    raise_if_error_page(html)
+
+
+def _raise_for_signal(signal: ProtectionSignal, url: str, *, headers: Mapping[str, Any] | None,
+                      html: str = "") -> None:
     host = host_key(url)
     if signal.kind == "rate-limit":
         pacing.penalise(host, seconds=signal.retry_after, status=signal.status or 429)
@@ -295,6 +312,8 @@ def _raise_for_signal(signal: ProtectionSignal, url: str, *, headers: Mapping[st
     if signal.kind == "login":
         raise CollectionFailure("auth_required", _describe_failure(signal, url), scope="site")
     if signal.kind == "forbidden":
+        if html:
+            _raise_if_error_page(html)
         raise CollectionFailure("blocked", _describe_failure(signal, url), scope="target")
 
 
@@ -420,7 +439,7 @@ def _fetch_with_impersonation(
             raise CollectionFailure("blocked", _describe_failure(signal, url), scope="target",
                                     verification_provider=signal.vendor)
         if signal.kind == "rate-limit":
-            _raise_for_signal(signal, url, headers=headers_in)
+            _raise_for_signal(signal, url, headers=headers_in, html=html)
         if 200 <= status < 300:
             observed = _session_cookies(session)
             if detect.has_clearance_cookie(observed):
@@ -429,7 +448,7 @@ def _fetch_with_impersonation(
                                  challenge=signal.challenge)
             return html
         if signal.kind in {"login", "forbidden"}:
-            _raise_for_signal(signal, url, headers=headers_in)
+            _raise_for_signal(signal, url, headers=headers_in, html=html)
         if attempt < attempts and status in {0, 408, 425, 500, 502, 503, 504}:
             time.sleep(max(0.5, min(float(backoff_seconds) * attempt, 10.0)))
             continue
@@ -527,7 +546,7 @@ def _fetch_with_curl_cli(
                 raise CollectionFailure("blocked", _describe_failure(signal, url), scope="target",
                                         verification_provider=signal.vendor)
             if signal.kind == "rate-limit":
-                _raise_for_signal(signal, url, headers=headers_in)
+                _raise_for_signal(signal, url, headers=headers_in, html=html)
             if result.returncode == 0:
                 _record_from_jar(cookie_file, host, options)
                 _raise_for_status(status, html, headers_in)

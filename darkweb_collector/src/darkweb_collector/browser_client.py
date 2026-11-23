@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 # the recovered document is used instead of the request being failed.
 _NAVIGATION_CAP_MS = 45_000
 _CAPPED_PROTECTIONS = frozenset({"cloudflare", "ddos-guard", "akamai", "incapsula", "datadome"})
+# The worker reports these as diagnostic progress frames, not as a capture
+# result.  They must be consumed here: an unhandled kind used to abort the whole
+# exchange, turning a successfully cleared challenge into "browser process
+# exited without a complete result".
+_DIAGNOSTIC_EVENTS = frozenset({"bypass", "bypass_error", "navigation_recovered"})
 
 
 def _navigation_timeout_ms(profile, remaining_ms: int) -> int:
@@ -1286,6 +1291,50 @@ def _read_capture_packet(stream):
     return pickle.loads(payload)
 
 
+def _open_worker_log() -> tuple[object, Path | None]:
+    """Give each browser worker its own stderr file.
+
+    The child is deliberately quiet on the wire, so a hard crash used to leave
+    only "browser process exited without a complete result" in the task list.
+    A per-worker file keeps the traceback for the failure detail without
+    interleaving diagnostics from concurrent workers.
+    """
+
+    try:
+        from darkweb_collector.runtime import user_data_root
+        from uuid import uuid4
+
+        directory = Path(user_data_root()) / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        _prune_worker_logs(directory)
+        path = directory / f"browser-worker-{uuid4().hex[:12]}.log"
+        return path.open("wb", buffering=0), path
+    except Exception:
+        logger.debug("browser worker stderr is unavailable", exc_info=True)
+        return subprocess.DEVNULL, None
+
+
+def _prune_worker_logs(directory: Path, max_age_seconds: float = 3 * 86400.0) -> None:
+    cutoff = time.time() - max_age_seconds
+    try:
+        for entry in directory.glob("browser-worker-*.log"):
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _worker_log_tail(path: Path | None, limit: int = 600) -> str:
+    if path is None:
+        return ""
+    try:
+        raw = path.read_bytes()[-limit:]
+    except OSError:
+        return ""
+    text = " ".join(raw.decode("utf-8", "replace").split())
+    return text[-limit:]
+
+
 class _BrowserWorker:
     """One serial browser process; business callbacks stay on the caller thread."""
 
@@ -1294,6 +1343,7 @@ class _BrowserWorker:
         self.process, self.job, self.exchange_thread = None, None, None
         self.reply_queue = None
         self._closed = False
+        self._stderr, self._stderr_path = _open_worker_log()
         assigned = False
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH"))))
@@ -1306,7 +1356,7 @@ class _BrowserWorker:
                 from darkweb_collector.worker_supervisor import _WorkerJob
 
                 self.job = _WorkerJob(f"Local\\dwti-worker-screenshot-{uuid4().hex}")
-            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
                                             env=env, creationflags=(subprocess.CREATE_NO_WINDOW | 0x00000004) if self.job else 0,
                                             start_new_session=os.name != "nt")
             if self.job is not None:
@@ -1366,13 +1416,19 @@ class _BrowserWorker:
                             return
                         reply = replies.get(timeout=max(0, receive_deadline - time.monotonic()))
                         _write_capture_packet(self.process.stdin, ("reply", reply))
+                    elif kind in _DIAGNOSTIC_EVENTS:
+                        logger.info("capture phase=%s value=%s", kind, value)
                     elif kind == "result":
                         deliver(kind, value)
                         return
                     else:
-                        raise ValueError("unsupported browser response message")
-            except Exception:
-                deliver("result", (False, CollectionFailure("infrastructure", "browser process exited without a complete result")))
+                        logger.warning("capture phase=unknown-message kind=%s", kind)
+            except Exception as exc:
+                logger.debug("capture phase=exchange-failed", exc_info=True)
+                tail = _worker_log_tail(self._stderr_path)
+                detail = "browser process exited without a complete result"
+                detail = f"{detail}: {tail}" if tail else f"{detail} ({type(exc).__name__})"
+                deliver("result", (False, CollectionFailure("infrastructure", detail)))
 
         def raise_failure(failure):
             if callback_error is not None and (not isinstance(callback_error, CollectionFailure)
@@ -1493,7 +1549,24 @@ class _BrowserWorker:
                 self.process.stdin.close()
                 self.process.stdout.close()
         from darkweb_collector.browser_temp import request_browser_temp_cleanup
+        self._close_worker_log()
         request_browser_temp_cleanup()
+
+    def _close_worker_log(self) -> None:
+        handle, path = self._stderr, self._stderr_path
+        self._stderr, self._stderr_path = subprocess.DEVNULL, None
+        try:
+            if handle is not None and handle is not subprocess.DEVNULL:
+                handle.close()
+        except OSError:
+            pass
+        if path is None or getattr(self.process, "returncode", 0) != 0:
+            return  # keep the log of a crash for diagnosis
+        try:
+            if path.exists() and path.stat().st_size == 0:
+                path.unlink()
+        except OSError:
+            pass
 
 
 _GLOBAL_BROWSER_WORKERS: dict[object, _BrowserWorker] = {}
