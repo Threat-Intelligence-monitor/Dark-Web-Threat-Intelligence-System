@@ -149,6 +149,8 @@ xforums 使用的是自定义 JS 挑战（`/verify-challenge?token=...`，页面
 - **导航等待有上限**：受保护站点（cloudflare/ddos-guard/akamai/incapsula/datadome）的 `page.goto` 最多等 45s。若迟迟等不到 `domcontentloaded`，只要主文档已经到达（≥512 字节）就继续做渲染等待与挑战求解，而不是把整个请求判成超时——实测 CF 偶发把 `domcontentloaded` 挂住 58~88s。
 - **挑战求解不是通用验证码识别**：只处理 Cloudflare/DDoS-Guard 的托管挑战（勾选、等待放行）。真正的图片验证码走已有的 `chaojiying` 打码路径，两者不混用。
 - **不要叠加循环**：站点/目标的每小时请求预算由采集框架统一管理，绕过层不做额外的无限重试。
+- **登录墙不是反爬**：站点用 403 + 「You are either not logged in or do not have permission…」这类模板拒绝游客时，请求会归为 `restricted`（正文需要账号），不会再去解挑战。这类源必须配 `session_cookie_env`/`session_cookie_file` 或在浏览器侧提供 `storage_state`，否则只能抓公开列表。bf.st、cracked、darkforums、leakforum、xforums 的部分分区属此类。
+- **采集出口的信誉就是成功率**：明网请求若走 Tor 出口，Cloudflare/DDoS-Guard 会明显更严（同一个 darkforums 线程，本机直连 200，Tor 出口 403 `cloudflare/managed`）。明网站点应走普通出口，Tor 只留给 `.onion`。
 
 ## 7. 依赖
 

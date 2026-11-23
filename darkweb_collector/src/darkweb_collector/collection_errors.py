@@ -237,9 +237,16 @@ def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> 
         retry_after = int(hint.group(1)) * ({"s": 1, "m": 60, "h": 3600}[hint.group(2)[0]]) if hint else 0
         raise CollectionFailure("rate_limited", "source returned its request-limit page", scope="site", retry_after=retry_after)
     if not has_post:
-        if any(phrase in panel for phrase in (
+        # Some boards (MyBB "board message", XenForo "no permission") render the
+        # refusal outside any element classed as an error panel, so the page text
+        # outside posts and quotes is the only place the reason appears.  This
+        # branch already requires that no post and no listing were recognised,
+        # which keeps ordinary threads and forum indexes out of it.
+        notice = " ".join([*template.error_text, *template.service_text]).lower()
+        if any(phrase in notice for phrase in (
             "do not have permission", "you must be logged", "you must be registered",
-            "not have permission", "insufficient privileges",
+            "not have permission", "insufficient privileges", "login to view", "log in to view",
+            "sign in to view", "register to view",
         )):
             raise CollectionFailure("restricted", "source returned its permission error template")
         if any(phrase in panel for phrase in (
