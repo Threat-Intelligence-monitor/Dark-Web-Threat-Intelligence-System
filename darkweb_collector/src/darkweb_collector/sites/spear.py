@@ -23,7 +23,7 @@ from darkweb_collector.utils import utc_now_iso
 
 
 FORUM_SECTIONS = {
-    name: f"https://spear.cx/Forum-{slug}?sortby=started&order=desc&datecut=9999"
+    name: f"https://spear.st/Forum-{slug}?sortby=started&order=desc&datecut=9999"
     for name, slug in (
         ("databases", "Databases"),
         ("stealer_logs", "Stealer-Logs"),

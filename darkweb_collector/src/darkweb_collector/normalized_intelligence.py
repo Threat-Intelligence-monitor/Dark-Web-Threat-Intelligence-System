@@ -433,6 +433,7 @@ SOURCE_HOSTNAME_KEYWORDS = {
     "lynx",
     "pwnfrm",
     "raidforums",
+    "spear.st",
     "spear.cx",
     "leakforum.io",
     "leakforum.st",

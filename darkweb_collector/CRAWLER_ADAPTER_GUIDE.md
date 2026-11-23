@@ -80,7 +80,7 @@ Windows 启动和调度会检查数据库引用的受管旧版本活动日志。
 
 ## 访问绕过（Cloudflare / DDoS-Guard / 自定义 JS 挑战）
 
-明网论坛（darkforums、cracked、bf.st、spear.cx、leakforum、raidforums、xforums）都在商业反爬后面：明文 `curl` 得到 `403 + Cf-Mitigated: challenge`，根因是 TLS/HTTP2 指纹而不是 User-Agent。绕过实现位于 `src/darkweb_collector/access_bypass/`，接入点在 `tor_fetch`、`browser_client` 与各适配器，详见仓库根目录 `docs/access-bypass.md`。
+明网论坛（darkforums、cracked、bf.st、spear.st、leakforum、raidforums、xforums）都在商业反爬后面：明文 `curl` 得到 `403 + Cf-Mitigated: challenge`，根因是 TLS/HTTP2 指纹而不是 User-Agent。绕过实现位于 `src/darkweb_collector/access_bypass/`，接入点在 `tor_fetch`、`browser_client` 与各适配器，详见仓库根目录 `docs/access-bypass.md`。
 
 适配器侧只需两件事：浏览器路由传 `bypass_profile=bypass_profile_for(config.site_name, url=url, extras=config.extras)`；调用 `tor_fetch.fetch_url/fetch_page_artifacts` 时传 `site_key=config.site_name`。HTTP 路由按站点解析配置，`blocked` 不是终态，因此被拦后会自动退到浏览器路由——不需要在适配器里再写一层重试循环。
 

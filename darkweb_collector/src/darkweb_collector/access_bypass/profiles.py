@@ -76,11 +76,12 @@ BUILTIN_DEFAULTS: dict[str, dict[str, Any]] = {
         "notes": "Cloudflare; the domain rotates between bf.st and mirrors",
     },
     "spear": {
-        "hosts": ["spear.cx"],
-        "protection": "cloudflare",
+        "hosts": ["spear.st", "www.spear.st", "spear.cx"],
+        "protection": "ddos-guard",
         "impersonate": "chrome",
         "stealth": "full",
         "challenge_wait_seconds": 25.0,
+        "notes": "DDoS-Guard in front of MyBB; spear.cx moved to spear.st",
     },
     "leakforum": {
         "hosts": ["leakforum.io"],

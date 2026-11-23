@@ -1,6 +1,6 @@
 # 访问绕过（Access Bypass）
 
-暗网论坛之外，项目里还有七个明网站点（darkforums、cracked、bf.st、spear.cx、leakforum、raidforums、xforums）位于 Cloudflare / DDoS-Guard 之后。这些站点的采集此前只有「明文 curl → 失败 → 等浏览器」这一条路，而明文 curl 在指纹层就已经被拒绝，浏览器又因为缺隐身和挑战交互而经常拿到挑战页。本文记录绕过层的设计、配置与实测结论。
+暗网论坛之外，项目里还有七个明网站点（darkforums、cracked、bf.st、spear.st、leakforum、raidforums、xforums）位于 Cloudflare / DDoS-Guard 之后。这些站点的采集此前只有「明文 curl → 失败 → 等浏览器」这一条路，而明文 curl 在指纹层就已经被拒绝，浏览器又因为缺隐身和挑战交互而经常拿到挑战页。本文记录绕过层的设计、配置与实测结论。
 
 ## 1. 问题定位（实测证据）
 
@@ -137,7 +137,7 @@ python -m pytest darkweb_collector/tests/test_access_bypass.py -q
 | leakforum.io | `200` ≈122 KB | 可用 | HTTP 优先 |
 | raidforums.im | `200` ≈74 KB | 可用 | HTTP 优先 |
 | xforums.st | `302` → `One More Step - Browser Check` | `200` ≈123 KB，**无 clearance** | 只能浏览器（约 17 s/次，靠 storage_state 复用） |
-| spear.cx | 当前不可达（本机无 A 记录，代理返回 502） | — | 站点侧故障，不是绕过失败；恢复后按 `cloudflare` 配置自动生效 |
+| spear.st（原 spear.cx） | 明文 curl 也是 `200` ≈84 KB，`server: ddos-guard` 不发挑战 | 待实测 | DDoS-Guard 目前是「放行」状态，HTTP 路由直接用 |
 
 xforums 使用的是自定义 JS 挑战（`/verify-challenge?token=...`，页面 title 是 `Loading` 后脚本跳转），不放发 `cf_clearance`，所以它的 HTTP 路由永远拿不到复用凭证。这是站点实现决定的，不是配置问题；该站保持 `browser_engine=chromium` + `storage-state` 会话复用。
 
