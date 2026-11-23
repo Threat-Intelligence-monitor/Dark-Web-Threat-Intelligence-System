@@ -86,6 +86,8 @@ Windows 启动和调度会检查数据库引用的受管旧版本活动日志。
 
 站点级参数写在 `darkweb_collector/bypass_profiles.yaml`（JSON 语法），或在 `sites.yaml` 的站点条目里加 `access_bypass: {...}` 覆盖。可用 `python -m darkweb_collector.access_bypass.probe --all` 实测各站点的可用路由；`ACCESS_BYPASS_DISABLE=1` 可整体回退到旧行为。
 
+当挑战挡在 IP 层、浏览器也过不去时，优先找站点自己的非挑战入口，而不是继续加重挑战求解。写 MyBB 站点时可以直接复用现成做法：`adapters/darkforums.py` 在列表路由整体失败后改抓 `syndication.php` RSS，`<content:encoded>` 里就是首帖正文（正好是线程页对游客隐藏的那段），快照落盘后由 `collect_detail` 的 `_detail_from_feed` 复用，免去线程页请求；这条兜底不产生截图，证据标记为待补采。XenForo 站点对应的入口是 `/forums/-/index.rss`，实现方式相同。
+
 冷却中的记录仍保留在待抓清单，但不作为当前可执行新增任务，也不占历史发现的可执行容量。存在可执行新增时先处理新增；没有可执行新增时，历史发现仍受小窗口和配置页数限制。详情站点级退避期间仍检查最新列表，历史回补暂停并保留游标。
 
 Windows 启动器使用受监督的 `solo` 消费进程。详情总时限默认公网 300 秒、Onion 600 秒；`detail_task_timeout_seconds` 可以设置 60–900 秒。站点执行槽的 TTL 至少覆盖总时限加 90 秒清理余量，同时使用数据库站点准入锁防止消息服务租约过期后产生重叠执行。守护进程每 15 秒检查，Windows Job Object 收容浏览器子孙进程；确认全部退出后才恢复任务。清理或数据库/消息服务恢复失败时保留日志，阻止替换进程。

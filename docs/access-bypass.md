@@ -151,7 +151,31 @@ xforums 使用的是自定义 JS 挑战（`/verify-challenge?token=...`，页面
 - **不要叠加循环**：站点/目标的每小时请求预算由采集框架统一管理，绕过层不做额外的无限重试。
 - **登录墙不是反爬**：站点用 403 + 「You are either not logged in or do not have permission…」这类模板拒绝游客时，请求会归为 `restricted`（正文需要账号），不会再去解挑战。这类源必须配 `session_cookie_env`/`session_cookie_file` 或在浏览器侧提供 `storage_state`，否则只能抓公开列表。bf.st、cracked、darkforums、leakforum、xforums 的部分分区属此类。
 - **采集出口的信誉就是成功率**：明网请求若走 Tor 出口，Cloudflare/DDoS-Guard 会明显更严（同一个 darkforums 线程，本机直连 200，Tor 出口 403 `cloudflare/managed`）。明网站点应走普通出口，Tor 只留给 `.onion`。
+- **MyBB「Hidden Content」不是权限错误**：darkforums 的线程页对游客返回 200，正文位置是 `Hidden Content — You must register or login to view this content.`。挑战解得出、页面也渲染得出来，但首帖正文仍被隐藏，只能走下面第 8 节的 RSS 兜底（或配登录会话）。
 
 ## 7. 依赖
 
 `curl_cffi` 是 HTTP 伪装路由的唯一依赖，已写入 `darkweb_collector/requirements.txt`。缺失时 `httpfetch` 自动降级到 `curl.exe`：请求仍带完整浏览器头，但没有 TLS 指纹，Cloudflare 站点会重新回到 403。
+
+## 8. 站点专项：darkforums 的 RSS 兜底
+
+darkforums 在部分出口 IP 上会把列表页和线程页一起判给托管挑战（线上表现为 `direct: cloudflare/managed (HTTP 403)` + `browser: HTTP 403`），即使换 UA、换浏览器引擎也拿不到。
+
+同一站点的 MyBB 订阅源 `https://darkforums.as/syndication.php?limit=40` 不受挑战保护，且 `<item>` 的 `<content:encoded>` 直接携带首帖正文——正好是线程页对游客隐藏的那段内容。因此适配器加了一条兜底路由：
+
+1. `collect_seed` 的列表路由整体失败（`blocked` / `unavailable` / `timeout` / `network` / `not_found`）时，改抓 RSS，把每个 `<item>` 当一条主题写入 `feed` 分区；
+2. 主题正文同时落盘到 `<output_dir>/darkforums-feed.json`（默认保留 7 天、最多 300 条）；
+3. `collect_detail` 开头的 `_detail_from_feed` 直接复用该快照，不再请求线程页，因此**不产生截图**（`metadata["artifact_error"]` 记为待补采，后续浏览器路由可用时会自动升级）。
+
+实测（本机，2026-11-23）：40 条主题 / 3.3 s，40/40 带正文，最长 4 KB 级帖子完整可取。
+
+可调项（写在 `sites.yaml` 的 `darkforums` 块里，走 `extras`）：
+
+```json
+{
+  "site_name": "darkforums",
+  "darkforums_feed_url": "https://darkforums.as/syndication.php?limit=40"
+}
+```
+
+不配置时按 `seed_urls` 的 origin 自动拼 `/syndication.php?limit=40`。

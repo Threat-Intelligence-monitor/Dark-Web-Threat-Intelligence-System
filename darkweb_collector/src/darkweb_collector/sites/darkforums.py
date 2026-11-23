@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from email import utils as email_utils
 from html import unescape
 from urllib.parse import urljoin, urlparse
 
@@ -581,6 +583,159 @@ def determine_region(victim: str) -> str:
                 return region
     
     return 'unknown'
+
+
+SYNDICATION_DEFAULT_PATH = "/syndication.php?limit=40"
+
+
+def _feed_child_text(node, name: str) -> str:
+    """Read a child element by local name, ignoring namespace prefixes."""
+    if node is None:
+        return ""
+    for child in list(node):
+        if child.tag.rsplit("}", 1)[-1] == name:
+            return child.text or ""
+    return ""
+
+
+def _syndication_tid(link: str) -> str:
+    match = re.search(r"-(\d+)/?$", link or "")
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]tid=(\d+)", link or "")
+    return match.group(1) if match else ""
+
+
+def _syndication_published(raw: str, collected_at_utc: str) -> str:
+    value = _clean_html_text(raw)
+    if not value:
+        return ""
+    try:
+        parsed = email_utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return normalize_darkforums_timestamp(value, collected_at_utc=collected_at_utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _syndication_media(content_html: str, base_url: str) -> tuple[list, list]:
+    attachments = []
+    for href in re.findall(r'<a[^>]*href="([^"]+)"[^>]*>', content_html, re.IGNORECASE):
+        if href.startswith(("http://", "https://")):
+            attachments.append(href)
+    media_links = []
+    for src in re.findall(r'<img[^>]+src="([^"]+)"', content_html, re.IGNORECASE):
+        absolute = urljoin(base_url, src) if base_url else src
+        if absolute not in media_links:
+            media_links.append(absolute)
+    return attachments, media_links
+
+
+def parse_darkforums_syndication(xml_text: str, *, base_url: str = "", max_topics: int = 40) -> dict:
+    """Parse the MyBB syndication feed into the same topic shape as the listing parser.
+
+    The feed carries the first post body of the newest threads. Those bodies are
+    exactly what thread pages hide from guests ("Hidden Content - You must
+    register or login to view this content."), and the feed endpoint is served
+    without the managed challenge that guards thread pages, so it is the fallback
+    when the forum listing route is blocked.
+    """
+    collected_at_utc = datetime.now(timezone.utc).isoformat()
+    raw = (xml_text or "").strip()
+    if not raw:
+        raise CollectionFailure("parse", "darkforums feed is empty")
+    try:
+        root = ET.fromstring(raw.encode("utf-8") if isinstance(raw, str) else raw)
+    except ET.ParseError as exc:
+        raise CollectionFailure("parse", f"darkforums feed is not valid XML: {exc}") from exc
+
+    channel = root.find("./channel")
+    if channel is None:
+        raise CollectionFailure("parse", "darkforums feed has no channel")
+
+    channel_title = _clean_html_text(_feed_child_text(channel, "title"))
+    source_url = base_url or _clean_html_text(_feed_child_text(channel, "link")) or "https://darkforums.as/"
+
+    topics: list[dict] = []
+    seen: set[str] = set()
+    for item in channel.findall("./item"):
+        link = (_feed_child_text(item, "link") or _feed_child_text(item, "guid")).strip()
+        if not link or link in seen:
+            continue
+        seen.add(link)
+        title = _clean_html_text(_feed_child_text(item, "title"))
+        content_html = _feed_child_text(item, "encoded") or _feed_child_text(item, "description")
+        creator_html = _feed_child_text(item, "creator")
+        author = _clean_html_text(creator_html) or "Unknown"
+        published_raw = _feed_child_text(item, "pubDate")
+        attachments, media_links = _syndication_media(content_html, source_url)
+        content = _clean_html_text(content_html)
+        topics.append({
+            "tid": _syndication_tid(link),
+            "title": title,
+            "relative_url": urlparse(link).path if link.startswith("http") else link,
+            "full_url": link,
+            "author": author,
+            "replies": "",
+            "views": "",
+            "published_at": _clean_html_text(published_raw),
+            "published_at_utc": _syndication_published(published_raw, collected_at_utc),
+            "content": content,
+            "content_html": content_html,
+            "attachments": attachments,
+            "media_links": media_links,
+            "content_hash": content_hash(content[:1000], author),
+            "potential_victim": _extract_victim_from_title(title),
+            "discovery_lane": "feed",
+        })
+        if len(topics) >= max_topics:
+            break
+
+    return {
+        "site_name": "darkforums",
+        "source_url": source_url,
+        "domain": _extract_domain(source_url),
+        "title": channel_title,
+        "collected_at_utc": collected_at_utc,
+        "topic_count": len(topics),
+        "topics": topics,
+    }
+
+
+def build_darkforums_feed_detail(url: str, item: dict, *, collected_at_utc: str | None = None) -> dict:
+    """Build a detail payload from a cached feed item, shaped like parse_darkforums_detail."""
+    collected_at = collected_at_utc or datetime.now(timezone.utc).isoformat()
+    content = str(item.get("content") or "").strip()
+    if not content:
+        raise CollectionFailure("parse", "darkforums feed item has no post body")
+    title = str(item.get("title") or "")
+    author = str(item.get("author") or "Unknown")
+    victims = extract_victims_from_content(content, title)
+    victim_info = [
+        {"name": victim, "industry": determine_industry(victim, f"{title} {content}"), "region": determine_region(victim)}
+        for victim in victims
+    ]
+    media_links = [str(link) for link in item.get("media_links") or []]
+    return {
+        "site_name": "darkforums",
+        "source_url": url,
+        "domain": _extract_domain(url),
+        "title": title,
+        "collected_at_utc": collected_at,
+        "content": content,
+        "content_access": "feed",
+        "content_quote_only": False,
+        "quote_attributions": [],
+        **({"media_links": media_links} if media_links else {}),
+        "author": author,
+        "timestamp": str(item.get("published_at") or ""),
+        "published_at_utc": str(item.get("published_at_utc") or ""),
+        "attachments": [str(link) for link in item.get("attachments") or []],
+        "victims": victim_info,
+        "attackers": extract_attackers_from_content(content),
+        "content_hash": content_hash(content[:1000], author, *media_links),
+    }
 
 
 def get_darkforums_sections() -> dict:

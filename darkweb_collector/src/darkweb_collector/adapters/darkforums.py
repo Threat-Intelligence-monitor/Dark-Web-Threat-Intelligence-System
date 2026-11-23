@@ -4,6 +4,10 @@ from darkweb_collector.detail_artifacts import persist_detail_artifacts
 
 from contextlib import nullcontext
 import hashlib
+import json
+import logging
+import time
+from pathlib import Path
 from urllib.parse import urlparse
 
 from darkweb_collector.adapters.base import SiteAdapter
@@ -21,9 +25,18 @@ from darkweb_collector.db import (
 )
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
 from darkweb_collector.source_sessions import browser_session_options, http_session_options
-from darkweb_collector.sites.darkforums import parse_darkforums_detail, parse_darkforums_list
+from darkweb_collector.sites.darkforums import (
+    SYNDICATION_DEFAULT_PATH,
+    build_darkforums_feed_detail,
+    parse_darkforums_detail,
+    parse_darkforums_list,
+    parse_darkforums_syndication,
+)
 from darkweb_collector.tor_fetch import browser_proxy_server_for_url, fetch_url, fetch_via_http_proxy, is_onion_url
 from darkweb_collector.utils import dump_json, dump_text, safe_stem
+
+
+logger = logging.getLogger(__name__)
 
 
 def _section_name(url: str) -> str:
@@ -42,6 +55,53 @@ def _detail_artifacts_exist(output_dir, section_name: str, topic_url: str, snaps
     details_dir = output_dir / section_name / "details"
     return detail_artifacts_complete(details_dir, artifact_stem, (snapshot or {}).get("artifact_payload", (snapshot or {}).get("raw_json")),
                                      root=output_dir, site_name=site_name, target_url=topic_url, forum=True, source_version=source_version)
+
+
+FEED_FALLBACK_KINDS = frozenset({"blocked", "unavailable", "timeout", "network", "not_found"})
+FEED_CACHE_TTL_SECONDS = 6 * 3600
+FEED_CACHE_MAX_AGE_SECONDS = 7 * 86400
+FEED_CACHE_MAX_ITEMS = 300
+FEED_TOPIC_LIMIT = 40
+
+
+def _feed_cache_path(output_dir: Path) -> Path:
+    return output_dir / "darkforums-feed.json"
+
+
+def _load_feed_cache(output_dir: Path) -> dict:
+    """Read the feed cache (thread url -> feed topic snapshot). Never raises."""
+    try:
+        payload = json.loads(_feed_cache_path(output_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    items = payload.get("items") if isinstance(payload, dict) else None
+    return items if isinstance(items, dict) else {}
+
+
+def _store_feed_topics(output_dir: Path, topics: list[dict], feed_url: str) -> None:
+    """Persist feed topics so the detail phase can reuse the post bodies it already has."""
+    now = time.time()
+    items = _load_feed_cache(output_dir)
+    for topic in topics:
+        url = str(topic.get("full_url") or "").strip()
+        if not url:
+            continue
+        items[url] = {**topic, "cached_at": now, "feed_url": feed_url}
+    items = {
+        url: item for url, item in items.items()
+        if now - float(item.get("cached_at") or 0) <= FEED_CACHE_MAX_AGE_SECONDS
+    }
+    if len(items) > FEED_CACHE_MAX_ITEMS:
+        newest = sorted(items.items(), key=lambda pair: float(pair[1].get("cached_at") or 0), reverse=True)
+        items = dict(newest[:FEED_CACHE_MAX_ITEMS])
+    path = _feed_cache_path(output_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"version": 1, "items": items}, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        logger.warning("darkforums feed cache could not be written to %s", path, exc_info=True)
 
 
 class DarkforumsAdapter(SiteAdapter):
@@ -123,8 +183,99 @@ class DarkforumsAdapter(SiteAdapter):
         content = str(detail.get("content") or "").strip()
         return bool(content)
 
+    def _feed_url(self, config: SiteConfig) -> str:
+        configured = str(config.extras.get("darkforums_feed_url") or "").strip()
+        if configured:
+            return configured
+        for seed in config.seed_urls:
+            parsed = urlparse(seed)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}{SYNDICATION_DEFAULT_PATH}"
+        return f"https://darkforums.as{SYNDICATION_DEFAULT_PATH}"
+
+    def _fetch_feed_xml(self, config: SiteConfig, feed_url: str) -> str:
+        return fetch_via_http_proxy(
+            feed_url,
+            timeout=config.fetch_timeout_seconds,
+            retries=1,
+            bypass_proxy=True,
+            **http_session_options(config, feed_url, None),
+        )
+
+    def _collect_feed_seed(self, config: SiteConfig, cause: Exception) -> SeedResult:
+        """Fallback seed: read the newest threads (and their post bodies) from the RSS feed.
+
+        The forum listing sits behind the same managed challenge as thread pages,
+        while `/syndication.php` is served untouched. Its items carry the first
+        post body, which thread pages hide behind "Hidden Content" for guests.
+        """
+        feed_url = self._feed_url(config)
+        xml_text = self._fetch_feed_xml(config, feed_url)
+        parsed = parse_darkforums_syndication(xml_text, base_url=feed_url, max_topics=FEED_TOPIC_LIMIT)
+        topics = parsed["topics"]
+        if not topics:
+            raise CollectionFailure("parse", "darkforums feed returned no topics")
+        _store_feed_topics(config.output_dir, topics, feed_url)
+        collected_at = parsed["collected_at_utc"]
+        section = {
+            "section": "feed",
+            "source_url": feed_url,
+            "collected_at_utc": collected_at,
+            "title": parsed["title"],
+            "source_count": len(topics),
+            "topics": topics,
+        }
+        payload = {
+            "site_name": self.site_name,
+            "source_url": feed_url,
+            "collected_at_utc": collected_at,
+            "section_count": 1,
+            "topic_count": len(topics),
+            "sections": [section],
+            "pagination_errors": [],
+        }
+        logger.info("darkforums seed recovered from the syndication feed (%s topics)", len(topics))
+        return SeedResult(
+            site_name=self.site_name,
+            collected_at_utc=collected_at,
+            payload=payload,
+            raw_html_by_url={feed_url: xml_text},
+            metadata={"feed_fallback": True, "feed_cause": safe_failure_text(str(cause)), "discovery_lane": "feed"},
+        )
+
+    def _detail_from_feed(self, detail_task: DetailTask, config: SiteConfig) -> DetailResult | None:
+        """Reuse a feed snapshot for this thread when the page itself is unreachable."""
+        url = detail_task.target_url
+        item = _load_feed_cache(config.output_dir).get(url)
+        if not item:
+            return None
+        if time.time() - float(item.get("cached_at") or 0) > FEED_CACHE_TTL_SECONDS:
+            return None
+        try:
+            detail = build_darkforums_feed_detail(url, item)
+        except CollectionFailure:
+            return None
+        metadata = dict(detail_task.metadata)
+        metadata["artifact_error"] = "artifact: darkforums feed route has no rendered screenshot"
+        detail["_collector_artifact_error"] = metadata["artifact_error"]
+        logger.info("darkforums detail served from the feed cache: %s", url)
+        return DetailResult(
+            site_name=self.site_name,
+            target_url=url,
+            payload=detail,
+            raw_html=str(item.get("content_html") or ""),
+            screenshot_png=None,
+            metadata=metadata,
+        )
+
     def collect_seed(self, config: SiteConfig, run_ctx: RunContext) -> SeedResult:
-        return collect_forum_seed(self, config, self.list_parser, _section_name)
+        try:
+            return collect_forum_seed(self, config, self.list_parser, _section_name)
+        except CollectionFailure as exc:
+            if exc.kind not in FEED_FALLBACK_KINDS:
+                raise
+            logger.warning("darkforums listing route failed (%s); trying the syndication feed", exc.kind)
+            return self._collect_feed_seed(config, exc)
 
     def plan_details(self, seed_result: SeedResult, config: SiteConfig) -> list[DetailTask]:
         per_section_tasks: list[list[DetailTask]] = []
@@ -192,6 +343,9 @@ class DarkforumsAdapter(SiteAdapter):
         )
         if restored is not None:
             return restored
+        from_feed = self._detail_from_feed(detail_task, config)
+        if from_feed is not None:
+            return from_feed
         url = detail_task.target_url
         proxy_server = browser_proxy_server_for_url(url)
         hide_selectors = ("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer")
