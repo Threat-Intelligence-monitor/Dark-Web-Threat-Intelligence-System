@@ -11,7 +11,6 @@ import struct
 import subprocess
 import sys
 from threading import Lock, Thread, current_thread
-import traceback
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
@@ -26,6 +25,19 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# A protected edge may hold ``domcontentloaded`` open for a minute or more while
+# its challenge script keeps streaming.  Capping the navigation wait keeps
+# enough of the request budget for the solver and the capture-ready probe, and
+# the recovered document is used instead of the request being failed.
+_NAVIGATION_CAP_MS = 45_000
+_CAPPED_PROTECTIONS = frozenset({"cloudflare", "ddos-guard", "akamai", "incapsula", "datadome"})
+
+
+def _navigation_timeout_ms(profile, remaining_ms: int) -> int:
+    if profile is None or profile.protection not in _CAPPED_PROTECTIONS:
+        return remaining_ms
+    return min(remaining_ms, _NAVIGATION_CAP_MS)
 
 
 @dataclass(frozen=True)
@@ -491,13 +503,32 @@ class BrowserClient:
             if time.monotonic() >= deadline:
                 raise CollectionFailure("timeout", "browser execution deadline exhausted before navigation")
             (_request_attempt or request_attempt)()
+            recovered = False
             try:
                 response = page.goto(url, wait_until="commit" if early_verification else "domcontentloaded",
-                                     timeout=_remaining_timeout_ms(deadline, timeout_seconds * 1000))
+                                     timeout=_navigation_timeout_ms(
+                                         profile, _remaining_timeout_ms(deadline, timeout_seconds * 1000)))
             except (PlaywrightTimeoutError, TimeoutError) as exc:
-                raise CollectionFailure("timeout", safe_failure_text(
-                    f"browser document navigation timed out ({type(exc).__name__}): {exc}"
-                )) from exc
+                # Chrome can hold ``domcontentloaded`` open on a challenge page or
+                # a slow third-party subresource long after the main document
+                # arrived.  When the document is already there, spend the rest of
+                # the budget on the render wait and the challenge solver instead
+                # of failing the whole request.
+                if main_response is None:
+                    raise CollectionFailure("timeout", safe_failure_text(
+                        f"browser document navigation timed out ({type(exc).__name__}): {exc}"
+                    )) from exc
+                try:
+                    stalled_html = _read_page_content(page)
+                except Exception:
+                    stalled_html = ""
+                if len(stalled_html) < 512:
+                    raise CollectionFailure("timeout", safe_failure_text(
+                        f"browser document navigation timed out ({type(exc).__name__}): {exc}"
+                    )) from exc
+                _emit_event(report, "navigation_recovered", getattr(main_response, "status", 0))
+                response = main_response
+                recovered = True
             except Exception as exc:
                 raise CollectionFailure("network", safe_failure_text(
                     f"browser document navigation failed ({type(exc).__name__}): {exc}"
@@ -507,7 +538,7 @@ class BrowserClient:
                 raise_for_http_status(status, headers=getattr(response, "headers", None))
             check_rate_limit()
             observe_dnsproxy_document(response)
-            if early_verification:
+            if early_verification and not recovered:
                 page.wait_for_load_state("domcontentloaded", timeout=_remaining_timeout_ms(deadline, timeout_seconds * 1000))
             render_deadline = min(deadline, time.monotonic() + max(0, wait_seconds))
             while time.monotonic() < render_deadline:

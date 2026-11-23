@@ -146,6 +146,7 @@ xforums 使用的是自定义 JS 挑战（`/verify-challenge?token=...`，页面
 - **curl_cffi 走代理偶发握手中断**：`BoringSSL SSL_connect: Connection closed abruptly`。已保留 curl.exe 降级与重试；出现该错误时先重跑 probe 再判断站点是否真的不可达。
 - **代理出口必须一致**：`_proxy_url` 优先读 `PROXY_HOST`/`PROXY_PORT`，未设置时回退 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`。换代理会换掉 clearance 槽位。
 - **浏览器启动 channel**：`browser_channel=chrome` 需要本机装有 Chrome；缺失时会自动回退到 bundled chromium，只降低隐蔽性，不影响可用性。
+- **导航等待有上限**：受保护站点（cloudflare/ddos-guard/akamai/incapsula/datadome）的 `page.goto` 最多等 45s。若迟迟等不到 `domcontentloaded`，只要主文档已经到达（≥512 字节）就继续做渲染等待与挑战求解，而不是把整个请求判成超时——实测 CF 偶发把 `domcontentloaded` 挂住 58~88s。
 - **挑战求解不是通用验证码识别**：只处理 Cloudflare/DDoS-Guard 的托管挑战（勾选、等待放行）。真正的图片验证码走已有的 `chaojiying` 打码路径，两者不混用。
 - **不要叠加循环**：站点/目标的每小时请求预算由采集框架统一管理，绕过层不做额外的无限重试。
 
