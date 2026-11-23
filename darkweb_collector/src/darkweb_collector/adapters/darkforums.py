@@ -7,6 +7,7 @@ import hashlib
 from urllib.parse import urlparse
 
 from darkweb_collector.adapters.base import SiteAdapter
+from darkweb_collector.access_bypass.profiles import profile_for as bypass_profile_for
 from darkweb_collector.adapters.forum_artifacts import FORUM_CAPTURE_CONTENT_SELECTOR, detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_forum_seed, is_forum_listing_html
 from darkweb_collector.browser_client import fetch_html_with_browser, fetch_page_artifacts_with_browser, screenshot_html_with_browser
@@ -65,6 +66,7 @@ class DarkforumsAdapter(SiteAdapter):
             "proxy_server": proxy_server,
             **browser_session_options(config, url, proxy_server),
             "browser_engine": str(config.extras.get("browser_engine") or "firefox"),
+            "bypass_profile": bypass_profile_for(config.site_name, url=url, extras=config.extras),
         }
 
     def _fetch_html(self, url: str, config: SiteConfig, mode: str) -> str:

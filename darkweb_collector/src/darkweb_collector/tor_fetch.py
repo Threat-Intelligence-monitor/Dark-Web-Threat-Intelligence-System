@@ -151,6 +151,17 @@ def is_onion_hostname(hostname: str | None) -> bool:
     return bool(hostname and hostname.lower().endswith(".onion"))
 
 
+def _bypass_profile(site_key: str | None, url: str):
+    """Access-bypass policy for one request; ``None`` means "no bypass layer"."""
+
+    try:
+        from darkweb_collector.access_bypass import profiles
+
+        return profiles.profile_for(site_key, url=url)
+    except Exception:
+        return None
+
+
 def is_onion_url(url: str) -> bool:
     return is_onion_hostname(urlparse(url).hostname)
 
@@ -197,6 +208,7 @@ def fetch_url(
     cookie_header: str | None = None,
     user_agent: str | None = None,
     cookies: list[dict] | None = None,
+    site_key: str | None = None,
 ) -> str:
     if mode == "browser":
         from darkweb_collector.browser_client import fetch_html_with_browser
@@ -207,6 +219,7 @@ def fetch_url(
             timeout_seconds=timeout_seconds,
             proxy_server=browser_proxy_server_for_url(url),
             cookie_header=cookie_header,
+            bypass_profile=_bypass_profile(site_key, url),
         )
 
     if is_onion_url(url):
@@ -233,6 +246,7 @@ def fetch_url(
         cookie_header=cookie_header,
         user_agent=user_agent,
         cookies=cookies,
+        site_key=site_key,
     )
 
 
@@ -249,6 +263,7 @@ def fetch_page_artifacts(
     cookie_header: str | None = None,
     validate_html: Callable[[str], bool] | None = None,
     on_artifact_error: Callable[[str], None] | None = None,
+    site_key: str | None = None,
 ) -> tuple[str, bytes | None]:
     if mode == "browser":
         from darkweb_collector.browser_client import fetch_page_artifacts_with_browser
@@ -265,6 +280,7 @@ def fetch_page_artifacts(
             cookie_header=cookie_header,
             validate_html=validate_html,
             on_artifact_error=on_artifact_error,
+            bypass_profile=_bypass_profile(site_key, url),
         )
         return html, screenshot_png
 
@@ -275,6 +291,7 @@ def fetch_page_artifacts(
         render_wait_seconds=render_wait_seconds,
         retries=1,
         cookie_header=cookie_header,
+        site_key=site_key,
     )
     if validate_html is not None and validate_html(html) is False:
         raise CollectionFailure("parse", "source detail did not pass content validation")
@@ -385,128 +402,6 @@ def fetch_via_tor_curl(
 
         raise TorFetchError(f"curl fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
 
-def fetch_with_cloudflare_bypass(
-    url: str,
-    socks_host: str,
-    socks_port: int,
-    timeout: int = 90,
-    retries: int = 3,
-    backoff_seconds: float = 3.0,
-) -> str:
-    """Fetch URL with Cloudflare protection bypass"""
-    import random
-    import time
-    
-    # Add random delay before request
-    time.sleep(random.uniform(2, 5))
-    
-    # Use different user agents
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:123.0) Gecko/20100101 Firefox/123.0"
-    ]
-    
-    # Randomly select a user agent
-    user_agent = random.choice(user_agents)
-    
-    # Generate random accept headers
-    accept_languages = [
-        "en-US,en;q=0.9",
-        "en-GB,en;q=0.9,en-US;q=0.8",
-        "en-CA,en;q=0.9,en-US;q=0.8",
-        "en-AU,en;q=0.9,en-US;q=0.8"
-    ]
-    
-    accept_language = random.choice(accept_languages)
-    
-    # Use curl with enhanced anti-crawler headers
-    curl = shutil.which("curl")
-    if not curl:
-        raise TorFetchError("curl not found in PATH")
-    
-    attempts = 1 if managed_request() else retries + 1
-    last_error = "unknown curl error"
-    
-    for attempt in range(1, attempts + 1):
-        # Generate random headers using -H option
-        headers = [
-            f"-H", f"User-Agent: {user_agent}",
-            f"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            f"-H", f"Accept-Language: {accept_language}",
-            f"-H", "Accept-Encoding: gzip, deflate, br",
-            f"-H", "Connection: keep-alive",
-            f"-H", "Upgrade-Insecure-Requests: 1",
-            f"-H", "Cache-Control: max-age=0",
-            f"-H", "Sec-Fetch-Dest: document",
-            f"-H", "Sec-Fetch-Mode: navigate",
-            f"-H", "Sec-Fetch-Site: none",
-            f"-H", "Sec-Fetch-User: ?1"
-        ]
-        
-        # Build curl command with decompression
-        command = [
-            curl,
-            "--socks5-hostname", f"{socks_host}:{socks_port}",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time", str(timeout),
-            "--cookie-jar", "/tmp/cookies.txt",
-            "--cookie", "/tmp/cookies.txt",
-            "--compressed",  # Automatically decompress gzip/brotli
-            "--output", "/tmp/temp.html"  # Save to file to avoid encoding issues
-        ] + headers + [url]
-        
-        # Execute curl command with proper encoding handling
-        request_attempt()
-        result = subprocess.run(command, capture_output=True, check=False)
-        
-        if result.returncode == 0:
-            try:
-                # Read from the output file
-                with open("/tmp/temp.html", "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                
-                # Check if we got a Cloudflare page
-                if "Checking your browser" in content:
-                    # Add more delay and try again
-                    time.sleep(random.uniform(5, 10))
-                    continue
-                return content
-            except Exception as e:
-                # If reading as UTF-8 fails, try other encodings
-                encodings = ['latin-1', 'cp1252']
-                for encoding in encodings:
-                    try:
-                        with open("/tmp/temp.html", "r", encoding=encoding, errors="replace") as f:
-                            content = f.read()
-                        if "Checking your browser" in content:
-                            # Add more delay and try again
-                            time.sleep(random.uniform(5, 10))
-                            continue
-                        return content
-                    except:
-                        continue
-                # If all encodings fail, try binary read
-                try:
-                    with open("/tmp/temp.html", "rb") as f:
-                        content = f.read()
-                    return content.decode('utf-8', errors='replace')
-                except:
-                    return ""
-        
-        last_error = _stderr_text(result.stderr)
-        if attempt < attempts:
-            # Add exponential backoff
-            time.sleep(backoff_seconds * attempt)
-    
-    raise TorFetchError(f"Cloudflare bypass failed for {url}: {last_error}")
-
-
 def fetch_via_http_proxy(
     url: str,
     proxy_host: str = None,
@@ -518,130 +413,43 @@ def fetch_via_http_proxy(
     bypass_proxy: bool = False,
     user_agent: str | None = None,
     cookies: list[dict] | None = None,
+    *,
+    site_key: str | None = None,
+    deadline: float | None = None,
 ) -> str:
+    """Fetch a clear-web URL through the access-bypass HTTP route.
+
+    This keeps the historical signature every adapter already calls, but the
+    request is now made by :mod:`darkweb_collector.access_bypass.httpfetch`:
+
+    * TLS/HTTP2 impersonation (``curl_cffi``) instead of a randomised UA string,
+      because the edge scores the handshake, not the header;
+    * a persisted ``cf_clearance``/``__ddg*`` cookie replayed with the UA family
+      and egress path that earned it;
+    * jittered per-host pacing, so a retry no longer looks like a burst.
+
+    Failures keep the collector's taxonomy (``blocked``, ``rate_limited``,
+    ``auth_required``, ``timeout``, ``network``), which is what lets the
+    adapters fall back to the browser route for this same URL.
     """
-    Fetch URL using HTTP/HTTPS proxy (e.g., Clash, Shadowsocks, etc.)
-    If no proxy is configured, fetches directly.
 
-    Args:
-        url: The URL to fetch
-        proxy_host: Proxy host (default: from env PROXY_HOST or None)
-        proxy_port: Proxy port (default: from env PROXY_PORT or None)
-        timeout: Request timeout in seconds
-        retries: Number of retries on failure
-        backoff_seconds: Base backoff time between retries
+    from darkweb_collector.access_bypass import httpfetch, profiles
 
-    Returns:
-        The HTML content of the page
-    """
-    import random
-
-    # Get proxy settings from environment (no defaults - must be explicitly set)
-    if bypass_proxy:
-        proxy_host = None
-        proxy_port = None
-    else:
-        proxy_host = proxy_host or os.environ.get("PROXY_HOST")
-        proxy_port_str = os.environ.get("PROXY_PORT")
-        proxy_port = proxy_port or (int(proxy_port_str) if proxy_port_str else None)
-
-    # Use different user agents
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:123.0) Gecko/20100101 Firefox/123.0"
-    ]
-
-    # Keep the validated browser session's user agent when one is supplied.
-    user_agent = user_agent or random.choice(user_agents)
-    if any(ord(char) < 32 or ord(char) == 127 for char in user_agent):
-        raise CollectionFailure("infrastructure", "invalid source user-agent configuration")
-
-    # Generate random accept headers
-    accept_languages = [
-        "en-US,en;q=0.9",
-        "en-GB,en;q=0.9,en-US;q=0.8",
-        "en-CA,en;q=0.9,en-US;q=0.8",
-        "en-AU,en;q=0.9,en-US;q=0.8"
-    ]
-
-    accept_language = random.choice(accept_languages)
-
-    # Use curl with HTTP proxy
-    curl = shutil.which("curl")
-    if not curl:
-        raise ProxyFetchError("curl not found in PATH", kind="infrastructure")
-
-    attempts = 1 if managed_request() else retries + 1
-
-    with tempfile.TemporaryDirectory(prefix="dwti-http-fetch-") as temp_dir:
-        cookie_file = os.path.join(temp_dir, "cookies.txt")
-        output_file = os.path.join(temp_dir, "temp.html")
-        headers_file = os.path.join(temp_dir, "headers.txt")
-        _write_curl_cookies(cookie_file, url, cookie_header, cookies)
-        for attempt in range(1, attempts + 1):
-            # Generate headers
-            # Note: Not sending Accept-Encoding to avoid compressed responses
-            headers = [
-                f"-H", f"User-Agent: {user_agent}",
-                f"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                f"-H", f"Accept-Language: {accept_language}",
-                f"-H", "Connection: keep-alive",
-                f"-H", "Upgrade-Insecure-Requests: 1",
-                f"-H", "Cache-Control: max-age=0",
-                f"-H", "Sec-Fetch-Dest: document",
-                f"-H", "Sec-Fetch-Mode: navigate",
-                f"-H", "Sec-Fetch-Site: none",
-                f"-H", "Sec-Fetch-User: ?1",
-                f"-H", "DNT: 1"
-            ]
-
-            # Build curl command
-            command = [
-                curl,
-                "--silent",
-                "--show-error",
-                "--location",
-                "--max-time", str(timeout),
-                "--write-out", "%{http_code}",
-                "--cookie-jar", cookie_file,
-                "--cookie", cookie_file,
-                "--dump-header", headers_file,
-                "--output", output_file
-            ]
-
-            # Add proxy if configured
-            if bypass_proxy or not (proxy_host and proxy_port):
-                command.extend(["--noproxy", "*"])
-            else:
-                command.extend(["--proxy", f"http://{proxy_host}:{proxy_port}", "--noproxy", ""])
-
-            command.extend(headers + [url])
-
-            # Execute curl command
-            request_attempt()
-            result = subprocess.run(command, capture_output=True, check=False)
-            response_headers = _read_retry_after_headers(headers_file)
-            status_text = result.stdout.decode("ascii", errors="ignore") if isinstance(result.stdout, bytes) else str(result.stdout or "")
-            status = int(status_text.strip()) if status_text.strip().isdigit() else 0
-
-            if result.returncode == 0:
-                try:
-                    # Try UTF-8 first
-                    with open(output_file, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                except OSError as exc:
-                    raise ProxyFetchError("HTTP response body could not be read", kind="parse") from exc
-                raise_for_http_status(status, content, headers=response_headers)
-                return content
-            raise_for_http_status(status, headers=response_headers)
-
-            if attempt < attempts:
-                time.sleep(backoff_seconds * attempt)
-
-        raise ProxyFetchError(f"proxy fetch failed (exit {result.returncode})", kind="timeout" if result.returncode == 28 else "network")
+    profile = profiles.profile_for(site_key, url=url)
+    return httpfetch.fetch_via_http_proxy(
+        url,
+        proxy_host=proxy_host,
+        proxy_port=proxy_port,
+        timeout=timeout,
+        retries=retries,
+        backoff_seconds=backoff_seconds,
+        cookie_header=cookie_header,
+        bypass_proxy=bypass_proxy,
+        user_agent=user_agent,
+        cookies=cookies,
+        profile=profile,
+        deadline=deadline,
+    )
 
 
 def fetch_with_proxy_bypass(
@@ -651,16 +459,13 @@ def fetch_with_proxy_bypass(
     timeout: int = 90,
     retries: int = 3,
 ) -> str:
-    """
-    Fetch URL with proxy and anti-detection measures
-    
-    This is a convenience wrapper around fetch_via_http_proxy
-    """
+    """Deprecated alias kept for older call sites; use ``fetch_via_http_proxy``."""
+
     return fetch_via_http_proxy(
         url=url,
         proxy_host=proxy_host,
         proxy_port=proxy_port,
         timeout=timeout,
         retries=retries,
-        backoff_seconds=3.0
+        backoff_seconds=3.0,
     )

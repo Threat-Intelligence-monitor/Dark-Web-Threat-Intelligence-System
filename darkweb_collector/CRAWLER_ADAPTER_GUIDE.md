@@ -78,6 +78,14 @@ Windows 启动和调度会检查数据库引用的受管旧版本活动日志。
 
 失败恢复期间，每个站点/目标地址的主文档请求共用每小时 6 次的持久预算，成功入库后归零。HTTP、代理、浏览器备用路径均计入，适配器不能叠加独立重复循环绕过预算。恢复轮次仍可以使用有界的备用路径；持续失败限制的是轮次频率，避免永远只尝试第一条路径。观察时间、浏览量等字段变化不能清零失败请求预算；真实来源版本变化可以提前复查，但仍受该预算约束。人工强制运行会清除未在执行目标的冷却和预算，不抢占存活任务。
 
+## 访问绕过（Cloudflare / DDoS-Guard / 自定义 JS 挑战）
+
+明网论坛（darkforums、cracked、bf.st、spear.cx、leakforum、raidforums、xforums）都在商业反爬后面：明文 `curl` 得到 `403 + Cf-Mitigated: challenge`，根因是 TLS/HTTP2 指纹而不是 User-Agent。绕过实现位于 `src/darkweb_collector/access_bypass/`，接入点在 `tor_fetch`、`browser_client` 与各适配器，详见仓库根目录 `docs/access-bypass.md`。
+
+适配器侧只需两件事：浏览器路由传 `bypass_profile=bypass_profile_for(config.site_name, url=url, extras=config.extras)`；调用 `tor_fetch.fetch_url/fetch_page_artifacts` 时传 `site_key=config.site_name`。HTTP 路由按站点解析配置，`blocked` 不是终态，因此被拦后会自动退到浏览器路由——不需要在适配器里再写一层重试循环。
+
+站点级参数写在 `darkweb_collector/bypass_profiles.yaml`（JSON 语法），或在 `sites.yaml` 的站点条目里加 `access_bypass: {...}` 覆盖。可用 `python -m darkweb_collector.access_bypass.probe --all` 实测各站点的可用路由；`ACCESS_BYPASS_DISABLE=1` 可整体回退到旧行为。
+
 冷却中的记录仍保留在待抓清单，但不作为当前可执行新增任务，也不占历史发现的可执行容量。存在可执行新增时先处理新增；没有可执行新增时，历史发现仍受小窗口和配置页数限制。详情站点级退避期间仍检查最新列表，历史回补暂停并保留游标。
 
 Windows 启动器使用受监督的 `solo` 消费进程。详情总时限默认公网 300 秒、Onion 600 秒；`detail_task_timeout_seconds` 可以设置 60–900 秒。站点执行槽的 TTL 至少覆盖总时限加 90 秒清理余量，同时使用数据库站点准入锁防止消息服务租约过期后产生重叠执行。守护进程每 15 秒检查，Windows Job Object 收容浏览器子孙进程；确认全部退出后才恢复任务。清理或数据库/消息服务恢复失败时保留日志，阻止替换进程。

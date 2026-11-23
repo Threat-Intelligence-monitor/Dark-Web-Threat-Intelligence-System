@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 
 from darkweb_collector.adapters.darkforums import DarkforumsAdapter
+from darkweb_collector.access_bypass.profiles import profile_for as bypass_profile_for
 from darkweb_collector.adapters.forum_artifacts import restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_paginated_seed
 from darkweb_collector.browser_client import fetch_html_with_browser, fetch_page_artifacts_with_browser, screenshot_html_with_browser
@@ -36,6 +37,7 @@ class XforumsAdapter(DarkforumsAdapter):
             **browser_session_options(config, url, proxy_server),
             "browser_engine": str(config.extras.get("browser_engine") or "chromium"),
             "verification_provider": verification_provider,
+            "bypass_profile": bypass_profile_for(config.site_name, url=url, extras=config.extras),
         }
 
     def _fetch_html(self, url: str, config: SiteConfig, mode: str) -> str:

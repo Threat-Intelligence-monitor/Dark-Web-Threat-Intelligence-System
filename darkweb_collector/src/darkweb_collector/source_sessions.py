@@ -198,8 +198,12 @@ def browser_session_options(config, url: str, proxy_server=None) -> dict:
 
 
 def http_session_options(config, url: str, proxy_server=None) -> dict:
+    # The site key travels with the options so the HTTP route can apply the
+    # source's access-bypass profile (and any ``access_bypass`` overrides in
+    # sites.yaml) instead of guessing from the host alone.
+    site_key = getattr(config, "site_name", None)
     if not any(same_source(seed, url) for seed in config.seed_urls):
-        return {"cookie_header": None, "user_agent": None, "cookies": []}
+        return {"cookie_header": None, "user_agent": None, "cookies": [], "site_key": site_key}
     state, metadata, verified, _, _ = _snapshot(_state_path(config), url, proxy_server)
     cookies = state.get("cookies", []) if verified else []
     user_agent = str(metadata.get("user_agent") or "") if verified else ""
@@ -219,4 +223,5 @@ def http_session_options(config, url: str, proxy_server=None) -> dict:
             selected[name] = value
     return {"cookie_header": "; ".join(f"{name}={value}" for name, value in selected.items()) or None,
             "user_agent": user_agent or None,
-            "cookies": [cookie for cookie in selected_cookies if cookie["name"] not in selected]}
+            "cookies": [cookie for cookie in selected_cookies if cookie["name"] not in selected],
+            "site_key": site_key}

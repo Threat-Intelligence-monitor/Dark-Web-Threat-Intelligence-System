@@ -221,6 +221,7 @@ class DragonforceblogAdapter(SiteAdapter):
             render_html_for_screenshot=True,
             validate_html=validate,
             on_artifact_error=lambda message: metadata.update(artifact_error=message),
+            site_key=config.site_name,
         )
 
         validate(html)

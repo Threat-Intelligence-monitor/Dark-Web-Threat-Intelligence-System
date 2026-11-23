@@ -25,6 +25,7 @@ from darkweb_collector.db import (
     upsert_forum_topic,
 )
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
+from darkweb_collector.access_bypass.profiles import profile_for as bypass_profile_for
 from darkweb_collector.source_sessions import browser_session_options, http_session_options
 from darkweb_collector.sites.cracked import parse_cracked_detail, parse_cracked_list
 from darkweb_collector.tor_fetch import browser_proxy_server_for_url, fetch_via_http_proxy, get_http_proxy_settings
@@ -117,6 +118,7 @@ class CrackedAdapter(SiteAdapter):
         def browser_route():
             options = browser_session_options(config, url, browser_proxy)
             options["browser_engine"] = browser_engine
+            options["bypass_profile"] = bypass_profile_for(config.site_name, url=url, extras=config.extras)
             if not capture_screenshot:
                 return (
                     fetch_html_with_browser(

@@ -19,6 +19,7 @@ from darkweb_collector.db import (
     upsert_forum_topic,
 )
 from darkweb_collector.models import DetailResult, DetailTask, RunContext, SeedResult, SiteConfig
+from darkweb_collector.access_bypass.profiles import profile_for as bypass_profile_for
 from darkweb_collector.source_sessions import browser_session_options, http_session_options
 from darkweb_collector.sites.pwnfrm import parse_pwnfrm_detail, parse_pwnfrm_list
 from darkweb_collector.tor_fetch import browser_proxy_server_for_url, fetch_url
@@ -59,6 +60,7 @@ class PwnfrmAdapter(SiteAdapter):
                 return True
             options = browser_session_options(config, url, proxy_server)
             options["browser_engine"] = str(config.extras.get("browser_engine") or "firefox")
+            options["bypass_profile"] = bypass_profile_for(config.site_name, url=url, extras=config.extras)
             return fetch_html_with_browser(
                 url, wait_seconds=config.render_wait_seconds,
                 timeout_seconds=config.fetch_timeout_seconds, proxy_server=proxy_server,
@@ -189,6 +191,7 @@ class PwnfrmAdapter(SiteAdapter):
         if config.detail_fetch_mode == "browser":
             options = browser_session_options(config, url, proxy_server)
             options["browser_engine"] = str(config.extras.get("browser_engine") or "firefox")
+            options["bypass_profile"] = bypass_profile_for(config.site_name, url=url, extras=config.extras)
             capture_errors = []
             html, screenshot_png = fetch_page_artifacts_with_browser(
                 url, validate_html=validate, on_artifact_error=capture_errors.append, **capture_options, **options,

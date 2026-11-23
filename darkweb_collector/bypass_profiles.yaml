@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "_readme": [
+    "Access-bypass overrides, parsed as JSON (PyYAML is not a dependency of the collector).",
+    "Values here win over the built-in table in access_bypass/profiles.py; a site's",
+    "sites.yaml 'access_bypass' block wins over both. Only the keys you need to change",
+    "are required: every field is merged onto the built-in profile of the same key.",
+    "Leave this file absent to use the built-in table unchanged."
+  ],
+  "profiles": {
+    "darkforums": {
+      "challenge_wait_seconds": 30.0,
+      "clearance_ttl_seconds": 1800.0
+    },
+    "cracked": {
+      "challenge_wait_seconds": 20.0
+    },
+    "raidforums": {
+      "protection": "ddos-guard",
+      "challenge_wait_seconds": 30.0,
+      "min_interval_seconds": 4.0,
+      "max_interval_seconds": 9.0
+    },
+    "xforums": {
+      "challenge_wait_seconds": 25.0,
+      "min_interval_seconds": 2.0,
+      "max_interval_seconds": 6.0
+    }
+  },
+  "hosts": {
+    "www.darkforums.as": {
+      "challenge_wait_seconds": 30.0
+    }
+  }
+}

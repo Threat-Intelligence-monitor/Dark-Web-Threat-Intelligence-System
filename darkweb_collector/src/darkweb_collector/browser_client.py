@@ -14,12 +14,15 @@ from threading import Lock, Thread, current_thread
 import traceback
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlparse
 
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt, safe_failure_text
 from darkweb_collector.tor_fetch import raise_for_http_status
 from darkweb_collector.source_sessions import read_browser_session, persist_browser_session, same_source
+
+if TYPE_CHECKING:
+    from darkweb_collector.access_bypass.model import BypassProfile
 
 
 logger = logging.getLogger(__name__)
@@ -185,6 +188,27 @@ class BrowserClient:
         self._browser = None
         self._created_monotonic = 0.0
         self._task_count = 0
+        self._launch_profile = None
+        self._channel_unavailable = ""
+
+    def _launch_channel(self) -> str:
+        """Which Chrome build to drive, if one is configured or worth trying."""
+
+        if self._proxy.verification_provider == "dnsproxy":
+            return "chromium"
+        if self._channel_unavailable:
+            return ""
+        profile = self._launch_profile
+        if profile is None:
+            return ""
+        if profile.browser_channel:
+            return profile.browser_channel
+        if self._proxy.engine == "chromium" and profile.protection in {"cloudflare", "ddos-guard", "akamai", "incapsula"}:
+            # The bundled headless shell is the easiest Chromium build to spot;
+            # a real Chrome install costs nothing when it is present, and the
+            # caller already retries without a channel when it is not.
+            return "chrome"
+        return ""
 
     def _open(self) -> None:
         from playwright.sync_api import sync_playwright
@@ -198,17 +222,25 @@ class BrowserClient:
         self._playwright_context = sync_playwright()
         try:
             self._playwright = self._playwright_context.start()
-            launch_kwargs = {
-                "headless": True,
-            }
-            if self._proxy.engine == "chromium":
-                launch_kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
-                if self._proxy.verification_provider == "dnsproxy":
-                    launch_kwargs["channel"] = "chromium"
+            launch_kwargs = _launch_kwargs(self._proxy.engine, headless=True)
+            channel = self._launch_channel()
+            if channel:
+                launch_kwargs["channel"] = channel
             if self._proxy.server:
                 launch_kwargs["proxy"] = {"server": self._proxy.server}
             browser_type = getattr(self._playwright, self._proxy.engine)
-            self._browser = browser_type.launch(**launch_kwargs)
+            try:
+                self._browser = browser_type.launch(**launch_kwargs)
+            except Exception:
+                if "channel" not in launch_kwargs:
+                    raise
+                # A channel is an optimisation, not a requirement: the machine
+                # may not have that Chrome build installed.
+                logger.warning("capture phase=launch-retry reason=channel-unavailable channel=%s",
+                               launch_kwargs["channel"])
+                self._channel_unavailable = launch_kwargs["channel"]
+                launch_kwargs.pop("channel")
+                self._browser = browser_type.launch(**launch_kwargs)
             self._created_monotonic = time.monotonic()
             self._task_count = 0
             logger.info("capture phase=launch-done engine=%s elapsed=%.3f", self._proxy.engine, time.monotonic() - started)
@@ -255,12 +287,21 @@ class BrowserClient:
         user_agent: str | None = None,
         validate_html: Callable[[str], bool] | None = None,
         capture_content_selector: str | None = None,
+        bypass_profile: "BypassProfile | None" = None,
         _request_attempt: Callable[[], None] | None = None,
         _on_event: Callable[[str, object], None] | None = None,
         _deadline: float | None = None,
     ) -> tuple[str, bytes | None]:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+        if bypass_profile is not None:
+            profile = bypass_profile
+        else:
+            profile = _bypass_profile_for(url)
+        # The launch happens before the context, so the profile has to be known
+        # by then: an impersonated UA is only consistent if the actual browser
+        # binary matches it (real Chrome instead of the headless shell).
+        self._launch_profile = profile
         try:
             self._ensure_browser()
         except Exception as exc:
@@ -268,18 +309,27 @@ class BrowserClient:
                 f"browser runtime could not be started ({type(exc).__name__}): {exc}"
             ), scope="site") from exc
         assert self._browser is not None
+        stealth_plan = _stealth_plan(profile, engine=self._proxy.engine)
         storage_path = Path(storage_state_path).expanduser().resolve() if storage_state_path else None
         stored_state, session_revision, saved_agent = None, "", None
         if storage_path is not None:
             stored_state, session_revision, saved_agent = read_browser_session(
                 storage_path, url, self._proxy.server, self._proxy.engine,
             )
-        user_agent = user_agent or saved_agent or self._default_user_agent()
-        context_kwargs = {
-            "user_agent": user_agent,
-            "viewport": {"width": 1440, "height": 960},
-            "locale": "en-US",
-        }
+        # The UA is part of a clearance cookie's identity: ``cf_clearance`` is
+        # issued to one (egress, UA family) pair.  Using the impersonated
+        # identity here is what lets the cheaper HTTP route replay what the
+        # browser earned, instead of arriving with a mismatched UA and being
+        # challenged again.
+        user_agent = user_agent or saved_agent or _bypass_user_agent(profile) or self._default_user_agent()
+        if stealth_plan is not None:
+            context_kwargs = _context_kwargs(stealth_plan, user_agent)
+        else:
+            context_kwargs = {
+                "user_agent": user_agent,
+                "viewport": {"width": 1440, "height": 960},
+                "locale": "en-US",
+            }
         cookie_rows = _cookie_rows(cookie_header, url)
         if stored_state is not None:
             explicit_names = {cookie["name"] for cookie in cookie_rows}
@@ -292,7 +342,9 @@ class BrowserClient:
                 raise
             context_kwargs.pop("storage_state", None)
             context = self._browser.new_context(**context_kwargs)
-        if self._proxy.engine == "chromium":
+        if stealth_plan is not None:
+            _apply_stealth(context, stealth_plan)
+        elif self._proxy.engine == "chromium":
             context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
@@ -461,7 +513,14 @@ class BrowserClient:
             while time.monotonic() < render_deadline:
                 page.wait_for_timeout(min(250, max(0, (render_deadline - time.monotonic()) * 1000)))
                 check_rate_limit()
-            _clear_browser_check_interstitial(page, timeout_ms=max(0, int((deadline - time.monotonic()) * 1000)))
+            _handle_browser_check(
+                page,
+                timeout_ms=max(0, int((deadline - time.monotonic()) * 1000)),
+                profile=profile,
+                user_agent=user_agent,
+                proxy_server=self._proxy.server,
+                report=report,
+            )
             verified_document(validate_content=False)
             # Validate the source only after ordinary asynchronous content is
             # ready. A loading shell is not evidence of a parser regression.
@@ -483,6 +542,10 @@ class BrowserClient:
                     f"browser content did not become ready within the request deadline ({type(exc).__name__}): {exc}"
                 )) from exc
             verified_document()
+            # A cleared challenge is a source of cheap future requests: keep the
+            # clearance cookie so the HTTP impersonation route can replay it
+            # instead of paying for another browser launch.
+            _record_browser_clearance(context, url, user_agent, self._proxy.server, report=report)
             session_eligible = True
             try:
                 if hide_selectors:
@@ -842,6 +905,167 @@ def _looks_like_browser_check_page(html: str | None) -> bool:
     return False
 
 
+def _bypass_profile_for(url: str) -> "BypassProfile | None":
+    """Resolve the access-bypass profile for ``url``.
+
+    Site configuration wins; ``bypass_profiles.yaml`` supplies per-site and
+    per-host overrides.  Resolution is allowed to fail: a missing or broken
+    configuration must degrade to the previous behaviour, never block a fetch.
+    """
+
+    try:
+        from darkweb_collector.access_bypass import profiles
+
+        return profiles.profile_for(url=url)
+    except Exception:
+        logger.debug("access-bypass profile resolution failed for %s", url, exc_info=True)
+        return None
+
+
+def _stealth_plan(profile: "BypassProfile | None", *, engine: str):
+    if profile is None:
+        return None
+    try:
+        from darkweb_collector.access_bypass import stealth
+
+        plan = stealth.plan_for(profile.stealth, engine=engine)
+    except Exception:
+        logger.debug("access-bypass stealth plan failed", exc_info=True)
+        return None
+    return plan if plan.enabled else None
+
+
+def _bypass_user_agent(profile: "BypassProfile | None") -> str:
+    """The UA that matches the impersonated TLS fingerprint."""
+
+    if profile is None:
+        return ""
+    try:
+        from darkweb_collector.access_bypass import headers
+
+        return headers.identity_for(profile.header_profile, impersonate=profile.impersonate).user_agent
+    except Exception:
+        return ""
+
+
+def _context_kwargs(plan, user_agent: str) -> dict:
+    from darkweb_collector.access_bypass import stealth
+
+    return stealth.context_kwargs(plan, user_agent=user_agent)
+
+
+def _apply_stealth(context, plan) -> None:
+    from darkweb_collector.access_bypass import stealth
+
+    stealth.apply_to_context(context, plan)
+
+
+def _launch_kwargs(engine: str, *, headless: bool = True) -> dict:
+    try:
+        from darkweb_collector.access_bypass import stealth
+
+        plan = stealth.plan_for("full", engine=engine, headless=headless)
+        return stealth.launch_kwargs(plan, headless=headless)
+    except Exception:
+        logger.debug("access-bypass launch kwargs failed", exc_info=True)
+        return {"headless": headless}
+
+
+def _handle_browser_check(
+    page,
+    *,
+    timeout_ms: int,
+    profile: "BypassProfile | None" = None,
+    user_agent: str = "",
+    proxy_server: str | None = None,
+    report: Callable[[str, object], None] | None = None,
+) -> None:
+    """Clear an interstitial, interacting with it only when the profile allows it.
+
+    Without a profile the previous passive wait is kept verbatim, so an operator
+    who disables access bypass gets exactly the old behaviour back.
+    """
+
+    if not _looks_like_browser_check_page(_read_page_content(page)):
+        return
+    if profile is None:
+        _clear_browser_check_interstitial(page, timeout_ms=timeout_ms)
+        return
+    try:
+        from darkweb_collector.access_bypass import challenge as challenge_ops
+
+        result = challenge_ops.solve(
+            page,
+            lambda: _read_page_content(page),
+            profile=profile,
+            deadline=time.monotonic() + max(0, timeout_ms) / 1000,
+        )
+    except Exception as exc:
+        _emit_event(report, "bypass_error", exc)
+        _clear_browser_check_interstitial(page, timeout_ms=timeout_ms)
+        return
+    _emit_event(report, "bypass", {
+        "challenge": result.signal.kind,
+        "solved": result.solved,
+        "waited_ms": result.waited_ms,
+        "reason": result.reason,
+    })
+    if result.cookies:
+        _store_clearance(page.url, result.cookies, user_agent, proxy_server,
+                         source="browser", challenge=result.signal.kind, report=report)
+
+
+def _record_browser_clearance(
+    context,
+    url: str,
+    user_agent: str,
+    proxy_server: str | None,
+    *,
+    report: Callable[[str, object], None] | None = None,
+) -> None:
+    try:
+        cookies = context.cookies()
+    except Exception:
+        return
+    _store_clearance(url, cookies, user_agent, proxy_server, source="browser", report=report)
+
+
+def _store_clearance(
+    url: str,
+    cookies,
+    user_agent: str,
+    proxy_server: str | None,
+    *,
+    source: str,
+    challenge: str = "",
+    report: Callable[[str, object], None] | None = None,
+) -> None:
+    host = (urlparse(str(url)).hostname or "").lower()
+    if not host:
+        return
+    try:
+        from darkweb_collector.access_bypass import clearance, detect
+
+        names = sorted({str(cookie.get("name", "")) for cookie in cookies})
+        logger.debug("browser cookies host=%s names=%s", host, names)
+        rows = [cookie for cookie in cookies if detect.has_clearance_cookie([cookie])]
+        if not rows:
+            return
+        clearance.record(host, rows, user_agent=user_agent, proxy_server=proxy_server,
+                         source=source, challenge=challenge)
+    except Exception as exc:
+        _emit_event(report, "bypass_error", exc)
+
+
+def _emit_event(report, kind: str, value) -> None:
+    if report is None:
+        return
+    try:
+        report(kind, value)
+    except Exception:
+        pass
+
+
 def _clear_browser_check_interstitial(
     page,
     *,
@@ -903,12 +1127,13 @@ def fetch_html_with_browser(
     validate_html: Callable[[str], bool] | None = None,
     capture_content_selector: str | None = None,
     verification_provider: str = "",
+    bypass_profile: "BypassProfile | None" = None,
 ) -> str:
     options = dict(url=url, wait_seconds=wait_seconds, timeout_seconds=timeout_seconds,
                    capture_screenshot=False, proxy_server=proxy_server, browser_engine=browser_engine,
                    verification_provider=verification_provider, storage_state_path=storage_state_path,
                    persist_storage_state=persist_storage_state, cookie_header=cookie_header, user_agent=user_agent,
-                   capture_content_selector=capture_content_selector)
+                   capture_content_selector=capture_content_selector, bypass_profile=bypass_profile)
     html, _ = _run_browser_request("fetch", options, validate_html=validate_html)
     return html
 
@@ -932,6 +1157,7 @@ def fetch_page_artifacts_with_browser(
     capture_content_selector: str | None = None,
     verification_provider: str = "",
     on_artifact_error: Callable[[str], None] | None = None,
+    bypass_profile: "BypassProfile | None" = None,
 ) -> tuple[str, bytes | None]:
     options = dict(url=url, wait_seconds=wait_seconds, timeout_seconds=timeout_seconds,
                    proxy_server=proxy_server, browser_engine=browser_engine, verification_provider=verification_provider,
@@ -939,7 +1165,7 @@ def fetch_page_artifacts_with_browser(
                    hide_selectors=hide_selectors, screenshot_styles=screenshot_styles,
                    storage_state_path=storage_state_path, persist_storage_state=persist_storage_state,
                    capture_ready_script=capture_ready_script, cookie_header=cookie_header, user_agent=user_agent,
-                   capture_content_selector=capture_content_selector)
+                   capture_content_selector=capture_content_selector, bypass_profile=bypass_profile)
     return _run_browser_request("fetch", options, validate_html=validate_html, on_artifact_error=on_artifact_error)
 
 

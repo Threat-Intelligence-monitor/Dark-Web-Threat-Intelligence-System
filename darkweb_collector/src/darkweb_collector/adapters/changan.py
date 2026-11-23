@@ -12,6 +12,7 @@ import subprocess
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from darkweb_collector.adapters.base import SiteAdapter
+from darkweb_collector.access_bypass.profiles import profile_for as bypass_profile_for
 from darkweb_collector.adapters.forum_artifacts import detail_artifacts_complete, restore_detail_artifacts
 from darkweb_collector.adapters.pagination import collect_paginated_seed
 from darkweb_collector.browser_client import fetch_page_artifacts_with_browser
@@ -297,6 +298,7 @@ class ChanganAdapter(SiteAdapter):
                 storage_state_path=storage_state_path,
                 capture_ready_script=_capture_ready_script(bool(detail.get("attachments"))),
                 on_artifact_error=lambda message: metadata.update(artifact_error=message),
+                bypass_profile=bypass_profile_for(config.site_name, url=detail_task.target_url, extras=config.extras),
             )
             raise_if_error_page(rendered_html)
             if not screenshot_png:

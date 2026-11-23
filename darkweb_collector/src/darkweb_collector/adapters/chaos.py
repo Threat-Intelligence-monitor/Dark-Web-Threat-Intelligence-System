@@ -134,6 +134,7 @@ class ChaosAdapter(SiteAdapter):
             screenshot_selector=screenshot_selector,
             validate_html=validate,
             on_artifact_error=lambda message: metadata.update(artifact_error=message),
+            site_key=config.site_name,
         )
         validate(html)
         if not screenshot_png:

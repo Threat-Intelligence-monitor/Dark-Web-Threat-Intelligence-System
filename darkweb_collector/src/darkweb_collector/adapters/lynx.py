@@ -173,6 +173,7 @@ class LynxAdapter(SiteAdapter):
             screenshot_selectors=selectors,
             validate_html=validate,
             on_artifact_error=lambda message: metadata.update(artifact_error=message),
+            site_key=config.site_name,
         )
         validate(html)
         detail["artifact_stem"] = detail_task.metadata.get("artifact_stem") or ""
