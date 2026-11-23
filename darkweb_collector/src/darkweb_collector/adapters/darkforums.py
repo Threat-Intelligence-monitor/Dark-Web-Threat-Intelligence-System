@@ -194,16 +194,28 @@ class DarkforumsAdapter(SiteAdapter):
         return f"https://darkforums.as{SYNDICATION_DEFAULT_PATH}"
 
     def _fetch_feed_xml(self, config: SiteConfig, feed_url: str) -> str:
-        return fetch_via_http_proxy(
-            feed_url,
-            timeout=config.fetch_timeout_seconds,
-            retries=1,
-            bypass_proxy=True,
-            **http_session_options(config, feed_url, None),
-        )
+        """Fetch the feed over HTTP first, then through the browser.
 
-    def _collect_feed_seed(self, config: SiteConfig, cause: Exception) -> SeedResult:
-        """Fallback seed: read the newest threads (and their post bodies) from the RSS feed.
+        `/syndication.php` usually answers a plain client, but the egress that Cloudflare
+        has already flagged gets a 403 for it too. The browser route is slower, yet it can
+        still load the page because there is no interactive challenge on the feed itself.
+        """
+        try:
+            return fetch_via_http_proxy(
+                feed_url,
+                timeout=config.fetch_timeout_seconds,
+                retries=1,
+                bypass_proxy=True,
+                **http_session_options(config, feed_url, None),
+            )
+        except CollectionFailure as exc:
+            if exc.kind in self.terminal_failure_kinds:
+                raise
+            logger.warning("darkforums feed direct fetch failed (%s); retrying through the browser", exc.kind)
+        return fetch_html_with_browser(feed_url, **self._browser_options(config, feed_url))
+
+    def _collect_feed_seed(self, config: SiteConfig, cause: Exception | None = None) -> SeedResult:
+        """Read the newest threads (and their post bodies) from the RSS feed.
 
         The forum listing sits behind the same managed challenge as thread pages,
         while `/syndication.php` is served untouched. Its items carry the first
@@ -240,7 +252,7 @@ class DarkforumsAdapter(SiteAdapter):
             collected_at_utc=collected_at,
             payload=payload,
             raw_html_by_url={feed_url: xml_text},
-            metadata={"feed_fallback": True, "feed_cause": safe_failure_text(str(cause)), "discovery_lane": "feed"},
+            metadata={"feed_fallback": cause is not None, "feed_cause": safe_failure_text(str(cause)) if cause else "", "discovery_lane": "feed"},
         )
 
     def _detail_from_feed(self, detail_task: DetailTask, config: SiteConfig) -> DetailResult | None:
@@ -269,6 +281,20 @@ class DarkforumsAdapter(SiteAdapter):
         )
 
     def collect_seed(self, config: SiteConfig, run_ctx: RunContext) -> SeedResult:
+        """Prefer the feed; the listing costs a ~90s failed challenge cycle first.
+
+        The forum listing answers this collector's egress with a managed challenge
+        (HTTP 403), so trying it first burns the whole seed budget and then still
+        needs the feed. `/syndication.php` answers in about three seconds, so the
+        order is flipped unless `darkforums_feed_first` is set to false.
+        """
+        if self._feed_preferred(config):
+            try:
+                return self._collect_feed_seed(config)
+            except CollectionFailure as exc:
+                if exc.kind in self.terminal_failure_kinds:
+                    raise
+                logger.warning("darkforums feed route failed (%s); falling back to the forum listing", exc.kind)
         try:
             return collect_forum_seed(self, config, self.list_parser, _section_name)
         except CollectionFailure as exc:
@@ -276,6 +302,13 @@ class DarkforumsAdapter(SiteAdapter):
                 raise
             logger.warning("darkforums listing route failed (%s); trying the syndication feed", exc.kind)
             return self._collect_feed_seed(config, exc)
+
+    @staticmethod
+    def _feed_preferred(config: SiteConfig) -> bool:
+        value = config.extras.get("darkforums_feed_first")
+        if value is None:
+            return True
+        return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
     def plan_details(self, seed_result: SeedResult, config: SiteConfig) -> list[DetailTask]:
         per_section_tasks: list[list[DetailTask]] = []
