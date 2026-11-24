@@ -458,14 +458,10 @@ class DarkforumsAdapter(SiteAdapter):
         )
         # Records saved before the feed route existed keep a bare body fragment as their
         # mirror, which no longer yields a usable image. Keep a restored result only when
-        # it actually carries an image; otherwise rebuild it from the feed or the payload.
+        # it actually carries an image; otherwise capture the live thread, and only fall
+        # back to the feed or to a rebuild from the stored payload when that fails.
         if restored is not None and restored.screenshot_png:
             return restored
-        from_feed = self._detail_from_feed(detail_task, config)
-        if from_feed is not None:
-            return from_feed
-        if restored is not None:
-            return self._mirror_from_stored(restored, detail_task, config)
         url = detail_task.target_url
         proxy_server = browser_proxy_server_for_url(url)
         hide_selectors = ("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer")
@@ -483,12 +479,12 @@ class DarkforumsAdapter(SiteAdapter):
             detail, parsed_html = parsed, html
             return True
 
-        # While the feed is the preferred source, threads outside it are almost always
-        # unreachable from this egress; a browser attempt would burn ~90s before failing,
-        # so keep those to the cheap direct probe. Set `darkforums_feed_first: false` to
-        # restore the old browser route.
+        # The live thread page is the only way to produce the source's own mirror,
+        # so the browser route is always worth an attempt while the feed still
+        # serves discovery: a stale browser session used to make this fail, and the
+        # feed fallback below keeps the record useful when the source really blocks.
         routes = [] if is_onion_url(url) else ["direct"]
-        if config.detail_fetch_mode == "browser" and not self._feed_preferred(config):
+        if config.detail_fetch_mode == "browser":
             routes.append("browser")
         elif is_onion_url(url) or proxy_server:
             routes.append("proxy")
@@ -553,6 +549,14 @@ class DarkforumsAdapter(SiteAdapter):
                 failures.append((route, exc))
             except Exception as exc:
                 failures.append((route, exc))
+        # The live source refused every route (Cloudflare can block one egress for
+        # hours). Fall back to what the feed already delivered, then to a rebuild
+        # from the stored payload, so the record keeps an image either way.
+        from_feed = self._detail_from_feed(detail_task, config)
+        if from_feed is not None:
+            return from_feed
+        if restored is not None:
+            return self._mirror_from_stored(restored, detail_task, config)
         raise summarize_failures(f"{self.site_name} detail fetch routes failed", failures)
 
     def persist(

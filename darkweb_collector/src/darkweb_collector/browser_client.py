@@ -18,7 +18,12 @@ from urllib.parse import urlparse
 
 from darkweb_collector.collection_errors import CollectionFailure, raise_if_error_page, request_attempt, safe_failure_text
 from darkweb_collector.tor_fetch import raise_for_http_status
-from darkweb_collector.source_sessions import read_browser_session, persist_browser_session, same_source
+from darkweb_collector.source_sessions import (
+    invalidate_browser_session,
+    persist_browser_session,
+    read_browser_session,
+    same_source,
+)
 
 if TYPE_CHECKING:
     from darkweb_collector.access_bypass.model import BypassProfile
@@ -403,6 +408,11 @@ class BrowserClient:
             nonlocal main_response
             if received.request.is_navigation_request() and received.frame == page.main_frame:
                 main_response = received
+                if received.status == 403 and stored_state is not None and storage_path is not None:
+                    # The saved clearance was replayed and refused: drop it so the
+                    # next capture starts from a clean context instead of
+                    # reproducing the same 403 until the cookie expires.
+                    invalidate_browser_session(storage_path)
                 if (received.status in {401, 429} or received.status == 403 and validated_html is not None) and terminal_failure is None:
                     try:
                         if not same_source(url, received.url):

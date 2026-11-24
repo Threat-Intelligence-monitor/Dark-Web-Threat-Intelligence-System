@@ -16,6 +16,30 @@ from darkweb_collector.runtime import user_data_root
 from darkweb_collector.session_cookies import resolve_session_cookie
 
 
+# A clearance cookie is bound to one (egress, user-agent) pair and the source
+# can stop honouring it long before its own expiry.  Replaying a days-old
+# ``cf_clearance`` is worse than starting clean: Cloudflare answers a hard 403
+# instead of a solvable challenge, which reads like an IP ban in the task log.
+MAX_SESSION_AGE_SECONDS = 6 * 3600
+
+
+def session_max_age_seconds() -> float:
+    raw = os.environ.get("DARKWEB_BROWSER_SESSION_MAX_AGE_SECONDS", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(MAX_SESSION_AGE_SECONDS)
+    return value if value > 0 else float(MAX_SESSION_AGE_SECONDS)
+
+
+def _session_expired(metadata: dict) -> bool:
+    try:
+        verified_ns = float(metadata.get("verified_at_ns") or 0)
+    except (TypeError, ValueError):
+        return True
+    return verified_ns <= 0 or (time.time() - verified_ns / 1e9) > session_max_age_seconds()
+
+
 def source_origin(url: str) -> str:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -82,7 +106,8 @@ def _snapshot(path: Path, url: str, proxy_server):
     verified = bool(raw and metadata.get("state_sha256") == _digest(raw)
                     and metadata.get("origin") == source_origin(url)
                     and metadata.get("proxy_sha256") == _proxy_digest(proxy_server)
-                    and metadata.get("user_agent"))
+                    and metadata.get("user_agent")
+                    and not _session_expired(metadata))
     return state, metadata, verified, _digest(raw) + ":" + _digest(metadata_raw), metadata_raw is not None
 
 
@@ -143,6 +168,28 @@ def _session_lock(path: Path):
                 msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def invalidate_browser_session(path: Path) -> bool:
+    """Drop a stored context the source no longer honours.
+
+    Called after a hard 403 that arrived while a saved session was replayed:
+    keeping the state would make every later attempt repeat the same rejection,
+    and the age check alone cannot distinguish "fresh but already revoked".
+    """
+    removed = False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _session_lock(path):
+            for target in (path, _sidecar(path)):
+                try:
+                    target.unlink()
+                    removed = True
+                except FileNotFoundError:
+                    continue
+    except OSError:
+        return False
+    return removed
 
 
 def persist_browser_session(state: dict, path: Path, *, url: str, proxy_server,

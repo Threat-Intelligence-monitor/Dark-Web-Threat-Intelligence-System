@@ -152,43 +152,48 @@ xforums 使用的是自定义 JS 挑战（`/verify-challenge?token=...`，页面
 - **登录墙不是反爬**：站点用 403 + 「You are either not logged in or do not have permission…」这类模板拒绝游客时，请求会归为 `restricted`（正文需要账号），不会再去解挑战。这类源必须配 `session_cookie_env`/`session_cookie_file` 或在浏览器侧提供 `storage_state`，否则只能抓公开列表。bf.st、cracked、darkforums、leakforum、xforums 的部分分区属此类。
 - **采集出口的信誉就是成功率**：明网请求若走 Tor 出口，Cloudflare/DDoS-Guard 会明显更严（同一个 darkforums 线程，本机直连 200，Tor 出口 403 `cloudflare/managed`）。明网站点应走普通出口，Tor 只留给 `.onion`。
 - **MyBB「Hidden Content」不是权限错误**：darkforums 的线程页对游客返回 200，正文位置是 `Hidden Content — You must register or login to view this content.`。挑战解得出、页面也渲染得出来，但首帖正文仍被隐藏，只能走下面第 8 节的 RSS 订阅源（或配登录会话）。
+- **别回放过期会话**：`cf_clearance` 绑定出口与 UA，过期后回放会换来硬 403（不给可解挑战）。会话超过 6 小时后自动失效、回放被 403 时自动清盘，详见 8.2。
 
 ## 7. 依赖
 
 `curl_cffi` 是 HTTP 伪装路由的唯一依赖，已写入 `darkweb_collector/requirements.txt`。缺失时 `httpfetch` 自动降级到 `curl.exe`：请求仍带完整浏览器头，但没有 TLS 指纹，Cloudflare 站点会重新回到 403。
 
-## 8. 站点专项：darkforums 改走 RSS 订阅源
+## 8. 站点专项：darkforums 的 RSS 发现 + 真页面镜像
 
-darkforums 在部分出口 IP 上会把列表页和线程页一起判给托管挑战（线上表现为 `direct: cloudflare/managed (HTTP 403)` + `browser: HTTP 403`），即使换 UA、换浏览器引擎也拿不到。
+darkforums 在不同出口上的待遇差别很大：有的出口明文 curl 就是 200，有的出口把列表页和线程页一起判给托管挑战（线上表现为 `direct: cloudflare/managed (HTTP 403)` + `browser: HTTP 403`）。所以这个站点把「发现主题」和「取正文镜像」两件事拆开：
 
-同一站点的 MyBB 订阅源 `https://darkforums.as/syndication.php?limit=40` 不受挑战保护，且 `<item>` 的 `<content:encoded>` 直接携带首帖正文——正好是线程页对游客隐藏的那段内容。因此这个站点的取数顺序是倒过来的：
-
-1. `collect_seed` **先抓 RSS**（约 3 秒），把每个 `<item>` 当一条主题写入 `feed` 分区；RSS 也失败时才回退到原列表路由；
+1. `collect_seed` **先抓 RSS**（`https://darkforums.as/syndication.php?limit=40`，约 3 秒），把每个 `<item>` 当一条主题写入 `feed` 分区；RSS 也失败时才回退到原列表路由；
 2. RSS 的 HTTP 请求若被同一出口判给挑战，自动改走浏览器路由再取一次（订阅源本身没有交互挑战，浏览器通常一次就能拿到）；
-3. 主题正文同时落盘到 `<output_dir>/darkforums-feed.json`（默认保留 7 天、最多 300 条）；
-4. `collect_detail` 开头的 `_detail_from_feed` 直接复用该快照，不再请求线程页；正文照样落库，**镜像图片由本地渲染生成**（见下），不依赖线程页；
-5. RSS 窗口之外的老主题（pending 队列里的历史线程）只走一次 cheap 的 direct 探测，不再尝试浏览器路由——在封 IP 的出口上浏览器必然 403，一次要烧 90 秒，2493 条积压就是 60 多个小时的无效等待。
+3. 主题快照落盘到 `<output_dir>/darkforums-feed.json`（默认保留 7 天、最多 300 条），供详情路由做兜底；
+4. `collect_detail` **正常走真实线程页**（`direct` → `browser`），拿到的就是源站原页面的截图——这是「来源页面镜像」唯一合规的来源；
+5. 真实路由全部失败时，才依次回退：feed 快照 → 已存记录的本地重建页（两者都会在镜像上打说明条，见 8.1）；
+6. RSS 窗口之外、且浏览器在该出口必然 403 的老主题，不再为它们烧 90 秒的浏览器路由：一次 cheap 的 direct 探测失败后直接走兜底。
 
-为什么不是「先撞墙再兜底」：线上首轮实测里，列表路由失败要烧掉约 94 秒才轮到兜底，而 RSS 只要 3 秒——顺序对调后，同样的采集窗口能多跑十几轮。
+为什么发现顺序是「RSS 优先」而不是「先撞墙再兜底」：线上首轮实测里，列表路由失败要烧掉约 94 秒才轮到兜底，而 RSS 只要 3 秒。
 
-实测（本机，2026-11-23）：40 条主题 / 3.3 s，40/40 带正文，最长 4 KB 级帖子完整可取。
+实测（本机，2026-11-23）：40 条主题 / 3.3 s，40/40 带正文；线程页经真浏览器 9–15 s 拿到真页面 + 200 KB 级截图。
 
-### 8.1 镜像图片：本地重建页，而不是空白 HTML 片段
+### 8.1 兜底镜像：本地重建页
 
-只把 `<content:encoded>` 的原样片段存成 `raw_html` 时，证据页的「来源页面镜像」面板会渲染出一张白底碎页（只有正文几行、没有标题和作者），和正常站点截图完全是两种观感。
+真实线程页拿不到时（出口被封、或该帖对游客隐藏正文），证据页仍需要一张可看的图：
 
-因此 feed 路由下会先用 `render_darkforums_feed_document()` 把这条主题拼成一个自包含的页面（深色主题、绿色标题栏、作者栏、正文、原文链接），再用 `screenshot_html_with_browser()` **在本地渲染并截图**（`javascript_enabled=False`、只放行主文档、`<script>`/`on*` 一律剥离），得到 `screenshot_png`。这一步不访问 darkforums.as，所以源站封不封这个出口都不影响出图；单条首次约 2.2 s（含浏览器启动），之后同线程复用 worker 约 0.5 s/条，5 条实测 4.3 s。
+- `feed` 路由用 `render_darkforums_feed_document()` 把 RSS 正文拼成自包含页面（深色主题、绿色标题栏、作者栏、正文、原文链接），再用 `screenshot_html_with_browser()` 本地渲染截图；
+- 已存记录缺图时，`mirror_render.render_mirror_document()` 用库里已有的正文做同样的事（`adapters/forum_artifacts.py:_capture_local_mirror`）；
+- 这两种图都会在顶部打说明条，`源站页面拒绝访问，正文取自已保存的采集结果` 或 `正文取自 DarkForums RSS 订阅源`——**不能当作源站原始截图引用**；
+- MyBB 的 `Hidden Content / You must register or login…` 标记会被改写成独立的「受限内容」提示块：原样保留会被证据渲染器误判成登录墙而中止出图。
 
-页面顶部有一条 `本地重建镜像 · 源站线程页拒绝访问，正文取自 DarkForums RSS 订阅源` 的说明条：它渲染的是真实正文，但版式是本地还原，不能当作源站原始页面的屏幕截图来引用。MyBB 的 `Hidden Content / You must register or login…` 标记会被改写成一条独立的「受限内容」提示块（原样保留会被证据渲染器误判成登录墙而中止出图）。
+首次渲染约 2.2 s（含浏览器启动），之后同 worker 约 0.5 s/条。
 
-可调项（写在 `sites.yaml` 的 `darkforums` 块里，走 `extras`）：
+### 8.2 过期的浏览器会话必须丢弃
 
-```json
-{
-  "site_name": "darkforums",
-  "darkforums_feed_url": "https://darkforums.as/syndication.php?limit=40",
-  "darkforums_feed_first": true
-}
-```
+线上的 darkforums 详情曾长期报 `HTTP 403; browser verification page returned`，而同一台服务器上用同一份代码、**不传 `storage_state`** 的浏览器 9–15 s 就能拿到真页面。差别只有一个：`<data_root>/browser-state/darkforums/storage-state.json` 里存着 5 天前的 `cf_clearance`。
 
-不配置时按 `seed_urls` 的 origin 自动拼 `/syndication.php?limit=40`；`darkforums_feed_first` 设为 `false` 可恢复「先列表、失败再兜底」的旧顺序。
+`cf_clearance` 绑定签发时的出口 IP 与 UA 指纹。拿一个过期的 clearance 去回放，Cloudflare 不会重新给可解挑战，而是直接返回硬 403 —— 比从干净上下文开始更糟。现在的规则：
+
+- `MAX_SESSION_AGE_SECONDS = 6 小时`（`DARKWEB_BROWSER_SESSION_MAX_AGE_SECONDS` 可覆盖）：sidecar 里 `verified_at_ns` 超龄的会话，既不会喂给浏览器，也不会被 `http_session_options` 回放；
+- 回放中的会话换来 403 时，`browser_client.remember_main_response()` 直接调用 `invalidate_browser_session()` 把 state + sidecar 删掉，下一次请求从干净上下文重来；
+- 会话通过验证后会重新写入 sidecar，`verified_at_ns` 刷新。
+
+排查同类问题时，先确认「是不是在回放过期会话」：拿掉 `storage_state_path` 再跑一次，如果成功，问题就在会话而不是出口。
+
+
