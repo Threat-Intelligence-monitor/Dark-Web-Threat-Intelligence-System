@@ -738,6 +738,93 @@ def build_darkforums_feed_detail(url: str, item: dict, *, collected_at_utc: str 
     }
 
 
+_MIRROR_EMBED_RE = re.compile(r"<(script|iframe|object|embed)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+_MIRROR_LINK_RE = re.compile(r"\s+(?:on\w+|target)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", re.IGNORECASE)
+_MIRROR_HIDDEN_RE = re.compile(
+    r"you must (?:register or login|log in|register|reply to this thread) to view this content\.?",
+    re.IGNORECASE,
+)
+_MIRROR_HIDDEN_LABEL_RE = re.compile(r"hidden content", re.IGNORECASE)
+_MIRROR_HIDDEN_NOTE = '<span class="mirror-note">源站要求登录或回复后才能查看此部分，镜像仅含 RSS 订阅源公开的内容。</span>'
+
+_MIRROR_STYLE = """
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 0 0 28px; background: #171a1d; color: #d7dbde;
+         font: 15px/1.65 "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  .mirror-root { max-width: 1080px; margin: 0 auto; background: #171a1d; }
+  .mirror-banner { padding: 6px 16px; background: #2a2f33; color: #9aa4ab; font-size: 12px;
+                   letter-spacing: .02em; border-bottom: 1px solid #3a4147; }
+  .mirror-banner b { color: #c8d0d6; font-weight: 600; }
+  .thread-head { padding: 12px 18px; background: linear-gradient(180deg, #2f7d4f 0%, #276b43 100%);
+                 border-bottom: 1px solid #1f5435; }
+  .thread-head h1 { margin: 0; font-size: 19px; line-height: 1.35; color: #f2f6f3; font-weight: 600; }
+  .thread-head .byline { margin-top: 4px; font-size: 12px; color: #d3e6da; }
+  .post { display: flex; align-items: flex-start; gap: 14px; padding: 18px; }
+  .author { flex: 0 0 168px; text-align: center; padding: 12px 8px; background: #1f2428;
+            border: 1px solid #313840; border-radius: 6px; }
+  .author .avatar { width: 84px; height: 84px; margin: 0 auto 10px; border-radius: 8px;
+                    background: #3a5f4a; color: #eef5f0; font-size: 34px; font-weight: 600;
+                    display: flex; align-items: center; justify-content: center; text-transform: uppercase; }
+  .author .name { font-weight: 600; color: #e7ecef; word-break: break-all; }
+  .author .meta { margin-top: 6px; font-size: 11px; color: #8e989f; }
+  .message { flex: 1 1 auto; min-width: 0; padding: 16px; background: #202529;
+             border: 1px solid #313840; border-radius: 6px; overflow-wrap: anywhere; }
+  .message .posted { margin-bottom: 10px; font-size: 11px; color: #8e989f;
+                     border-bottom: 1px solid #313840; padding-bottom: 8px; }
+  .message a { color: #67b3ff; }
+  .message img { max-width: 100%; height: auto; }
+  .mirror-note { display: block; margin: 10px 0; padding: 9px 12px; border-left: 3px solid #b5645f;
+                 background: #2b2224; color: #d8b7b4; font-size: 13px; }
+  .mirror-foot { margin: 0 18px; padding-top: 10px; border-top: 1px solid #313840;
+                 font-size: 11px; color: #7d878e; overflow-wrap: anywhere; }
+"""
+
+
+def _mirror_safe_html(html: str) -> str:
+    """Strip anything executable from feed HTML before it is rendered as evidence."""
+    cleaned = _MIRROR_EMBED_RE.sub("", html or "")
+    cleaned = _MIRROR_LINK_RE.sub("", cleaned)
+    # Rewrite MyBB's hidden-content marker: it is the source's own gate notice, and
+    # leaving it verbatim makes the evidence renderer read the document as a login page.
+    cleaned = _MIRROR_HIDDEN_RE.sub(_MIRROR_HIDDEN_NOTE, cleaned)
+    return _MIRROR_HIDDEN_LABEL_RE.sub("受限内容", cleaned)
+
+
+def render_darkforums_feed_document(detail: dict) -> str:
+    """Build a standalone, self-contained page for a post recovered from the RSS feed.
+
+    The forum pages answer this collector's egress with a Cloudflare challenge, so the
+    only body we can reach is the feed copy. Rendering that body inside a full thread
+    layout keeps the evidence panel readable instead of showing a bare HTML fragment;
+    the banner states that the page is a local reconstruction, not a capture of the
+    live thread.
+    """
+    title = unescape(str(detail.get("title") or "")) or "DarkForums thread"
+    author = unescape(str(detail.get("author") or "Unknown"))
+    source_url = str(detail.get("source_url") or "")
+    published = str(detail.get("timestamp") or detail.get("published_at_utc") or "")
+    body = _mirror_safe_html(str(detail.get("content") or ""))
+    initial = next((char for char in author if char.isalnum()), "?")
+    byline = f"by {author}" + (f" · {published}" if published else "")
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        f"<title>{title}</title><base href=\"{source_url}\">"
+        f"<style>{_MIRROR_STYLE}</style></head>"
+        "<body><div class=\"mirror-root\">"
+        "<div class=\"mirror-banner\"><b>本地重建镜像</b> · 源站线程页拒绝访问，"
+        "正文取自 DarkForums RSS 订阅源，版式为本地还原</div>"
+        f"<div class=\"thread-head\"><h1>{title}</h1><div class=\"byline\">{byline}</div></div>"
+        "<div class=\"post\">"
+        f"<aside class=\"author\"><div class=\"avatar\">{initial}</div>"
+        f"<div class=\"name\">{author}</div><div class=\"meta\">darkforums.as</div></aside>"
+        f"<section class=\"message\"><div class=\"posted\">#1 · {published or '发布时间未知'}</div>"
+        f"{body}</section></div>"
+        f"<div class=\"mirror-foot\">原文链接：{source_url}</div>"
+        "</div></body></html>"
+    )
+
+
 def get_darkforums_sections() -> dict:
     """Get the list of forum sections to crawl"""
     return FORUM_SECTIONS

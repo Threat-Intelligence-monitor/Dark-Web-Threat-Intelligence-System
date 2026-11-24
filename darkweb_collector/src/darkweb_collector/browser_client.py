@@ -736,6 +736,10 @@ class BrowserClient:
     ) -> bytes:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+        # A locally rendered document never talks to the site, but the launch channel
+        # still has to match the machine: protected sources prefer the installed Chrome
+        # when the bundled shell is absent.
+        self._launch_profile = _bypass_profile_for(base_url)
         self._ensure_browser()
         assert self._browser is not None
         stored_state, saved_agent = None, None

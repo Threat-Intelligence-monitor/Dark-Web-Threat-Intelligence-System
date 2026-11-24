@@ -31,6 +31,7 @@ from darkweb_collector.sites.darkforums import (
     parse_darkforums_detail,
     parse_darkforums_list,
     parse_darkforums_syndication,
+    render_darkforums_feed_document,
 )
 from darkweb_collector.tor_fetch import browser_proxy_server_for_url, fetch_url, fetch_via_http_proxy, is_onion_url
 from darkweb_collector.utils import dump_json, dump_text, safe_stem
@@ -268,17 +269,52 @@ class DarkforumsAdapter(SiteAdapter):
         except CollectionFailure:
             return None
         metadata = dict(detail_task.metadata)
-        metadata["artifact_error"] = "artifact: darkforums feed route has no rendered screenshot"
-        detail["_collector_artifact_error"] = metadata["artifact_error"]
-        logger.info("darkforums detail served from the feed cache: %s", url)
+        mirror_html = render_darkforums_feed_document(detail)
+        screenshot_png, artifact_error = self._screenshot_feed_mirror(config, url, mirror_html)
+        if screenshot_png:
+            metadata.pop("artifact_error", None)
+            detail.pop("_collector_artifact_error", None)
+        else:
+            metadata["artifact_error"] = artifact_error
+            detail["_collector_artifact_error"] = artifact_error
+        logger.info("darkforums detail served from the feed cache: %s (image=%s)", url, bool(screenshot_png))
         return DetailResult(
             site_name=self.site_name,
             target_url=url,
             payload=detail,
-            raw_html=str(item.get("content_html") or ""),
-            screenshot_png=None,
+            raw_html=mirror_html,
+            screenshot_png=screenshot_png or None,
             metadata=metadata,
         )
+
+    def _screenshot_feed_mirror(self, config: SiteConfig, url: str, mirror_html: str) -> tuple[bytes | None, str]:
+        """Render the reconstructed page locally so the detail keeps an image artifact.
+
+        The static render never touches darkforums.as, so it works even while the
+        forum itself refuses this collector's egress.
+        """
+        engines = ["chromium"]
+        configured = str(config.extras.get("browser_engine") or "")
+        if configured and configured not in engines:
+            engines.append(configured)
+        if "firefox" not in engines:
+            engines.append("firefox")
+        error = "artifact: darkforums feed mirror produced no image"
+        for engine in engines:
+            try:
+                return screenshot_html_with_browser(
+                    mirror_html, url,
+                    wait_seconds=1,
+                    timeout_seconds=min(120, max(30, config.fetch_timeout_seconds)),
+                    browser_engine=engine,
+                    screenshot_selectors=(".mirror-root",),
+                ), ""
+            except Exception as exc:
+                error = safe_failure_text(
+                    f"artifact: darkforums feed mirror capture failed ({type(exc).__name__}): {exc}"
+                )
+                logger.warning("darkforums feed mirror capture failed with %s: %s", engine, safe_failure_text(str(exc)))
+        return None, error
 
     def collect_seed(self, config: SiteConfig, run_ctx: RunContext) -> SeedResult:
         """Prefer the feed; the listing costs a ~90s failed challenge cycle first.
