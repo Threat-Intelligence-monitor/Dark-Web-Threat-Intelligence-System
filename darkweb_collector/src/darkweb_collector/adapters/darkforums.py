@@ -404,17 +404,67 @@ class DarkforumsAdapter(SiteAdapter):
             per_section_tasks = next_round
         return tasks
 
+    def _mirror_from_stored(self, restored: DetailResult, detail_task: DetailTask, config: SiteConfig) -> DetailResult:
+        """Give an already-stored record an image even when the feed no longer lists it.
+
+        The stored payload still holds the thread title, author and body, so the same
+        mirror layout can be rebuilt locally; only the capture step was missing.
+        """
+        url = detail_task.target_url
+        payload = dict(restored.payload)
+        body = str(payload.get("content") or payload.get("content_html") or "")
+        if not body.strip():
+            return restored
+        detail = {
+            "title": payload.get("title") or "",
+            "author": payload.get("author") or "",
+            "source_url": url,
+            "timestamp": payload.get("timestamp") or payload.get("published_at_utc") or "",
+            "content": body,
+        }
+        metadata = dict(restored.metadata)
+        mirror_html = render_darkforums_feed_document(detail)
+        screenshot_png, artifact_error = self._screenshot_feed_mirror(config, url, mirror_html)
+        if not screenshot_png:
+            metadata["artifact_error"] = artifact_error
+            payload["_collector_artifact_error"] = artifact_error
+            return DetailResult(
+                site_name=self.site_name,
+                target_url=url,
+                payload=payload,
+                raw_html=restored.raw_html,
+                screenshot_png=restored.screenshot_png,
+                metadata=metadata,
+            )
+        metadata.pop("artifact_error", None)
+        payload.pop("_collector_artifact_error", None)
+        payload["_collector_artifacts_complete"] = True
+        logger.info("darkforums stored detail rebuilt as a local mirror: %s", url)
+        return DetailResult(
+            site_name=self.site_name,
+            target_url=url,
+            payload=payload,
+            raw_html=mirror_html,
+            screenshot_png=screenshot_png,
+            metadata=metadata,
+        )
+
     def collect_detail(self, detail_task: DetailTask, config: SiteConfig, run_ctx: RunContext) -> DetailResult | None:
         restored = restore_detail_artifacts(
             detail_task, config, screenshot_selectors=self.detail_screenshot_selectors,
             capture_content_selector=self.detail_capture_content_selector,
             hide_selectors=("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
         )
-        if restored is not None:
+        # Records saved before the feed route existed keep a bare body fragment as their
+        # mirror, which no longer yields a usable image. Rebuild those from the feed cache
+        # instead of replaying the stored fragment.
+        if restored is not None and not restored.metadata.get("artifact_error"):
             return restored
         from_feed = self._detail_from_feed(detail_task, config)
         if from_feed is not None:
             return from_feed
+        if restored is not None:
+            return self._mirror_from_stored(restored, detail_task, config)
         url = detail_task.target_url
         proxy_server = browser_proxy_server_for_url(url)
         hide_selectors = ("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer")

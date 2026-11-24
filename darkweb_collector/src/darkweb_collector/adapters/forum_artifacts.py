@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 
 from darkweb_collector.browser_client import screenshot_html_with_browser
 from darkweb_collector.collection_errors import CollectionFailure, has_detail_body, raise_if_error_page, safe_failure_text
 from darkweb_collector.db import get_db_connection, get_forum_detail_snapshot, get_victim_snapshot
 from darkweb_collector.detail_artifacts import ARTIFACTS_KEY, detail_artifact_paths
+from darkweb_collector.mirror_render import render_mirror_document
 from darkweb_collector.models import DetailResult, DetailTask, SiteConfig
 from darkweb_collector.source_sessions import browser_session_options, http_session_options
 from darkweb_collector.tor_fetch import browser_proxy_server_for_url
@@ -14,6 +16,8 @@ from darkweb_collector.tor_fetch import browser_proxy_server_for_url
 
 # Prefer the actual body over a wider MyBB content column containing author UI.
 FORUM_CAPTURE_CONTENT_SELECTOR = ".post_body, .post_content:not(:has(.post_body)), .messageContent:not(:has(.post_body))"
+
+logger = logging.getLogger(__name__)
 
 
 def detail_artifacts_complete(directory, stem: str, raw_payload=None, *, root=None, site_name="", target_url="", forum=False, source_version="") -> bool:
@@ -37,6 +41,42 @@ def detail_artifacts_complete(directory, stem: str, raw_payload=None, *, root=No
     except (OSError, ValueError):
         return False
     return isinstance(payload, dict) and payload.get("_collector_artifacts_complete") is not False
+
+
+def _capture_local_mirror(payload: dict, detail_task: DetailTask, config: SiteConfig) -> tuple[str, bytes] | None:
+    """Render the stored body as a page and screenshot it, without touching the source."""
+    body = str(payload.get("content") or payload.get("content_html") or "")
+    if not body.strip():
+        return None
+    url = detail_task.target_url
+    document = render_mirror_document(
+        title=str(payload.get("title") or ""),
+        author=str(payload.get("author") or ""),
+        published=str(payload.get("timestamp") or payload.get("published_at_utc") or ""),
+        source_url=url,
+        body=body,
+        site_label=str(payload.get("domain") or ""),
+        banner="源站页面拒绝访问，正文取自已保存的采集结果，版式为本地还原",
+    )
+    engines = ["chromium"]
+    configured = str(getattr(config, "extras", {}).get("browser_engine") or "")
+    if configured and configured not in engines:
+        engines.append(configured)
+    for engine in engines:
+        try:
+            image = screenshot_html_with_browser(
+                document, url,
+                wait_seconds=1,
+                timeout_seconds=min(120, max(30, config.fetch_timeout_seconds)),
+                browser_engine=engine,
+                screenshot_selectors=(".mirror-root",),
+            )
+        except Exception as exc:
+            logger.warning("mirror capture failed with %s: %s", engine, safe_failure_text(str(exc)))
+            continue
+        if image:
+            return document, image
+    return None
 
 
 def restore_detail_artifacts(
@@ -150,12 +190,20 @@ def restore_detail_artifacts(
             raise CollectionFailure("artifact", "stored detail evidence capture produced no image")
     except Exception as exc:
         # A verified, already-saved body remains usable when only its evidence
-        # cannot be refreshed. The caller persists partial and retries evidence.
-        error = safe_failure_text(f"artifact: stored detail evidence capture failed ({type(exc).__name__}): {exc}")
-        metadata["artifact_error"] = error
-        payload["_collector_artifact_error"] = error
-        payload["_collector_artifacts_complete"] = False
-        capture_html, screenshot = html, None
+        # cannot be refreshed. Try a local reconstruction first: the panel then shows
+        # a readable page instead of a white strip of text.
+        rebuilt = _capture_local_mirror(payload, detail_task, config)
+        if rebuilt is not None:
+            capture_html, screenshot = rebuilt
+            metadata.pop("artifact_error", None)
+            payload.pop("_collector_artifact_error", None)
+            payload["_collector_artifacts_complete"] = True
+        else:
+            error = safe_failure_text(f"artifact: stored detail evidence capture failed ({type(exc).__name__}): {exc}")
+            metadata["artifact_error"] = error
+            payload["_collector_artifact_error"] = error
+            payload["_collector_artifacts_complete"] = False
+            capture_html, screenshot = html, None
     return DetailResult(
         site_name=detail_task.site_name, target_url=detail_task.target_url, payload=payload,
         raw_html=capture_html, screenshot_png=screenshot, metadata=metadata,
