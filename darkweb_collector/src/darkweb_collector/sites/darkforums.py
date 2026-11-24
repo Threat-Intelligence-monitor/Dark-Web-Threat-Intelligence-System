@@ -746,6 +746,7 @@ def render_darkforums_feed_document(detail: dict) -> str:
     body we can reach is the feed copy. Rendering it in a thread layout keeps the
     evidence panel readable instead of showing a bare HTML fragment.
     """
+    stored = bool(detail.get("stored"))
     return render_mirror_document(
         title=str(detail.get("title") or ""),
         author=str(detail.get("author") or ""),
@@ -753,7 +754,11 @@ def render_darkforums_feed_document(detail: dict) -> str:
         source_url=str(detail.get("source_url") or ""),
         body=str(detail.get("content") or ""),
         site_label="darkforums.as",
-        banner="源站线程页拒绝访问，正文取自 DarkForums RSS 订阅源，版式为本地还原",
+        banner=(
+            "源站页面拒绝访问，正文取自已保存的采集结果，版式为本地还原"
+            if stored
+            else "源站线程页拒绝访问，正文取自 DarkForums RSS 订阅源，版式为本地还原"
+        ),
     )
 
 

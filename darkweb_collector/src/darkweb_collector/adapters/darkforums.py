@@ -421,6 +421,7 @@ class DarkforumsAdapter(SiteAdapter):
             "source_url": url,
             "timestamp": payload.get("timestamp") or payload.get("published_at_utc") or "",
             "content": body,
+            "stored": True,
         }
         metadata = dict(restored.metadata)
         mirror_html = render_darkforums_feed_document(detail)
@@ -456,9 +457,9 @@ class DarkforumsAdapter(SiteAdapter):
             hide_selectors=("header", "#panel", "#quick-search", ".bam_wrapper", ".footer", "footer"),
         )
         # Records saved before the feed route existed keep a bare body fragment as their
-        # mirror, which no longer yields a usable image. Rebuild those from the feed cache
-        # instead of replaying the stored fragment.
-        if restored is not None and not restored.metadata.get("artifact_error"):
+        # mirror, which no longer yields a usable image. Keep a restored result only when
+        # it actually carries an image; otherwise rebuild it from the feed or the payload.
+        if restored is not None and restored.screenshot_png:
             return restored
         from_feed = self._detail_from_feed(detail_task, config)
         if from_feed is not None:
