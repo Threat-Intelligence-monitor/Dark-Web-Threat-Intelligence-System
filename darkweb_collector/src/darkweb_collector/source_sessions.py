@@ -255,7 +255,9 @@ def session_status(path: Path, url: str, proxy_server=None) -> dict:
     if verified_at_ns:
         age_seconds = max(0.0, time.time() - verified_at_ns / 1_000_000_000)
     if not has_metadata:
-        status = "missing"
+        # A state file without its provenance record cannot be trusted; saying
+        # "missing" would hide a real file an operator may want to replace.
+        status = "invalid_state" if path.exists() else "missing"
     elif verified:
         status = "valid"
     else:

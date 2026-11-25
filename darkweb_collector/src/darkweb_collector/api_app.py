@@ -558,6 +558,18 @@ def healthcheck_page() -> FileResponse:
     return FileResponse(path, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/collector-console", include_in_schema=False)
+@app.get("/collector-console/", include_in_schema=False)
+def collector_console_page() -> FileResponse:
+    """Serve the queue and login console.
+
+    The dashboard that ships with the product is a separate build, so this small
+    standalone page is what an operator gets without rebuilding the front end.
+    """
+    path = Path(__file__).resolve().parents[2] / "templates" / "collector_console.html"
+    return FileResponse(path, media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
 @app.get("/healthcheck/api", include_in_schema=False)
 def system_diagnostics_catalog(request: Request) -> dict:
     _require_admin(request, action="执行系统诊断")

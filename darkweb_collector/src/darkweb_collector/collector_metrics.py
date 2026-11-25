@@ -267,7 +267,6 @@ def build_queue_view(status="", site="", page=1, page_size=20, q="") -> dict:
     from darkweb_collector.crawl_frontier import (
         RETIRED_STATUS,
         count_frontier_entries,
-        frontier_counts,
         list_frontier_entries,
         retire_threshold,
     )
@@ -284,18 +283,17 @@ def build_queue_view(status="", site="", page=1, page_size=20, q="") -> dict:
     page_size = min(200, max(1, int(page_size)))
     page = max(1, int(page))
     with get_db_connection() as connection:
-        total = count_frontier_entries(connection, site_names, statuses)
+        total = count_frontier_entries(connection, site_names, statuses, contains=q)
         page = min(page, max(1, (total + page_size - 1) // page_size))
         entries = list_frontier_entries(connection, site_names, statuses=statuses,
-                                        limit=page_size, offset=(page - 1) * page_size)
-        counts = frontier_counts(connection, site_names)
-    query = str(q or "").strip().casefold()
-    if query:
-        entries = [
-            entry for entry in entries
-            if query in entry["target_url"].casefold() or query in entry["section"].casefold()
-            or query in labels.get(entry["site_name"], entry["site_name"]).casefold()
-        ]
+                                        limit=page_size, offset=(page - 1) * page_size, contains=q)
+        # Count by the status the table shows: the frontier's own pending bucket
+        # also swallows rows nobody has claimed yet, which made the chips
+        # disagree with the rows underneath them.
+        summary = {
+            bucket: count_frontier_entries(connection, site_names, [bucket])
+            for bucket in ("pending", "queued", "running", "retired", "done")
+        }
     items = []
     for entry in entries:
         items.append({
@@ -313,13 +311,7 @@ def build_queue_view(status="", site="", page=1, page_size=20, q="") -> dict:
             "retired_at": iso(entry["retired_at"]) if entry["retired_at"] else "",
             "retire_reason": entry["retire_reason"],
         })
-    summary = {
-        "pending": sum(row["pending"] for row in counts.values()),
-        "running": sum(row["running"] for row in counts.values()),
-        "queued": sum(row["queued"] for row in counts.values()),
-        "retired": sum(row["retired"] for row in counts.values()),
-        "completed": sum(row["completed"] for row in counts.values()),
-    }
+    summary["completed"] = summary["done"]
     return {
         "items": items,
         "total": total,

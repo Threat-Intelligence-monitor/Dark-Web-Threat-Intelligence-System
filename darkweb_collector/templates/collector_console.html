@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Collector console · 队列与登录态</title>
+  <style>
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: #f3f6fa; color: #243247; font: 14px/1.55 "Microsoft YaHei", system-ui, sans-serif; }
+    main { max-width: 1240px; margin: 32px auto; padding: 0 20px; }
+    h1 { margin: 4px 0 20px; font-size: 26px; } h2 { margin: 0; font-size: 18px; }
+    .kicker, .note { color: #637287; font-size: 12px; } .note { display: block; overflow-wrap: anywhere; }
+    .panel { margin-bottom: 16px; padding: 20px; border: 1px solid #d9e2ec; border-radius: 8px; background: white; }
+    #login-panel { max-width: 440px; }
+    fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+    .login-fields { display: grid; gap: 16px; }
+    label { display: block; margin-bottom: 6px; font-weight: 600; }
+    input, select, button { font: inherit; }
+    input, select { padding: 8px 10px; border: 1px solid #cbd6e2; border-radius: 5px; color: inherit; background: white; }
+    button { padding: 8px 14px; border: 1px solid #cbd6e2; border-radius: 5px; background: white; color: #243247; cursor: pointer; }
+    button.primary { border-color: #2576ba; background: #2576ba; color: white; }
+    button:disabled { opacity: .55; cursor: default; }
+    :focus-visible { outline: 2px solid #2576ba; outline-offset: 2px; }
+    .heading, .actions, .toolbar, .chips { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .heading { justify-content: space-between; margin-bottom: 16px; }
+    .toolbar { margin-bottom: 12px; }
+    .toolbar label { margin: 0; font-weight: 400; color: #637287; font-size: 12px; }
+    .toolbar select, .toolbar input { width: auto; min-width: 150px; }
+    #queue-keyword { min-width: 220px; }
+    .chips { margin-bottom: 12px; }
+    .chip { padding: 4px 10px; border-radius: 999px; background: #eef3f9; color: #3b4a5f; font-size: 12px; }
+    .chip strong { margin-left: 4px; font-size: 13px; }
+    .chip.retired { background: #fdeceb; color: #a2342b; }
+    .table-wrap { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 9px; text-align: left; border-bottom: 1px solid #e4eaf1; overflow-wrap: anywhere; vertical-align: top; }
+    th { color: #637287; font-weight: 600; white-space: nowrap; }
+    td.target { min-width: 320px; font-size: 12px; color: #33445c; }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; background: #eef3f9; font-size: 12px; white-space: nowrap; }
+    .pill.running { background: #e6f2ff; color: #16588e; }
+    .pill.retired { background: #fdeceb; color: #a2342b; }
+    .pill.pending { background: #fff7e5; color: #8b5a0b; }
+    .pill.valid { background: #e7f6ec; color: #1f7a45; }
+    .pill.expired, .pill.invalid_state { background: #fdeceb; color: #a2342b; }
+    .pill.missing, .pill.unverified { background: #eef3f9; color: #55637a; }
+    .pager { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+    #message { margin: 0 0 16px; padding: 10px 12px; border-radius: 5px; background: #fff0ed; color: #ad3228; }
+    #status { margin: 0 0 10px; color: #637287; font-size: 12px; }
+    .import-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    @media (max-width: 720px) { main { margin: 20px auto; padding: 0 12px; } .panel { padding: 16px; } .toolbar select, .toolbar input, #queue-keyword { min-width: 0; width: 100%; } }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="kicker">Collector console</span>
+    <h1>采集队列与登录态</h1>
+    <p id="message" role="alert" hidden></p>
+
+    <section id="login-panel" class="panel">
+      <h2>管理员登录</h2>
+      <p class="note">与控制台同一套账号；登录后 token 只保存在当前标签页。</p>
+      <form id="login-form">
+        <fieldset id="login-fields" class="login-fields">
+          <div><label for="username">账号</label><input id="username" name="username" value="admin" autocomplete="username" maxlength="64" required></div>
+          <div><label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required></div>
+          <button id="login-button" class="primary" type="submit">登录</button>
+        </fieldset>
+      </form>
+    </section>
+
+    <div id="pages" hidden>
+      <section class="panel" aria-live="polite" id="queue-panel">
+        <div class="heading">
+          <h2>待执行队列</h2>
+          <div class="actions">
+            <button id="queue-refresh" type="button">刷新</button>
+            <button id="queue-reset-retired" type="button" disabled>恢复已退休</button>
+          </div>
+        </div>
+        <form id="queue-toolbar" class="toolbar">
+          <label for="queue-site">站点</label><select id="queue-site"><option value="">全部站点</option></select>
+          <label for="queue-status">状态</label>
+          <select id="queue-status">
+            <option value="">全部</option>
+            <option value="pending">待执行</option>
+            <option value="queued">已排队</option>
+            <option value="running">采集中</option>
+            <option value="retired">已退休</option>
+            <option value="done">已完成</option>
+          </select>
+          <label for="queue-keyword">目标关键词</label><input id="queue-keyword" maxlength="120" placeholder="按 URL 或分区筛选">
+          <button class="primary" type="submit">查询</button>
+        </form>
+        <div class="chips" id="queue-summary"></div>
+        <p id="status">正在读取队列…</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>状态</th><th>站点</th><th>来源</th><th>目标</th><th>失败</th><th>下次重试</th><th>备注</th></tr></thead>
+            <tbody id="queue-rows"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="queue-prev" type="button" disabled>上一页</button>
+          <span id="queue-page-note" class="note"></span>
+          <button id="queue-next" type="button" disabled>下一页</button>
+        </div>
+        <p id="queue-retirement" class="note"></p>
+      </section>
+
+      <section class="panel" aria-live="polite" id="logins-panel">
+        <div class="heading">
+          <h2>登录态中枢</h2>
+          <div class="actions"><button id="logins-refresh" type="button">刷新全部</button></div>
+        </div>
+        <p class="note">「刷新」会让服务端用已保存的账号重新登录该站；登录页有强挑战的站点会返回「需要人工」，这时请在浏览器登录一次后导出会话，再从下面的导入框上传。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>站点</th><th>状态</th><th>账号</th><th>Cookie</th><th>会话年龄</th><th>最近验证</th><th>操作</th></tr></thead>
+            <tbody id="logins-rows"></tbody>
+          </table>
+        </div>
+        <form id="import-form" class="import-row">
+          <label for="import-site">导入会话</label>
+          <select id="import-site"></select>
+          <input id="import-file" type="file" accept="application/json,.json">
+          <button class="primary" type="submit">上传并导入</button>
+          <span class="note">文件由 <code>tools/capture_session.py</code> 导出，形如 {"user_agent": "...", "storage_state": {...}}。</span>
+        </form>
+      </section>
+    </div>
+  </main>
+  <script>
+    'use strict';
+    const $ = (id) => document.getElementById(id);
+    const tokenKey = 'dwti-collector-console-token';
+    let token = '', queuePage = 1, queuePages = 1, busy = false;
+    try { token = sessionStorage.getItem(tokenKey) || ''; } catch {}
+
+    function node(tag, text, className = '') {
+      const element = document.createElement(tag);
+      if (text != null) element.textContent = String(text);
+      if (className) element.className = className;
+      return element;
+    }
+    function message(text = '') { $('message').textContent = text; $('message').hidden = !text; }
+    function saveToken(value) {
+      token = value;
+      try { if (value) sessionStorage.setItem(tokenKey, value); else sessionStorage.removeItem(tokenKey); } catch {}
+    }
+    function setBusy(value, label = '') {
+      busy = value;
+      document.querySelectorAll('#pages button, #login-fields input, #login-fields button, #import-form input, #import-form select, #import-form button').forEach((element) => { element.disabled = value; });
+      if (label) $('status').textContent = label;
+      if (!value) updateRetiredButton();
+    }
+    function updateRetiredButton() {
+      const retired = Number($('queue-reset-retired').dataset.count || 0);
+      $('queue-reset-retired').disabled = busy || !retired;
+      $('queue-reset-retired').textContent = retired ? `恢复已退休（${retired}）` : '恢复已退休';
+    }
+
+    async function request(path, options = {}) {
+      const headers = new Headers(options.headers || {});
+      if (token && path !== '/api/auth/login') headers.set('Authorization', 'Bearer ' + token);
+      if (options.body != null && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+      const response = await fetch(path, { ...options, headers });
+      if (response.status === 401) { saveToken(''); showLogin(); throw new Error('登录已过期，请重新登录'); }
+      const text = await response.text();
+      let payload = null;
+      try { payload = text ? JSON.parse(text) : null; } catch { payload = text; }
+      if (!response.ok) {
+        const detail = payload && payload.detail ? payload.detail : (typeof payload === 'string' ? payload : response.statusText);
+        throw new Error(String(detail));
+      }
+      return payload;
+    }
+
+    function showLogin() {
+      $('login-panel').hidden = false; $('pages').hidden = true;
+    }
+    function showPages() {
+      $('login-panel').hidden = true; $('pages').hidden = false;
+    }
+
+    const statusLabels = { pending: '待执行', queued: '已排队', dispatching: '派发中', running: '采集中', retired: '已退休', done: '已完成', legacy_queued: '旧队列' };
+    const loginLabels = { missing: '无会话', valid: '有效', expiring: '即将过期', expired: '已过期', invalid_state: '会话无效', unverified: '未验证', needs_human: '需要人工' };
+    function pill(text, tone) { return node('span', text, 'pill ' + (tone || '')); }
+    function ageLabel(seconds) {
+      const value = Number(seconds || 0);
+      if (!value) return '—';
+      if (value < 3600) return Math.round(value / 60) + ' 分钟';
+      if (value < 86400) return (value / 3600).toFixed(1) + ' 小时';
+      return (value / 86400).toFixed(1) + ' 天';
+    }
+    function timeLabel(iso) {
+      if (!iso) return '—';
+      const parsed = new Date(iso);
+      if (Number.isNaN(parsed.getTime())) return iso;
+      return parsed.toLocaleString('zh-CN', { hour12: false });
+    }
+
+    function renderQueue(payload) {
+      const summary = payload.summary || {};
+      const chips = $('queue-summary');
+      chips.replaceChildren();
+      [['待执行', summary.pending], ['已排队', summary.queued], ['采集中', summary.running], ['已退休', summary.retired], ['已完成', summary.completed]].forEach(([label, value]) => {
+        const chip = node('span', label, 'chip' + (label === '已退休' ? ' retired' : ''));
+        chip.append(node('strong', Number(value || 0).toLocaleString('zh-CN')));
+        chips.append(chip);
+      });
+      const rows = $('queue-rows');
+      rows.replaceChildren();
+      (payload.items || []).forEach((item) => {
+        const row = document.createElement('tr');
+        const statusCell = document.createElement('td');
+        statusCell.append(pill(statusLabels[item.status] || item.status, item.status));
+        const siteCell = node('td', item.display_name || item.site_name);
+        if (item.display_name && item.display_name !== item.site_name) {
+          siteCell.append(node('span', item.site_name, 'note'));
+        }
+        const sourceCell = node('td', [item.section, item.discovery_lane].filter(Boolean).join(' · ') || '—');
+        const targetCell = document.createElement('td');
+        targetCell.className = 'target';
+        if (item.target && /^https?:/i.test(item.target)) {
+          const link = node('a', item.target);
+          link.href = item.target; link.target = '_blank'; link.rel = 'noreferrer noopener';
+          targetCell.append(link);
+        } else {
+          targetCell.textContent = item.target || '—';
+        }
+        const streakCell = node('td', item.failure_streak ? String(item.failure_streak) : '—');
+        const retryCell = node('td', item.next_retry_at ? timeLabel(item.next_retry_at) : '—');
+        const noteCell = node('td', item.retire_reason || item.last_error || '—');
+        row.append(statusCell, siteCell, sourceCell, targetCell, streakCell, retryCell, noteCell);
+        rows.append(row);
+      });
+      if (!(payload.items || []).length) {
+        const row = document.createElement('tr');
+        const cell = node('td', '没有符合条件的记录');
+        cell.colSpan = 7; cell.className = 'note';
+        row.append(cell); rows.append(row);
+      }
+      queuePages = Math.max(1, Math.ceil(Number(payload.total || 0) / Number(payload.page_size || 20)));
+      queuePage = Number(payload.page || 1);
+      $('queue-page-note').textContent = `第 ${queuePage} / ${queuePages} 页 · 共 ${Number(payload.total || 0).toLocaleString('zh-CN')} 条`;
+      $('queue-prev').disabled = busy || queuePage <= 1;
+      $('queue-next').disabled = busy || queuePage >= queuePages;
+      const retirement = payload.retirement || {};
+      $('queue-retirement').textContent = `退休规则：连续 ${retirement.not_found_after} 次「目标不存在」或 ${retirement.parse_after} 次「解析失败」后移出队列；恢复后重新排队。`;
+      $('queue-reset-retired').dataset.count = String(summary.retired || 0);
+      updateRetiredButton();
+      const sites = payload.sites || [];
+      const select = $('queue-site');
+      const current = select.value;
+      select.replaceChildren(node('option', '全部站点'));
+      select.firstChild.value = '';
+      sites.forEach((site) => {
+        const option = node('option', site.display_name || site.site_name);
+        option.value = site.site_name;
+        select.append(option);
+      });
+      select.value = current;
+    }
+
+    function renderLogins(payload) {
+      const rows = $('logins-rows');
+      rows.replaceChildren();
+      const items = payload.items || [];
+      items.forEach((item) => {
+        const row = document.createElement('tr');
+        const siteCell = node('td', item.site_name);
+        const statusCell = document.createElement('td');
+        statusCell.append(pill(loginLabels[item.status] || item.status, item.status));
+        const userCell = node('td', item.username || '—');
+        const cookieCell = node('td', item.cookie_count ? String(item.cookie_count) : '—');
+        const ageCell = node('td', ageLabel(item.age_seconds));
+        const verifiedCell = node('td', item.verified_at ? timeLabel(item.verified_at) : '—');
+        const actionCell = document.createElement('td');
+        const button = node('button', item.status === 'valid' ? '重新登录' : '登录');
+        button.type = 'button';
+        button.disabled = busy || !item.has_credentials;
+        button.addEventListener('click', () => refreshLogin(item.site_name));
+        actionCell.append(button);
+        row.append(siteCell, statusCell, userCell, cookieCell, ageCell, verifiedCell, actionCell);
+        rows.append(row);
+      });
+      if (!items.length) {
+        const row = document.createElement('tr');
+        const cell = node('td', '还没有配置任何账号。用下面的「导入会话」上传，或运行 login_broker import 导入账号文件。');
+        cell.colSpan = 7; cell.className = 'note';
+        row.append(cell); rows.append(row);
+      }
+      const select = $('import-site');
+      const current = select.value;
+      select.replaceChildren();
+      items.forEach((item) => {
+        const option = node('option', item.site_name + (item.has_credentials ? '' : '（无账号）'));
+        option.value = item.site_name;
+        select.append(option);
+      });
+      if (current && items.some((item) => item.site_name === current)) select.value = current;
+    }
+
+    async function loadQueue() {
+      const params = new URLSearchParams({ page: String(queuePage), page_size: '20' });
+      const site = $('queue-site').value; const status = $('queue-status').value; const keyword = $('queue-keyword').value.trim();
+      if (site) params.set('site', site);
+      if (status) params.set('status', status);
+      if (keyword) params.set('q', keyword);
+      const payload = await request('/api/collector/queue?' + params.toString());
+      renderQueue(payload);
+      $('status').textContent = '队列已更新：' + timeLabel(payload.updated_at);
+    }
+
+    async function loadLogins() {
+      const payload = await request('/api/collector/logins');
+      renderLogins(payload);
+    }
+
+    async function refreshLogin(site) {
+      setBusy(true, `正在让 ${site} 重新登录…`);
+      try {
+        const report = await request(`/api/collector/logins/${encodeURIComponent(site)}/refresh`, { method: 'POST' });
+        message(report && report.ok ? `${site} 已登录` : `${site}：${(report && (report.detail || report.status)) || '未知结果'}`);
+        await loadLogins();
+      } catch (error) { message(String(error.message || error)); }
+      finally { setBusy(false); }
+    }
+
+    async function refreshAllLogins() {
+      setBusy(true, '正在依次刷新所有站点…');
+      try {
+        const reports = await request('/api/collector/logins/refresh', { method: 'POST' });
+        const failed = (reports || []).filter((report) => !report.ok).length;
+        message(failed ? `刷新完成，${failed} 个站点需要关注` : '全部站点登录成功');
+        await loadLogins();
+      } catch (error) { message(String(error.message || error)); }
+      finally { setBusy(false); }
+    }
+
+    async function resetRetired() {
+      const retired = Number($('queue-reset-retired').dataset.count || 0);
+      if (!retired) return;
+      if (!confirm(`把 ${retired} 条已退休目标放回队列？`)) return;
+      const site = $('queue-site').value;
+      setBusy(true, '正在恢复已退休目标…');
+      try {
+        const payload = await request('/api/collector/queue/retired/reset', { method: 'POST', body: JSON.stringify(site ? { site_name: site } : {}) });
+        message(`已恢复 ${payload.released} 条目标`);
+        await loadQueue();
+      } catch (error) { message(String(error.message || error)); }
+      finally { setBusy(false); }
+    }
+
+    async function importSession() {
+      const site = $('import-site').value;
+      const file = $('import-file').files && $('import-file').files[0];
+      if (!site || !file) { message('请选择站点并选中导出的 JSON 文件'); return; }
+      let parsed;
+      try { parsed = JSON.parse(await file.text()); } catch { message('文件不是合法 JSON'); return; }
+      setBusy(true, `正在导入 ${site} 的会话…`);
+      try {
+        const report = await request(`/api/collector/logins/${encodeURIComponent(site)}/state`, { method: 'POST', body: JSON.stringify(parsed) });
+        message(report && report.ok ? `${site} 会话已导入` : `${site}：${(report && (report.detail || report.status)) || '导入失败'}`);
+        $('import-file').value = '';
+        await loadLogins();
+      } catch (error) { message(String(error.message || error)); }
+      finally { setBusy(false); }
+    }
+
+    async function start() {
+      setBusy(false);
+      try {
+        await Promise.all([loadQueue(), loadLogins()]);
+        showPages();
+        message();
+      } catch (error) {
+        if (String(error.message).includes('登录已过期')) return;
+        showPages(); message(String(error.message || error));
+      }
+    }
+
+    $('login-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      message();
+      $('login-button').disabled = true;
+      try {
+        const payload = await request('/api/auth/login', { method: 'POST', body: JSON.stringify({ username: $('username').value.trim(), password: $('password').value }) });
+        saveToken(payload.access_token || '');
+        $('password').value = '';
+        await start();
+      } catch (error) {
+        message('登录失败：' + String(error.message || error));
+      } finally { $('login-button').disabled = false; }
+    });
+    $('queue-refresh').addEventListener('click', () => { queuePage = 1; setBusy(true); loadQueue().catch((error) => message(String(error.message || error))).finally(() => setBusy(false)); });
+    $('queue-toolbar').addEventListener('submit', (event) => { event.preventDefault(); queuePage = 1; setBusy(true); loadQueue().catch((error) => message(String(error.message || error))).finally(() => setBusy(false)); });
+    $('queue-prev').addEventListener('click', () => { if (queuePage > 1) { queuePage -= 1; setBusy(true); loadQueue().catch((error) => message(String(error.message || error))).finally(() => setBusy(false)); } });
+    $('queue-next').addEventListener('click', () => { if (queuePage < queuePages) { queuePage += 1; setBusy(true); loadQueue().catch((error) => message(String(error.message || error))).finally(() => setBusy(false)); } });
+    $('queue-reset-retired').addEventListener('click', resetRetired);
+    $('logins-refresh').addEventListener('click', refreshAllLogins);
+    $('import-form').addEventListener('submit', (event) => { event.preventDefault(); importSession(); });
+
+    if (token) start(); else showLogin();
+  </script>
+</body>
+</html>

@@ -549,8 +549,22 @@ def frontier_counts(connection, site_names=None, now=None) -> dict[str, dict[str
     return result
 
 
+def _contains_clause(contains: str) -> tuple[str, list[str]]:
+    """Match a search term against the target and its section.
+
+    The console filters before pagination, so this has to live in SQL; otherwise
+    page one of a search could come back empty while later pages hold the hits.
+    """
+    term = str(contains or "").strip()
+    if not term:
+        return "", []
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
+    return "(target_url LIKE ? ESCAPE '\\' OR section LIKE ? ESCAPE '\\')", [pattern, pattern]
+
+
 def list_frontier_entries(connection, site_names=None, *, statuses: Iterable[str] | None = None,
-                          limit: int = 100, offset: int = 0) -> list[dict]:
+                          limit: int = 100, offset: int = 0, contains: str = "") -> list[dict]:
     """Read the queue as data so the console can show what is waiting.
 
     ``metadata_json`` carries the section and lane per target; only the fields
@@ -562,6 +576,10 @@ def list_frontier_entries(connection, site_names=None, *, statuses: Iterable[str
     if selected:
         clauses.append(f"status IN ({', '.join('?' for _ in selected)})")
         parameters = [*parameters, *selected]
+    search_clause, search_parameters = _contains_clause(contains)
+    if search_clause:
+        clauses.append(search_clause)
+        parameters = [*parameters, *search_parameters]
     statement = (
         "SELECT site_name, target_url, section, discovery_lane, status, next_retry, "
         "first_seen_at, observed_at, updated_at, last_error, failure_streak, retired_at, retire_reason "
@@ -591,13 +609,18 @@ def list_frontier_entries(connection, site_names=None, *, statuses: Iterable[str
     return entries
 
 
-def count_frontier_entries(connection, site_names=None, statuses: Iterable[str] | None = None) -> int:
+def count_frontier_entries(connection, site_names=None, statuses: Iterable[str] | None = None,
+                           contains: str = "") -> int:
     names, where, parameters = _sites_filter(site_names, column="site_name")
     clauses = [where.replace(" WHERE ", "")] if where else []
     selected = [str(item) for item in (statuses or ()) if str(item)]
     if selected:
         clauses.append(f"status IN ({', '.join('?' for _ in selected)})")
         parameters = [*parameters, *selected]
+    search_clause, search_parameters = _contains_clause(contains)
+    if search_clause:
+        clauses.append(search_clause)
+        parameters = [*parameters, *search_parameters]
     statement = "SELECT COUNT(*) FROM crawl_frontier"
     if clauses:
         statement += " WHERE " + " AND ".join(clauses)
