@@ -113,3 +113,10 @@ Windows 启动器使用受监督的 `solo` 消费进程。详情总时限默认�
 性能同时记录每小时去重后的有效新增或实质更新、发现到可搜索的延迟、队列等待时间、请求成功率和证据完整率。列表扫描条数、任务执行次数及数据库更新次数不能替代有效情报产出。
 
 增加历史页预算会加快旧数据覆盖，也会增加源站请求和详情积压；增加最新页预算适合更新速度超过轮询间隔的分区。先用运行数据调整预算，再调整 worker 和出口容量。这套机制提供可持续的默认策略，不能保证所有站点上的绝对最大效率。支持增量 API、站点地图、时间游标或少量公告的来源应优先使用其更合适的发现接口，并复用同一版本和恢复语义。
+﻿
+## 失效目标退休与登录态（v20261125 起）
+
+- 失败要带 `kind`：`CollectionFailure` 的 `kind` 决定队列行为。`not_found` / `parse` 连续命中阈值（2 / 3 次）后，该目标会被标为 `retired`，不再进入待执行队列。适配器不要自己重试这两类失败，也不要把「帖子已删」包装成 `network` 或 `blocked`，否则永远退不了休。
+- 权限页请抛 `restricted`：403 且页面是论坛自身版式（≥ 12 KB、页脚带 `Powered by MyBB/XenForo/vBulletin`）现在会被 `collection_errors.raise_if_error_page` 判为 `restricted`，这是终态，不会再把适配器推去浏览器路由白跑一次。需要登录的站点请走登录态中枢，不要在适配器里硬编码账号。
+- 队列可见性：`GET /api/collector/queue` 会列出每条目标的 `status`、`failure_streak`、`retire_reason`；排查「为什么这条一直在跑」时先看这里。
+- 登录态中枢：`python -m darkweb_collector.login_broker status|login <site>`，凭证在 `<data_root>/credentials/`；会话落盘后采集器自动复用，适配器侧无需改动。
