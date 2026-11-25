@@ -383,6 +383,58 @@ def _await_login_form(page, credentials: Credentials, *, profile, deadline: floa
     raise LoginError(f"login form never appeared ({last_reason or 'no challenge to clear'})", step="navigate")
 
 
+_LOGGED_IN_PROBE = """
+(username) => {
+  const name = (username || '').trim().toLowerCase();
+  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  const href = (a) => (a.getAttribute('href') || '');
+  if (anchors.some((a) => /action=logout/i.test(href(a)))) return 'logout';
+  const profile = anchors.find((a) => /member\\.php\\?action=profile/i.test(href(a))
+    && (a.textContent || '').trim().toLowerCase() === name);
+  if (profile) return 'profile';
+  return '';
+}
+"""
+
+
+def _wait_for_login(page, credentials: Credentials, success_selector: str, *, timeout_ms: int = 15000) -> bool:
+    """Wait until the page proves the session is signed in.
+
+    Themes disagree about the logout link: some hide it in a dropdown, some
+    render it as ``member.php?action=logout&uid=``, and a few (bf.st) only show
+    the profile link plus the username. Checking the profile link keeps those
+    logins from being reported as failures after they actually worked.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            if page.query_selector(success_selector):
+                return True
+            if page.evaluate(_LOGGED_IN_PROBE, credentials.username):
+                return True
+        except Exception:  # pragma: no cover - navigation races
+            pass
+        page.wait_for_timeout(400)
+    return False
+
+
+def _login_user_agent(profile) -> str:
+    """Return the user agent the login browser should present.
+
+    Playwright advertises ``HeadlessChrome`` by default, and several WAFs
+    (BreachForums among them) answer that with a flat 403 before serving any
+    challenge -- the same request with a normal Chrome UA loads fine.
+    """
+    from darkweb_collector.access_bypass.headers import identity_for
+
+    header_profile = getattr(profile, "header_profile", "") or "chrome"
+    impersonate = getattr(profile, "impersonate", "") or ""
+    try:
+        return identity_for(header_profile, impersonate=impersonate).user_agent
+    except Exception:  # pragma: no cover - defensive, identity_for is total
+        return identity_for("chrome").user_agent
+
+
 def _login_with_playwright(credentials: Credentials, *, login_url: str, probe_url: str, headless: bool,
                            timeout_seconds: float, proxy_server: str | None) -> tuple[dict, str]:
     """Drive the source's own login form and return (storage_state, user_agent)."""
@@ -393,6 +445,7 @@ def _login_with_playwright(credentials: Credentials, *, login_url: str, probe_ur
     from darkweb_collector.access_bypass.profiles import profile_for
 
     profile = profile_for(credentials.site_name, url=login_url) if login_url else None
+    user_agent = _login_user_agent(profile)
     engine = "chromium"
     plan = plan_for("full", engine=engine, headless=headless)
     launch_options = {**launch_kwargs(plan, headless=headless)}
@@ -403,7 +456,6 @@ def _login_with_playwright(credentials: Credentials, *, login_url: str, probe_ur
         channel = "chrome"
     if channel:
         launch_options["channel"] = channel
-
     with sync_playwright() as playwright:
         browser = None
         error: Exception | None = None
@@ -417,7 +469,7 @@ def _login_with_playwright(credentials: Credentials, *, login_url: str, probe_ur
         if browser is None:
             raise LoginError(f"could not start a browser: {error}", step="launch") from error
         try:
-            context_options = context_kwargs(plan, locale="en-US")
+            context_options = context_kwargs(plan, user_agent=user_agent, locale="en-US")
             context = browser.new_context(**context_options)
             apply_to_context(context, plan)
             page = context.new_page()
@@ -443,22 +495,21 @@ def _login_with_playwright(credentials: Credentials, *, login_url: str, probe_ur
                 # the success check, which is what actually matters.
                 logger.debug("login submit produced no navigation for %s", credentials.site_name)
             success_selector = _default_selector(credentials, "success_selector")
-            try:
-                page.wait_for_selector(success_selector, timeout=15000)
-            except PlaywrightTimeoutError as exc:
+            if not _wait_for_login(page, credentials, success_selector, timeout_ms=15000):
                 body = ""
                 try:
                     body = page.inner_text("body")[:400]
                 except Exception:  # pragma: no cover - page may be torn down
                     body = ""
                 raise LoginError(f"login did not stick (still no logout link). Page said: {body!r}",
-                                 step="verify") from exc
+                                 step="verify")
             if probe_url:
                 try:
                     page.goto(probe_url, timeout=timeout_seconds * 1000, wait_until="domcontentloaded")
-                    page.wait_for_selector(success_selector, timeout=15000)
                 except PlaywrightTimeoutError as exc:
-                    raise LoginError(f"member page {probe_url} bounced back to the login form", step="probe") from exc
+                    raise LoginError(f"member page {probe_url} did not load", step="probe") from exc
+                if not _wait_for_login(page, credentials, success_selector, timeout_ms=15000):
+                    raise LoginError(f"member page {probe_url} bounced back to the login form", step="probe")
             state = context.storage_state()
             return state, str(page.evaluate("navigator.userAgent"))
         finally:
