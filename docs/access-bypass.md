@@ -251,6 +251,6 @@ python -m darkweb_collector.login_broker import-state darkforums --state-file da
 页面里两块：
 
 1. **待执行队列**：按站点/状态过滤、按目标或分区搜索、分页；汇总行显示 `待执行 / 已排队 / 采集中 / 已退休 / 已完成`；「恢复已退休」把 `retired` 放回 `pending`。
-2. **登录态中枢**：每个站点的登录状态、账号、Cookie 数、会话年龄、最近验证时间；「登录」触发 broker 重登；底部「导入会话」上传 `capture_session.py` 导出的 JSON。
+2. **登录态中枢**：每个站点（含还没配账号的）一行，显示登录状态、账号、Cookie 数、会话年龄、最近验证时间；「登录」触发 broker 重登；「添加账号」直接录入用户名/密码（Windows 上 DPAPI 加密后落盘）；底部「导入会话」上传 `capture_session.py` 导出的 JSON。
 
 状态文案：`pending 待执行`、`queued 已排队`、`dispatching 派发中`、`running 采集中`、`retired 已退休`、`done 已完成`；登录态 `missing 无会话`、`valid 有效`、`expiring 即将过期`、`expired 已过期`、`invalid_state 会话无效`、`unverified 未验证`、`needs_human 需要人工`。

@@ -1436,6 +1436,36 @@ def collector_login_status(request: Request) -> dict:
     return {"items": status_all()}
 
 
+@app.post("/api/collector/logins/{site_name}/credentials")
+def collector_login_save_credentials(request: Request, site_name: str, payload: dict = Body(...)) -> dict:
+    """Store the account used by the broker for one site.
+
+    Operators otherwise have to shell into the host to run the CLI; this keeps
+    onboarding inside the console page.  The password is encrypted with DPAPI on
+    Windows before it touches the disk.
+    """
+    _require_collector_access(request)
+    from darkweb_collector.login_broker import save_credentials
+
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="账号和密码都不能为空")
+    try:
+        save_credentials(
+            site_name,
+            username=username,
+            password=password,
+            login_url=str(payload.get("login_url") or "").strip(),
+            engine=str(payload.get("engine") or "").strip(),
+            probe_url=str(payload.get("probe_url") or "").strip(),
+            notes=str(payload.get("notes") or "").strip(),
+        )
+    except Exception as exc:  # pragma: no cover - defensive for filesystem errors
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"site_name": site_name, "saved": True}
+
+
 @app.post("/api/collector/logins/{site_name}/refresh")
 def collector_login_refresh(request: Request, site_name: str) -> dict:
     """Log in with the stored credentials and replace this site's session."""

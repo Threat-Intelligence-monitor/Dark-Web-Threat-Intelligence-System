@@ -311,6 +311,10 @@ def build_queue_view(status="", site="", page=1, page_size=20, q="") -> dict:
             "retired_at": iso(entry["retired_at"]) if entry["retired_at"] else "",
             "retire_reason": entry["retire_reason"],
         })
+    # Every row belongs to some status; anything outside the five headline
+    # buckets (dispatching, legacy_queued, ...) shows up here so the chips add
+    # up to "total" instead of quietly disagreeing with it.
+    summary["other"] = max(0, total - sum(summary.values()))
     summary["completed"] = summary["done"]
     return {
         "items": items,

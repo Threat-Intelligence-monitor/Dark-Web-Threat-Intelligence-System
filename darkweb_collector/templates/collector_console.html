@@ -121,6 +121,15 @@
             <tbody id="logins-rows"></tbody>
           </table>
         </div>
+        <form id="account-form" class="import-row">
+          <label for="account-site">添加账号</label>
+          <select id="account-site"></select>
+          <input id="account-username" type="text" placeholder="用户名" autocomplete="off">
+          <input id="account-password" type="password" placeholder="密码" autocomplete="new-password">
+          <input id="account-url" type="text" placeholder="登录页地址（可留空）" autocomplete="off">
+          <button class="primary" type="submit">保存账号</button>
+          <span class="note">保存后点该行的「登录」。密码在 Windows 上用 DPAPI 加密后再落盘。</span>
+        </form>
         <form id="import-form" class="import-row">
           <label for="import-site">导入会话</label>
           <select id="import-site"></select>
@@ -151,7 +160,7 @@
     }
     function setBusy(value, label = '') {
       busy = value;
-      document.querySelectorAll('#pages button, #login-fields input, #login-fields button, #import-form input, #import-form select, #import-form button').forEach((element) => { element.disabled = value; });
+      document.querySelectorAll('#pages button, #login-fields input, #login-fields button, #import-form input, #import-form select, #import-form button, #account-form input, #account-form select, #account-form button').forEach((element) => { element.disabled = value; });
       if (label) $('status').textContent = label;
       if (!value) updateRetiredButton();
     }
@@ -205,9 +214,11 @@
       const summary = payload.summary || {};
       const chips = $('queue-summary');
       chips.replaceChildren();
-      [['待执行', summary.pending], ['已排队', summary.queued], ['采集中', summary.running], ['已退休', summary.retired], ['已完成', summary.completed]].forEach(([label, value]) => {
+      [['待执行', summary.pending], ['已排队', summary.queued], ['采集中', summary.running], ['已退休', summary.retired], ['已完成', summary.completed], ['其它', summary.other]].forEach(([label, value]) => {
+        const count = Number(value || 0);
+        if (label === '其它' && !count) return;
         const chip = node('span', label, 'chip' + (label === '已退休' ? ' retired' : ''));
-        chip.append(node('strong', Number(value || 0).toLocaleString('zh-CN')));
+        chip.append(node('strong', count.toLocaleString('zh-CN')));
         chips.append(chip);
       });
       const rows = $('queue-rows');
@@ -288,7 +299,7 @@
       });
       if (!items.length) {
         const row = document.createElement('tr');
-        const cell = node('td', '还没有配置任何账号。用下面的「导入会话」上传，或运行 login_broker import 导入账号文件。');
+        const cell = node('td', '还没有配置任何账号。用下面的「添加账号」录入，或运行 login_broker import 导入账号文件。');
         cell.colSpan = 7; cell.className = 'note';
         row.append(cell); rows.append(row);
       }
@@ -301,6 +312,15 @@
         select.append(option);
       });
       if (current && items.some((item) => item.site_name === current)) select.value = current;
+      const accountSelect = $('account-site');
+      const currentAccount = accountSelect.value;
+      accountSelect.replaceChildren();
+      items.forEach((item) => {
+        const option = node('option', item.site_name + (item.has_credentials ? '（已配置）' : ''));
+        option.value = item.site_name;
+        accountSelect.append(option);
+      });
+      if (currentAccount && items.some((item) => item.site_name === currentAccount)) accountSelect.value = currentAccount;
     }
 
     async function loadQueue() {
@@ -370,6 +390,25 @@
       finally { setBusy(false); }
     }
 
+    async function saveAccount() {
+      const site = $('account-site').value;
+      const username = $('account-username').value.trim();
+      const password = $('account-password').value;
+      const loginUrl = $('account-url').value.trim();
+      if (!site || !username || !password) { message('站点、账号、密码都要填'); return; }
+      setBusy(true, `正在保存 ${site} 的账号…`);
+      try {
+        await request(`/api/collector/logins/${encodeURIComponent(site)}/credentials`, {
+          method: 'POST',
+          body: JSON.stringify({ username, password, login_url: loginUrl }),
+        });
+        $('account-password').value = '';
+        message(`${site} 账号已保存，可以点该行的「登录」`);
+        await loadLogins();
+      } catch (error) { message(String(error.message || error)); }
+      finally { setBusy(false); }
+    }
+
     async function start() {
       setBusy(false);
       try {
@@ -402,6 +441,7 @@
     $('queue-reset-retired').addEventListener('click', resetRetired);
     $('logins-refresh').addEventListener('click', refreshAllLogins);
     $('import-form').addEventListener('submit', (event) => { event.preventDefault(); importSession(); });
+    $('account-form').addEventListener('submit', (event) => { event.preventDefault(); saveAccount(); });
 
     if (token) start(); else showLogin();
   </script>

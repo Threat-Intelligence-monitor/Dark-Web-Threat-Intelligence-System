@@ -589,9 +589,13 @@ def probe(site_name: str, *, config=None, proxy_server: str | None = None) -> di
 
 
 def status_all() -> list[dict]:
-    names = configured_sites()
-    rows = [probe(name) for name in names]
-    return rows
+    """Every login-capable site, including the ones still missing an account.
+
+    Listing only the configured sites hid the very action the operator needs —
+    adding credentials — so the console shows the full engine map instead.
+    """
+    names = sorted(set(SITE_ENGINES) | set(configured_sites()))
+    return [probe(name) for name in names]
 
 
 def login_all(*, headless: bool = True) -> list[LoginReport]:
