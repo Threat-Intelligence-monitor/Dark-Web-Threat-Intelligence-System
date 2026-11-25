@@ -68,3 +68,7 @@ _tmp_kaiti_report.txt
 # Archives and downloads
 *.tar.gz
 tor-downloads/
+
+# local smoke-test data (never part of a release)
+_console_smoke/
+_broker_state/
