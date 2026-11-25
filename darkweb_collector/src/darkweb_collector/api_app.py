@@ -11,7 +11,7 @@ from threading import Lock, Thread
 from urllib.parse import unquote
 from darkweb_collector.detail_artifacts import native_artifact_path
 
-from fastapi import FastAPI, Query
+from fastapi import Body, FastAPI, Query
 from fastapi import HTTPException
 from fastapi import Request
 from fastapi import Response
@@ -861,6 +861,35 @@ def collector_tasks(request: Request, hours: int = Query(24), page: int = Query(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.get("/api/collector/queue")
+def collector_queue(request: Request, page: int = Query(1, ge=1),
+                    page_size: int = Query(20, ge=1, le=200), site: str = Query("", max_length=150),
+                    status: str = "", q: str = Query("", max_length=200)) -> dict:
+    _require_collector_access(request)
+    from darkweb_collector.collector_metrics import build_queue_view
+    try:
+        return build_queue_view(status=status, site=site, page=page, page_size=page_size, q=q)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/collector/queue/retired/reset")
+def collector_queue_reset_retired(request: Request, payload: dict | None = Body(None)) -> dict:
+    """Put retired targets back in the queue after a site became reachable."""
+    _require_collector_access(request)
+    from darkweb_collector.crawl_frontier import reset_retired_frontier
+    from darkweb_collector.db import get_db_connection
+
+    body = payload or {}
+    site = str(body.get("site_name") or "").strip()
+    target = str(body.get("target_url") or "").strip()
+    with get_db_connection() as connection:
+        released = reset_retired_frontier(connection, site_names=[site] if site else None, target_url=target)
+        connection.commit()
+    logger.info("collector queue reset_retired site=%s target=%s released=%d", site or "all", target or "", released)
+    return {"released": released, "site_name": site, "target_url": target}
+
+
 @app.get("/api/events/search")
 def event_search(
     response: Response,
@@ -1378,6 +1407,49 @@ def probe_site(site_name: str) -> dict:
 @app.get("/api/sites/cookies")
 def list_site_cookies() -> dict:
     return {"sites": list_cookie_capable_sites()}
+
+
+@app.get("/api/collector/logins")
+def collector_login_status(request: Request) -> dict:
+    """Per-site login health: which sources have credentials and a live session."""
+    _require_collector_access(request)
+    from darkweb_collector.login_broker import status_all
+
+    return {"items": status_all()}
+
+
+@app.post("/api/collector/logins/{site_name}/refresh")
+def collector_login_refresh(request: Request, site_name: str) -> dict:
+    """Log in with the stored credentials and replace this site's session."""
+    _require_collector_access(request)
+    from darkweb_collector.login_broker import login
+
+    report = login(site_name)
+    if report.status == "no_credentials":
+        raise HTTPException(status_code=404, detail=report.detail)
+    return report.as_dict()
+
+
+@app.post("/api/collector/logins/{site_name}/state")
+def collector_login_import_state(request: Request, site_name: str, payload: dict = Body(...)) -> dict:
+    """Adopt a session captured by a real browser login (see tools/capture_session.py)."""
+    _require_collector_access(request)
+    from darkweb_collector.login_broker import import_session_state
+
+    try:
+        report = import_session_state(site_name, payload)
+    except Exception as exc:  # pragma: no cover - defensive for malformed uploads
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return report.as_dict()
+
+
+@app.post("/api/collector/logins/refresh")
+def collector_login_refresh_all(request: Request) -> dict:
+    """Refresh every site that has credentials on file."""
+    _require_collector_access(request)
+    from darkweb_collector.login_broker import login_all
+
+    return {"items": [report.as_dict() for report in login_all()]}
 
 
 @app.get("/api/sites/{site_name}/cookie")

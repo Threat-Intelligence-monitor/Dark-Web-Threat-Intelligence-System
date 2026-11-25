@@ -255,6 +255,87 @@ def build_overview(hours=24, page=1, page_size=10, q="", state="all", attention_
         "items": items[(page - 1) * page_size:page * page_size], "total": len(items), "page": page, "page_size": page_size}}
 
 
+def build_queue_view(status="", site="", page=1, page_size=20, q="") -> dict:
+    """Expose the detail queue so an operator can explain what is waiting.
+
+    The frontier keeps one row per target; this view answers "which URLs are
+    queued, from which section/lane, and why is one retired".
+    """
+    from darkweb_collector.api_data import site_display_name
+    from darkweb_collector.collection_errors import safe_failure_text
+    from darkweb_collector.config import load_site_configs
+    from darkweb_collector.crawl_frontier import (
+        RETIRED_STATUS,
+        count_frontier_entries,
+        frontier_counts,
+        list_frontier_entries,
+        retire_threshold,
+    )
+    from darkweb_collector.db import get_db_connection
+
+    allowed = {"", "all", "pending", "queued", "dispatching", "running", "retired", "legacy_queued", "done"}
+    selected_status = str(status or "").strip().lower()
+    if selected_status not in allowed:
+        raise ValueError("unsupported queue status")
+    configs = load_site_configs()
+    labels = {config.site_name: site_display_name(config) for config in configs}
+    site_names = [str(site)] if site else list(labels)
+    statuses = [] if selected_status in ("", "all") else [selected_status]
+    page_size = min(200, max(1, int(page_size)))
+    page = max(1, int(page))
+    with get_db_connection() as connection:
+        total = count_frontier_entries(connection, site_names, statuses)
+        page = min(page, max(1, (total + page_size - 1) // page_size))
+        entries = list_frontier_entries(connection, site_names, statuses=statuses,
+                                        limit=page_size, offset=(page - 1) * page_size)
+        counts = frontier_counts(connection, site_names)
+    query = str(q or "").strip().casefold()
+    if query:
+        entries = [
+            entry for entry in entries
+            if query in entry["target_url"].casefold() or query in entry["section"].casefold()
+            or query in labels.get(entry["site_name"], entry["site_name"]).casefold()
+        ]
+    items = []
+    for entry in entries:
+        items.append({
+            "site_name": entry["site_name"],
+            "display_name": labels.get(entry["site_name"], entry["site_name"]),
+            "target": safe_failure_text(entry["target_url"]),
+            "section": entry["section"],
+            "discovery_lane": entry["discovery_lane"],
+            "status": entry["status"],
+            "next_retry_at": iso(entry["next_retry_at"]) if entry["next_retry_at"] else "",
+            "first_seen_at": iso(entry["first_seen_at"]) if entry["first_seen_at"] else "",
+            "updated_at": iso(entry["updated_at"]) if entry["updated_at"] else "",
+            "last_error": entry["last_error"],
+            "failure_streak": entry["failure_streak"],
+            "retired_at": iso(entry["retired_at"]) if entry["retired_at"] else "",
+            "retire_reason": entry["retire_reason"],
+        })
+    summary = {
+        "pending": sum(row["pending"] for row in counts.values()),
+        "running": sum(row["running"] for row in counts.values()),
+        "queued": sum(row["queued"] for row in counts.values()),
+        "retired": sum(row["retired"] for row in counts.values()),
+        "completed": sum(row["completed"] for row in counts.values()),
+    }
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "summary": summary,
+        "retirement": {
+            "not_found_after": retire_threshold("not_found"),
+            "parse_after": retire_threshold("parse"),
+            "status": RETIRED_STATUS,
+        },
+        "sites": [{"site_name": config.site_name, "display_name": labels[config.site_name]} for config in configs],
+        "updated_at": iso(time.time()),
+    }
+
+
 def build_task_history(hours=24, page=1, page_size=20, q="", site="", status="") -> dict:
     from darkweb_collector.config import load_site_configs
     from darkweb_collector.db import get_db_connection
@@ -268,7 +349,7 @@ def build_task_history(hours=24, page=1, page_size=20, q="", site="", status="")
     configs = load_site_configs()
     labels = {c.site_name: site_display_name(c) for c in configs}
     scope, scope_args = _site_scope(list(labels), "j.site_name")
-    clauses = [f"COALESCE(j.finished_at,j.started_at,j.enqueued_at)>=?", scope]
+    clauses = ["COALESCE(j.finished_at,j.started_at,j.enqueued_at)>=?", scope]
     args = [iso(time.time() - hours * 3600), *scope_args]
     if site:
         clauses.append("j.site_name=?"); args.append(site)

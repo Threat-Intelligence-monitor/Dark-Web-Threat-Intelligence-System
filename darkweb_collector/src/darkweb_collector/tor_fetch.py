@@ -128,7 +128,7 @@ def raise_for_http_status(
         )
     if html is not None and html.strip():
         try:
-            raise_if_error_page(html)
+            raise_if_error_page(html, status=status)
         except CollectionFailure as exc:
             message = f"HTTP {status}; {exc}" if status else str(exc)
             raise CollectionFailure(exc.kind, message, scope=exc.scope, retry_after=exc.retry_after,

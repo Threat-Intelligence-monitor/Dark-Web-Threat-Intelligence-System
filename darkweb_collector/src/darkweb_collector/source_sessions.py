@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import datetime
 import hashlib
 import json
 import math
@@ -228,6 +229,43 @@ def persist_browser_session(state: dict, path: Path, *, url: str, proxy_server,
             for source, _ in temporary:
                 source.unlink(missing_ok=True)
     return True
+
+
+def session_state_path(site_name: str, extras: dict | None = None) -> Path:
+    """Return the storage-state file a site's browser session lives in."""
+    configured = str((extras or {}).get("browser_storage_state_file") or "").strip()
+    if configured:
+        path = Path(configured)
+        return path if path.is_absolute() else user_data_root() / path
+    return user_data_root() / "browser-state" / str(site_name).strip() / "storage-state.json"
+
+
+def session_revision(path: Path) -> str:
+    """Revision token a session writer has to echo back to win the commit."""
+    raw, metadata_raw = _read(path), _read(_sidecar(path))
+    return _digest(raw) + ":" + _digest(metadata_raw)
+
+
+def session_status(path: Path, url: str, proxy_server=None) -> dict:
+    """Describe a stored session without replaying it: valid/expired/missing."""
+    state, metadata, verified, revision, has_metadata = _snapshot(path, url, proxy_server)
+    cookies = state.get("cookies", []) if isinstance(state, dict) else []
+    age_seconds = 0.0
+    verified_at_ns = int(metadata.get("verified_at_ns") or 0)
+    if verified_at_ns:
+        age_seconds = max(0.0, time.time() - verified_at_ns / 1_000_000_000)
+    if not has_metadata:
+        status = "missing"
+    elif verified:
+        status = "valid"
+    else:
+        status = "expired"
+    return {"status": status, "path": str(path), "revision": revision, "cookie_count": len(cookies),
+            "age_seconds": round(age_seconds, 1), "max_age_seconds": session_max_age_seconds(),
+            "origin": str(metadata.get("origin") or ""), "user_agent": str(metadata.get("user_agent") or ""),
+            "browser_engine": str(metadata.get("browser_engine") or ""),
+            "verified_at": datetime.datetime.fromtimestamp(verified_at_ns / 1_000_000_000, datetime.timezone.utc).isoformat()
+            if verified_at_ns else ""}
 
 
 def _explicit_cookie(config, url: str) -> str | None:

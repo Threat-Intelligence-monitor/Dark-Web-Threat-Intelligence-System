@@ -26,6 +26,17 @@ class CollectionFailure(RuntimeError):
         }
 
 
+# A board that refuses a thread to guests still renders its own layout: header,
+# navigation and footer, but no post and no error panel.  Size separates that
+# page (tens of kilobytes) from a CDN challenge (a few kilobytes of inline JS).
+_PERMISSION_PAGE_MIN_BYTES = 12_000
+_FORUM_CHROME_MARKERS = (
+    "powered by mybb",
+    "powered by xenforo",
+    "powered by vbulletin",
+    "vbulletin solutions",
+)
+
 _request_callback: ContextVar[Callable[[], None] | None] = ContextVar("collection_request", default=None)
 
 
@@ -181,7 +192,7 @@ def has_forum_listing_html(html: str) -> bool:
     return template.has_listing
 
 
-def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> None:
+def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = (), status: int = 0) -> None:
     """Recognize error templates, not keywords quoted in a legitimate post."""
     if not str(html or "").strip():
         raise CollectionFailure("parse", "empty document; availability is unconfirmed")
@@ -255,6 +266,18 @@ def raise_if_error_page(html: str, *, missing_markers: tuple[str, ...] = ()) -> 
             "requested page could not be found", "requested post could not be found",
         )):
             raise CollectionFailure("unavailable", "source returned its explicit missing-content template")
+    if status in {401, 403} and not has_content and len(lowered) >= _PERMISSION_PAGE_MIN_BYTES:
+        # DDoS-Guard fronts RaidForums and answers a guest request for a
+        # restricted thread with the board's own layout and an empty body.
+        # Reading that as a CDN block makes the adapter replay the same refusal
+        # through the browser route; the board is refusing the target itself.
+        # Boards wrap the product name in a link, so the marker only matches once
+        # the tags between the words are gone.
+        flat = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", lowered))
+        if any(marker in flat for marker in _FORUM_CHROME_MARKERS):
+            raise CollectionFailure(
+                "restricted", "source returned its permission page for this target", scope="target",
+            )
     # These markers are supplied by each adapter and must identify its error container.
     if any(marker.lower() in lowered for marker in missing_markers):
         raise CollectionFailure("unavailable", "site returned its explicit unavailable template")

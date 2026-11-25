@@ -4,12 +4,37 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import time
 
 from darkweb_collector.models import DetailTask
 
 
 DISPATCH_RESERVATION_SECONDS = 60
+RETIRED_STATUS = "retired"
+# Threads that answer "does not exist" or return no parsable body do not heal
+# by themselves.  Re-reading them costs a browser round trip per scan, so the
+# frontier retires a target after a couple of identical failures instead of
+# keeping it in the queue forever.
+DEFAULT_RETIRE_AFTER = {"not_found": 2, "parse": 3}
+_RETIRE_ENV = {
+    "not_found": "DARKWEB_FRONTIER_RETIRE_NOT_FOUND",
+    "parse": "DARKWEB_FRONTIER_RETIRE_PARSE",
+}
+
+
+def retire_threshold(failure_kind: str) -> int:
+    """Consecutive identical failures allowed before a target is retired."""
+    kind = str(failure_kind or "").strip().lower()
+    default = DEFAULT_RETIRE_AFTER.get(kind, 0)
+    if not default:
+        return 0
+    raw = os.environ.get(_RETIRE_ENV.get(kind, ""), "")
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return configured if configured > 0 else 0
 _AVAILABLE = """(
     f.status = 'pending'
     OR (f.status IN ('dispatching', 'running') AND f.lease_until <= ?
@@ -52,6 +77,9 @@ CREATE TABLE IF NOT EXISTS crawl_frontier (
     updated_at DOUBLE PRECISION NOT NULL,
     last_claimed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT '',
+    failure_streak INTEGER NOT NULL DEFAULT 0,
+    retired_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    retire_reason TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (site_name, target_url)
 );
 CREATE INDEX IF NOT EXISTS idx_crawl_frontier_pending
@@ -74,13 +102,37 @@ CREATE TABLE IF NOT EXISTS crawl_page_cursors (
 """
 
 
+FRONTIER_ADDED_COLUMNS = (
+    ("failure_streak", "INTEGER NOT NULL DEFAULT 0"),
+    ("retired_at", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+    ("retire_reason", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
 def ensure_frontier_schema(connection) -> None:
     """Called once during database initialization, never by frontier operations."""
     for statement in FRONTIER_SCHEMA.split(";"):
         if statement.strip():
             connection.execute(statement)
+    _add_frontier_columns(connection)
     from darkweb_collector.detail_lifecycle import ensure_collection_schema
     ensure_collection_schema(connection)
+
+
+def _add_frontier_columns(connection) -> None:
+    """Upgrade a frontier table that predates the retirement bookkeeping.
+
+    ``CREATE TABLE IF NOT EXISTS`` never widens an existing table, so existing
+    installs need an explicit ALTER.  Both SQLite and PostgreSQL report a
+    duplicate column; that is the only error we swallow here.
+    """
+    for name, definition in FRONTIER_ADDED_COLUMNS:
+        try:
+            connection.execute(f"ALTER TABLE crawl_frontier ADD COLUMN {name} {definition}")
+        except Exception as exc:  # noqa: BLE001 - dialect specific duplicate column errors
+            message = str(exc).lower()
+            if "duplicate column" not in message and "already exists" not in message:
+                raise
 
 
 def _timestamp(now: float | None) -> float:
@@ -183,7 +235,7 @@ def list_frontier_candidates(connection, site_name: str, now=None, limit: int = 
                 ) AS section_rank
             FROM crawl_frontier f
             JOIN activity a ON a.section = f.section AND a.discovery_lane = f.discovery_lane
-            WHERE f.site_name = ? AND f.status <> 'done'
+            WHERE f.site_name = ? AND f.status NOT IN ('done', 'retired')
                 AND f.next_retry <= ? AND {_AVAILABLE}
                 AND NOT EXISTS (SELECT 1 FROM crawl_detail_control c
                     WHERE c.site_name = f.site_name AND c.target_url = f.target_url
@@ -259,7 +311,7 @@ def claim_frontier(connection, site_name: str, target_url: str | None, lease_tok
         f"""
         UPDATE crawl_frontier AS f SET status = 'dispatching', lease_token = ?, lease_until = ?,
             claimed_version = observed_version, last_claimed_at = ?, updated_at = ?
-        WHERE site_name = ? AND target_url = ? AND status <> 'done'
+        WHERE site_name = ? AND target_url = ? AND status NOT IN ('done', 'retired')
             AND next_retry <= ? AND {_AVAILABLE}
             AND NOT EXISTS (SELECT 1 FROM crawl_detail_control c
                 WHERE c.site_name = f.site_name AND c.target_url = f.target_url
@@ -385,7 +437,8 @@ def complete_frontier(connection, site_name, target_url, lease_token, *, artifac
         UPDATE crawl_frontier SET fetched_version = claimed_version, artifacts_complete = ?,
             status = CASE WHEN observed_version = claimed_version AND ? = 1 THEN 'done' ELSE 'pending' END,
             next_retry = CASE WHEN observed_version <> claimed_version OR ? = 1 THEN 0 ELSE ? END,
-            lease_token = '', lease_until = 0, claimed_version = '', last_error = '', updated_at = ?
+            lease_token = '', lease_until = 0, claimed_version = '', last_error = '',
+            failure_streak = 0, updated_at = ?
         WHERE site_name = ? AND target_url = ? AND lease_token = ?
             AND lease_until > ? AND status = 'running'
         """,
@@ -395,11 +448,41 @@ def complete_frontier(connection, site_name, target_url, lease_token, *, artifac
     return cursor.rowcount == 1
 
 
-def fail_frontier(connection, site_name, target_url, lease_token, *, retry_seconds=60, error_message='', now=None) -> bool:
+def fail_frontier(connection, site_name, target_url, lease_token, *, retry_seconds=60,
+                  error_message='', failure_kind='', now=None) -> bool:
+    """Release a lease; retire targets whose failure cannot heal by itself.
+
+    ``failure_kind`` is the classified kind from :mod:`collection_errors`.  Only
+    the kinds listed in :data:`DEFAULT_RETIRE_AFTER` accumulate a streak; any
+    other failure resets it, so a transient timeout does not count towards the
+    retirement of a thread that is simply missing.
+    """
     timestamp = _timestamp(now)
+    threshold = retire_threshold(failure_kind)
+    if threshold:
+        cursor = connection.execute(
+            """
+            UPDATE crawl_frontier SET
+                failure_streak = failure_streak + 1,
+                status = CASE WHEN failure_streak + 1 >= ? THEN ? ELSE 'pending' END,
+                retired_at = CASE WHEN failure_streak + 1 >= ? THEN ? ELSE retired_at END,
+                retire_reason = CASE WHEN failure_streak + 1 >= ? THEN ? ELSE retire_reason END,
+                lease_token = '', lease_until = 0,
+                next_retry = CASE WHEN observed_version <> claimed_version THEN 0
+                    WHEN failure_streak + 1 >= ? THEN 0 ELSE ? END,
+                claimed_version = '', last_error = ?, updated_at = ?
+            WHERE site_name = ? AND target_url = ? AND lease_token = ?
+                AND status IN ('queued', 'running')
+            """,
+            (threshold, RETIRED_STATUS, threshold, timestamp, threshold, failure_kind,
+             threshold, timestamp + max(0, retry_seconds), str(error_message)[:1000], timestamp,
+             site_name, target_url, lease_token),
+        )
+        return cursor.rowcount == 1
     cursor = connection.execute(
         """
         UPDATE crawl_frontier SET status = 'pending', lease_token = '', lease_until = 0,
+            failure_streak = 0,
             next_retry = CASE WHEN observed_version <> claimed_version THEN 0 ELSE ? END,
             claimed_version = '', last_error = ?, updated_at = ?
         WHERE site_name = ? AND target_url = ? AND lease_token = ?
@@ -414,7 +497,7 @@ def count_frontier_pending(connection, site_name: str, now=None) -> int:
     """Count active deliveries and executable backlog, excluding cooled inventory."""
     timestamp = _timestamp(now)
     return int(connection.execute(
-        f"""SELECT COUNT(*) FROM crawl_frontier f WHERE site_name = ? AND status <> 'done'
+        f"""SELECT COUNT(*) FROM crawl_frontier f WHERE site_name = ? AND status NOT IN ('done', 'retired')
             AND ({_ACTIVE} OR (status = 'legacy_queued' AND EXISTS (
                 SELECT 1 FROM crawl_jobs j WHERE j.job_id = f.lease_token
                     AND j.status IN ('enqueued', 'running') AND j.finished_at IS NULL))
@@ -445,24 +528,101 @@ def frontier_counts(connection, site_names=None, now=None) -> dict[str, dict[str
             FROM crawl_frontier f {where}
         )
         SELECT site_name, COUNT(*) AS total,
-            SUM(CASE WHEN status NOT IN ('done', 'legacy_queued') AND active = 0 THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN status NOT IN ('done', 'legacy_queued', 'retired') AND active = 0 THEN 1 ELSE 0 END) AS pending,
             SUM(CASE WHEN status = 'legacy_queued' THEN 1 ELSE active END) AS inflight,
             SUM(CASE WHEN status = 'legacy_queued' THEN 1 ELSE 0 END) AS legacy_queued,
             SUM(CASE WHEN active = 1 AND status = 'dispatching' THEN 1 ELSE 0 END) AS dispatching,
             SUM(CASE WHEN active = 1 AND status = 'queued' THEN 1 ELSE 0 END) AS queued,
             SUM(CASE WHEN active = 1 AND status = 'running' THEN 1 ELSE 0 END) AS running,
             SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS completed,
-            SUM(CASE WHEN status <> 'done' AND fetched_version = observed_version
+            SUM(CASE WHEN status = 'retired' THEN 1 ELSE 0 END) AS retired,
+            SUM(CASE WHEN status <> 'done' AND status <> 'retired' AND fetched_version = observed_version
                 AND artifacts_complete = 0 THEN 1 ELSE 0 END) AS artifacts_pending
         FROM inventory GROUP BY site_name
         """,
         [timestamp, timestamp, *parameters],
     ).fetchall()
-    empty = {key: 0 for key in ("total", "pending", "inflight", "dispatching", "queued", "legacy_queued", "running", "completed", "artifacts_pending")}
+    empty = {key: 0 for key in ("total", "pending", "inflight", "dispatching", "queued", "legacy_queued", "running", "completed", "retired", "artifacts_pending")}
     result = {name: dict(empty) for name in names or []}
     for row in rows:
         result[row["site_name"]] = {key: int(row[key]) for key in empty}
     return result
+
+
+def list_frontier_entries(connection, site_names=None, *, statuses: Iterable[str] | None = None,
+                          limit: int = 100, offset: int = 0) -> list[dict]:
+    """Read the queue as data so the console can show what is waiting.
+
+    ``metadata_json`` carries the section and lane per target; only the fields
+    an operator needs to explain a queue are returned.
+    """
+    names, where, parameters = _sites_filter(site_names, column="site_name")
+    clauses = [where.replace(" WHERE ", "")] if where else []
+    selected = [str(item) for item in (statuses or ()) if str(item)]
+    if selected:
+        clauses.append(f"status IN ({', '.join('?' for _ in selected)})")
+        parameters = [*parameters, *selected]
+    statement = (
+        "SELECT site_name, target_url, section, discovery_lane, status, next_retry, "
+        "first_seen_at, observed_at, updated_at, last_error, failure_streak, retired_at, retire_reason "
+        "FROM crawl_frontier"
+    )
+    if clauses:
+        statement += " WHERE " + " AND ".join(clauses)
+    statement += " ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'dispatching' THEN 1 WHEN 'queued' THEN 2 WHEN 'pending' THEN 3 ELSE 4 END, updated_at DESC LIMIT ? OFFSET ?"
+    rows = connection.execute(statement, [*parameters, max(1, int(limit)), max(0, int(offset))]).fetchall()
+    entries = []
+    for row in rows:
+        entries.append({
+            "site_name": row["site_name"],
+            "target_url": row["target_url"],
+            "section": row["section"],
+            "discovery_lane": row["discovery_lane"],
+            "status": row["status"],
+            "next_retry_at": row["next_retry"],
+            "first_seen_at": row["first_seen_at"],
+            "observed_at": row["observed_at"],
+            "updated_at": row["updated_at"],
+            "last_error": row["last_error"],
+            "failure_streak": int(row["failure_streak"] or 0),
+            "retired_at": row["retired_at"],
+            "retire_reason": row["retire_reason"],
+        })
+    return entries
+
+
+def count_frontier_entries(connection, site_names=None, statuses: Iterable[str] | None = None) -> int:
+    names, where, parameters = _sites_filter(site_names, column="site_name")
+    clauses = [where.replace(" WHERE ", "")] if where else []
+    selected = [str(item) for item in (statuses or ()) if str(item)]
+    if selected:
+        clauses.append(f"status IN ({', '.join('?' for _ in selected)})")
+        parameters = [*parameters, *selected]
+    statement = "SELECT COUNT(*) FROM crawl_frontier"
+    if clauses:
+        statement += " WHERE " + " AND ".join(clauses)
+    return int(connection.execute(statement, parameters).fetchone()[0])
+
+
+def reset_retired_frontier(connection, *, site_names=None, target_url: str = "", now=None) -> int:
+    """Return retired targets to the queue, e.g. after credentials were added."""
+    timestamp = _timestamp(now)
+    clauses = ["status = 'retired'"]
+    parameters: list = []
+    names, where, where_parameters = _sites_filter(site_names, column="site_name")
+    if where:
+        clauses.append(where.replace(" WHERE ", ""))
+        parameters.extend(where_parameters)
+    if target_url:
+        clauses.append("target_url = ?")
+        parameters.append(target_url)
+    cursor = connection.execute(
+        f"""UPDATE crawl_frontier SET status = 'pending', next_retry = 0, failure_streak = 0,
+            retired_at = 0, retire_reason = '', updated_at = ?
+        WHERE {' AND '.join(clauses)}""",
+        [timestamp, *parameters],
+    )
+    return int(cursor.rowcount or 0)
 
 
 def load_page_cursor(connection, site_name: str, source_url: str) -> dict:

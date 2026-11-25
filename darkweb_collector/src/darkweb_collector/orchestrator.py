@@ -470,7 +470,8 @@ def execute_detail_job(
                     retry_at = fail_detail(connection, site_name, detail_task.target_url, token, failure)
                     if frontier_token:
                         fail_frontier(connection, site_name, detail_task.target_url, frontier_token,
-                                      retry_seconds=max(60, retry_at - time.time()), error_message=failure.kind)
+                                      retry_seconds=max(60, retry_at - time.time()), error_message=failure.kind,
+                                      failure_kind=failure.kind)
                     record_failure(connection, failure)
                     connection.commit()
     except Exception as error:
@@ -484,7 +485,8 @@ def execute_detail_job(
                     retry_at = fail_detail(connection, site_name, detail_task.target_url, token, entry_failure)
                     if frontier_token:
                         fail_frontier(connection, site_name, detail_task.target_url, frontier_token,
-                                      retry_seconds=max(60, retry_at - time.time()), error_message=entry_failure.kind)
+                                      retry_seconds=max(60, retry_at - time.time()), error_message=entry_failure.kind,
+                                      failure_kind=entry_failure.kind)
                     record_failure(connection, entry_failure, finalization=True)
                     connection.commit()
             if completed is not None or owned:

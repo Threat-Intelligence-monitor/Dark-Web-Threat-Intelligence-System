@@ -283,7 +283,7 @@ def _raise_for_status(status: int, html: str, headers: Mapping[str, Any] | None)
     raise_for_http_status(status, html, headers=dict(headers or {}))
 
 
-def _raise_if_error_page(html: str) -> None:
+def _raise_if_error_page(html: str, *, status: int = 0) -> None:
     """Let the collector's own error templates win over the generic verdict.
 
     A 403 is often the source's permission or login page rather than an edge
@@ -291,12 +291,13 @@ def _raise_if_error_page(html: str) -> None:
     to view this page." with 403.  Reporting that as an unknown edge block sends
     the adapter down the browser route and burns the request budget on a wall
     that only a session can pass, so the specific diagnosis has to be tried
-    first.
+    first.  The status is forwarded because a board's permission page is only
+    recognisable by its combination of layout and refusal code.
     """
 
     from darkweb_collector.collection_errors import raise_if_error_page
 
-    raise_if_error_page(html)
+    raise_if_error_page(html, status=status)
 
 
 def _raise_for_signal(signal: ProtectionSignal, url: str, *, headers: Mapping[str, Any] | None,
@@ -313,7 +314,7 @@ def _raise_for_signal(signal: ProtectionSignal, url: str, *, headers: Mapping[st
         raise CollectionFailure("auth_required", _describe_failure(signal, url), scope="site")
     if signal.kind == "forbidden":
         if html:
-            _raise_if_error_page(html)
+            _raise_if_error_page(html, status=signal.status or 403)
         raise CollectionFailure("blocked", _describe_failure(signal, url), scope="target")
 
 

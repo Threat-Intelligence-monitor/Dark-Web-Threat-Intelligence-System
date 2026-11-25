@@ -27,7 +27,7 @@ _POOL_IDENTITY_TABLES: dict[tuple[str, str, str, str], frozenset[str]] = {}
 _POOL_GATES: dict[tuple[str, str, str, str], BoundedSemaphore] = {}
 _RUNTIME_SCHEMA_MIGRATION = "runtime_collector_schema_v1"
 _RUNTIME_TABLE_COLUMNS = {
-    "crawl_frontier": "site_name target_url section discovery_lane metadata_json observed_version fetched_version claimed_version artifacts_complete status lease_token lease_until next_retry first_seen_at observed_at updated_at last_claimed_at last_error",
+    "crawl_frontier": "site_name target_url section discovery_lane metadata_json observed_version fetched_version claimed_version artifacts_complete status lease_token lease_until next_retry first_seen_at observed_at updated_at last_claimed_at last_error failure_streak retired_at retire_reason",
     "crawl_frontier_admission": "site_name updated_at",
     "crawl_page_cursors": "site_name source_url next_page last_signature completed_at updated_at",
     "crawl_detail_control": "site_name target_url source_version request_count budget_until failure_count failure_kind next_retry last_error owner_token owner_until worker_pid worker_started activity_path body_hash updated_at",

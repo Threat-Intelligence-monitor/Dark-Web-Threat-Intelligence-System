@@ -197,3 +197,46 @@ darkforums 在不同出口上的待遇差别很大：有的出口明文 curl 就
 排查同类问题时，先确认「是不是在回放过期会话」：拿掉 `storage_state_path` 再跑一次，如果成功，问题就在会话而不是出口。
 
 
+﻿
+## 9. 失效目标退休与待执行队列
+
+同一条目标反复失败是队列里最大的隐性成本：一条已删除的帖子会先走 `direct` 再走浏览器，每次约 90 秒，而结果永远是 404。
+
+`crawl_frontier` 现在带三个字段：`failure_streak`（连续失败次数）、`retired_at`、`retire_reason`。默认阈值：
+
+| 失败类型 | 连续次数 | 环境变量覆盖 |
+|---|---|---|
+| `not_found`（404/410，帖子被删） | 2 | `DARKWEB_FRONTIER_RETIRE_NOT_FOUND` |
+| `parse`（页面拿到了但解析不出正文） | 3 | `DARKWEB_FRONTIER_RETIRE_PARSE` |
+
+达到阈值的目标变成 `retired`：不再被 `claim_frontier` 认领，`count_frontier_pending` 与 `frontier_counts` 都不再把它算进待办。站点恢复可访问后，可以在控制台点「恢复已退休」或调 `POST /api/collector/queue/retired/reset`（可限定 `site_name` / `target_url`）把它们放回队列。
+
+队列本身通过 `GET /api/collector/queue?site=&status=&page=&page_size=` 暴露，返回每条目标的站点、状态、来源分区与发现通道、`failure_streak`、`retire_reason`，以及 `pending/running/queued/retired` 汇总。`collector_metrics.build_queue_view` 是它的数据层。
+
+> 队列卡片的前端在 `threat-intelligence-dashboard/src/views/CollectorControl.vue`；线上控制台是另一套前端，接同样的接口即可显示。
+
+## 10. 登录态中枢（login broker）
+
+账号类站点（MyBB / XenForo）的正文只对登录用户开放，而 Cloudflare 的 clearance 与论坛会话是两码事：前者小时级、不需要账号；后者周/月级、必须有账号。
+
+一个地方管三件事：
+
+1. **凭证**：`<data_root>/credentials/<site>.json`，密码在 Windows 上走 DPAPI 加密（换机器或换账号解不开），非 Windows 退化为明文并保留 600 权限。
+   - 从桌面笔记导入：`python -m darkweb_collector.login_broker import "C:\path\accounts.txt"`（识别 `网址：…` / `账密：user/pass` 这种写法）
+   - 单条写入：`python -m darkweb_collector.login_broker set darkforums --username … --password …`
+2. **登录**：`python -m darkweb_collector.login_broker login darkforums` 会用无头浏览器打开站点自己的登录表单，填表、提交、确认出现登出链接，然后把 storage state 通过 `source_sessions.persist_browser_session` 提交。采集器无需改动，下一次请求就会用上这份会话。
+   - 登录页被托管挑战挡住时会先尝试解挑战；遇到 hCaptcha/reCAPTCHA 直接返回 `needs_human`，不会盲试。
+   - 结果：`logged_in` / `failed` / `needs_human` / `no_credentials` / `imported`（附 `step` 说明卡在哪一步）。
+3. **巡检**：`python -m darkweb_collector.login_broker status` 输出每个站点的 `valid` / `expired` / `missing`、cookie 数、会话年龄。会话超过 6 小时（见第 6 节）即判过期，这正是「保持登录」反而被 Cloudflare 硬 403 的根因。
+
+挑战与验证码过不去的站点（darkforums、breachforums、cracked 等实测都属于此类），走「真人登录一次 → 导出会话」：
+
+```bash
+# 在放着桌面的机器上跑，登录完成后自动保存
+python darkweb_collector/tools/capture_session.py darkforums --out darkforums.json
+
+# 在采集器主机上导入（或用 POST /api/collector/logins/<site>/state）
+python -m darkweb_collector.login_broker import-state darkforums --state-file darkforums.json
+```
+
+控制台接口：`GET /api/collector/logins`、`POST /api/collector/logins/<site>/refresh`、`POST /api/collector/logins/refresh`、`POST /api/collector/logins/<site>/state`。

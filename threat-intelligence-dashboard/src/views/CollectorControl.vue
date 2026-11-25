@@ -634,6 +634,111 @@
         <div v-else class="empty-state"><p>最近 24 小时没有失败或异常挂起任务。</p></div>
       </div>
     </section>
+
+    <section class="ti-card ti-reveal-up">
+      <div class="ti-card-header">
+        <div class="ti-card-title">待执行队列</div>
+        <div class="queue-toolbar">
+          <el-select v-model="queueFilters.site" size="small" style="width: 170px" @change="loadQueue">
+            <el-option label="全部站点" value="" />
+            <el-option v-for="site in queueSites" :key="site.site_name" :label="site.display_name" :value="site.site_name" />
+          </el-select>
+          <el-select v-model="queueFilters.status" size="small" style="width: 130px" @change="loadQueue">
+            <el-option v-for="option in queueStatusOptions" :key="option.value" :label="option.label" :value="option.value" />
+          </el-select>
+          <el-button size="small" :loading="queueLoading" @click="loadQueue">刷新</el-button>
+          <el-button size="small" type="warning" plain :disabled="!queueState.summary.retired" @click="resetRetiredTargets">
+            恢复已退休（{{ queueState.summary.retired }}）
+          </el-button>
+        </div>
+      </div>
+      <div class="ti-card-body">
+        <div class="queue-summary">
+          <span>待执行 <strong>{{ queueState.summary.pending }}</strong></span>
+          <span>执行中 <strong>{{ queueState.summary.running }}</strong></span>
+          <span>已入队 <strong>{{ queueState.summary.queued }}</strong></span>
+          <span>已退休 <strong>{{ queueState.summary.retired }}</strong></span>
+          <span class="queue-summary__note">404 连续 {{ queueState.retirement.not_found_after }} 次 / 解析失败连续 {{ queueState.retirement.parse_after }} 次即退休，不再进队列</span>
+        </div>
+        <el-table v-if="queueState.items.length" :data="queueState.items" size="small" max-height="420">
+          <el-table-column label="站点" prop="display_name" width="150" show-overflow-tooltip />
+          <el-table-column label="状态" width="96">
+            <template #default="{ row }">
+              <StatusBadge :label="queueStatusLabel(row.status)" :tone="queueStatusTone(row.status)" :dot="false" />
+            </template>
+          </el-table-column>
+          <el-table-column label="来源" width="150" show-overflow-tooltip>
+            <template #default="{ row }">
+              {{ row.section || '—' }}<span v-if="row.discovery_lane"> · {{ row.discovery_lane }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="目标" min-width="320" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span class="queue-target">{{ row.target }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="失败" width="72" align="right">
+            <template #default="{ row }">{{ row.failure_streak || 0 }}</template>
+          </el-table-column>
+          <el-table-column label="下次重试" prop="next_retry_at" width="150" show-overflow-tooltip />
+          <el-table-column label="备注" min-width="200" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.retire_reason || row.last_error || '—' }}</template>
+          </el-table-column>
+        </el-table>
+        <div v-else class="empty-state"><p>{{ queueLoading ? '正在读取队列…' : '当前筛选条件下没有排队目标。' }}</p></div>
+        <div v-if="queueState.total > queueState.items.length" class="queue-more">
+          共 {{ queueState.total }} 条，当前显示 {{ queueState.items.length }} 条
+        </div>
+      </div>
+    </section>
+    <section class="ti-card ti-reveal-up">
+      <div class="ti-card-header">
+        <div class="ti-card-title">登录态中枢</div>
+        <div class="queue-toolbar">
+          <el-button size="small" :loading="loginLoading" @click="loadLogins">刷新状态</el-button>
+          <el-button size="small" type="primary" :loading="loginRefreshing === 'all'" @click="refreshAllLogins">
+            全部重新登录
+          </el-button>
+        </div>
+      </div>
+      <div class="ti-card-body">
+        <p class="panel-note">
+          凭据存放在服务器 <code>{{ loginState.credential_root || 'credentials/' }}</code>（Windows 下用 DPAPI 加密）。
+          自动登录会被挑战页或验证码拦下时，可在本机运行
+          <code>python darkweb_collector/tools/capture_session.py &lt;site&gt;</code>，再用
+          <code>login_broker import-state</code> 导入真实浏览器会话。
+        </p>
+        <el-table v-if="loginState.items.length" :data="loginState.items" size="small">
+          <el-table-column label="站点" prop="site_name" width="150" show-overflow-tooltip />
+          <el-table-column label="登录态" width="110">
+            <template #default="{ row }">
+              <StatusBadge :label="loginStatusLabel(row.status)" :tone="loginStatusTone(row.status)" :dot="false" />
+            </template>
+          </el-table-column>
+          <el-table-column label="账号" width="130" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.has_credentials ? row.username || '已配置' : '未配置' }}</template>
+          </el-table-column>
+          <el-table-column label="Cookie" width="80" align="right">
+            <template #default="{ row }">{{ row.cookie_count || 0 }}</template>
+          </el-table-column>
+          <el-table-column label="会话年龄" width="110">
+            <template #default="{ row }">{{ loginAgeLabel(row) }}</template>
+          </el-table-column>
+          <el-table-column label="最后验证" prop="verified_at" min-width="180" show-overflow-tooltip />
+          <el-table-column label="操作" width="140">
+            <template #default="{ row }">
+              <el-button size="small" text type="primary" :loading="loginRefreshing === row.site_name"
+                         :disabled="!row.has_credentials" @click="refreshLogin(row.site_name)">
+                重新登录
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <div v-else class="empty-state">
+          <p>{{ loginLoading ? '正在读取登录状态…' : '还没有配置任何站点凭据。' }}</p>
+        </div>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -1308,6 +1413,8 @@ async function refreshAllPanels() {
     loadBotConfig(),
     loadDingTalkConfig(),
     loadTorBridgeStatus(),
+    loadQueue(),
+    loadLogins(),
   ])
 }
 
@@ -1786,6 +1893,185 @@ async function stopRansomwareSync() {
 
 function updateViewportWidth() {
   viewportWidth.value = window.innerWidth
+}
+
+const queueLoading = ref(false)
+const queueFilters = reactive({ site: '', status: '' })
+const queueState = ref({
+  items: [],
+  total: 0,
+  summary: { pending: 0, running: 0, queued: 0, retired: 0, completed: 0 },
+  retirement: { not_found_after: 2, parse_after: 3, status: 'retired' },
+  sites: [],
+})
+const queueSites = computed(() => queueState.value.sites || [])
+const queueStatusOptions = [
+  { label: '全部状态', value: '' },
+  { label: '待执行', value: 'pending' },
+  { label: '已入队', value: 'queued' },
+  { label: '执行中', value: 'running' },
+  { label: '已退休', value: 'retired' },
+]
+
+function queueStatusLabel(status) {
+  return {
+    pending: '待执行',
+    queued: '已入队',
+    dispatching: '调度中',
+    running: '执行中',
+    retired: '已退休',
+    done: '已完成',
+    legacy_queued: '历史队列',
+  }[status] || status || '未知'
+}
+
+function queueStatusTone(status) {
+  return {
+    pending: 'info',
+    queued: 'info',
+    dispatching: 'warning',
+    running: 'success',
+    retired: 'danger',
+    done: 'neutral',
+  }[status] || 'neutral'
+}
+
+async function loadQueue() {
+  queueLoading.value = true
+  try {
+    const query = new URLSearchParams({ page: '1', page_size: '50' })
+    if (queueFilters.site) query.set('site', queueFilters.site)
+    if (queueFilters.status) query.set('status', queueFilters.status)
+    const response = await fetchWithTimeout(`/api/collector/queue?${query.toString()}`)
+    if (!response.ok) throw new Error(await readApiError(response, `请求失败: ${response.status}`))
+    const payload = await response.json()
+    queueState.value = {
+      items: Array.isArray(payload?.items) ? payload.items : [],
+      total: Number(payload?.total || 0),
+      summary: { ...queueState.value.summary, ...(payload?.summary || {}) },
+      retirement: { ...queueState.value.retirement, ...(payload?.retirement || {}) },
+      sites: Array.isArray(payload?.sites) ? payload.sites : queueState.value.sites,
+    }
+  } catch (error) {
+    ElMessage.error(error.message || '读取待执行队列失败')
+  } finally {
+    queueLoading.value = false
+  }
+}
+
+async function resetRetiredTargets() {
+  const count = queueState.value.summary.retired
+  try {
+    await ElMessageBox.confirm(
+      `把 ${count} 条已退休目标恢复到待执行队列？只有在确认站点重新可访问时才需要这样做。`,
+      '恢复已退休目标',
+      { type: 'warning', confirmButtonText: '恢复', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    const response = await fetchWithTimeout(
+      '/api/collector/queue/retired/reset',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(queueFilters.site ? { site_name: queueFilters.site } : {}),
+      },
+      15000,
+    )
+    if (!response.ok) throw new Error(await readApiError(response, `请求失败: ${response.status}`))
+    const payload = await response.json()
+    ElMessage.success(`已恢复 ${payload?.released ?? 0} 条目标`)
+    await loadQueue()
+  } catch (error) {
+    ElMessage.error(error.message || '恢复已退休目标失败')
+  }
+}
+
+const loginLoading = ref(false)
+const loginRefreshing = ref('')
+const loginState = ref({ items: [], credential_root: '' })
+
+function loginStatusLabel(status) {
+  return {
+    valid: '有效',
+    expired: '已过期',
+    missing: '未登录',
+    unverified: '待验证',
+  }[status] || status || '未知'
+}
+
+function loginStatusTone(status) {
+  return {
+    valid: 'success',
+    expired: 'warning',
+    missing: 'neutral',
+    unverified: 'info',
+  }[status] || 'neutral'
+}
+
+function loginAgeLabel(row) {
+  const seconds = Number(row?.age_seconds || 0)
+  if (!seconds) return '—'
+  if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟`
+  return `${(seconds / 3600).toFixed(1)} 小时`
+}
+
+async function loadLogins() {
+  loginLoading.value = true
+  try {
+    const response = await fetchWithTimeout('/api/collector/logins')
+    if (!response.ok) throw new Error(await readApiError(response, `请求失败: ${response.status}`))
+    const payload = await response.json()
+    loginState.value = {
+      items: Array.isArray(payload?.items) ? payload.items : [],
+      credential_root: payload?.credential_root || loginState.value.credential_root,
+    }
+  } catch (error) {
+    ElMessage.error(error.message || '读取登录状态失败')
+  } finally {
+    loginLoading.value = false
+  }
+}
+
+async function refreshLogin(siteName) {
+  loginRefreshing.value = siteName
+  try {
+    const response = await fetchWithTimeout(
+      `/api/collector/logins/${encodeURIComponent(siteName)}/refresh`, { method: 'POST' }, 120000)
+    if (!response.ok) throw new Error(await readApiError(response, `请求失败: ${response.status}`))
+    const report = await response.json()
+    if (report?.ok) {
+      ElMessage.success(`${siteName} 登录成功`)
+    } else if (report?.needs_human) {
+      ElMessage.warning(`${siteName} 需要人工验证：${report.detail || report.status}`)
+    } else {
+      ElMessage.error(`${siteName} 登录失败：${report?.detail || report?.status || '未知原因'}`)
+    }
+    await loadLogins()
+  } catch (error) {
+    ElMessage.error(error.message || '重新登录失败')
+  } finally {
+    loginRefreshing.value = ''
+  }
+}
+
+async function refreshAllLogins() {
+  loginRefreshing.value = 'all'
+  try {
+    const response = await fetchWithTimeout('/api/collector/logins/refresh', { method: 'POST' }, 300000)
+    if (!response.ok) throw new Error(await readApiError(response, `请求失败: ${response.status}`))
+    const payload = await response.json()
+    const items = Array.isArray(payload?.items) ? payload.items : []
+    const ok = items.filter((item) => item.ok).length
+    ElMessage.success(`重新登录完成：${ok}/${items.length} 成功`)
+    await loadLogins()
+  } catch (error) {
+    ElMessage.error(error.message || '批量重新登录失败')
+  } finally {
+    loginRefreshing.value = ''
+  }
 }
 
 onMounted(async () => {
@@ -2338,5 +2624,45 @@ onBeforeUnmount(() => {
     width: 100%;
     justify-self: stretch;
   }
+}
+
+.queue-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.queue-summary {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--ti-text-secondary, #5b6470);
+
+  strong {
+    margin-left: 4px;
+    color: var(--ti-text-primary, #1f2430);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.queue-summary__note {
+  font-size: 12px;
+  color: var(--ti-text-tertiary, #8b939f);
+}
+
+.queue-target {
+  font-family: var(--ti-font-mono, 'SFMono-Regular', Consolas, monospace);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.queue-more {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--ti-text-tertiary, #8b939f);
 }
 </style>
