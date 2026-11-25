@@ -240,3 +240,17 @@ python -m darkweb_collector.login_broker import-state darkforums --state-file da
 ```
 
 控制台接口：`GET /api/collector/logins`、`POST /api/collector/logins/<site>/refresh`、`POST /api/collector/logins/refresh`、`POST /api/collector/logins/<site>/state`。
+
+## 11. 独立采集控制台（没有前端也能操作）
+
+线上控制台是另一套前端，改本仓库的 `threat-intelligence-dashboard/` 不会出现在那个页面上。为了不改前端也能操作队列与登录态，服务端直接托管了一个自包含页面：
+
+- `GET /collector-console`
+- `GET /api/collector-console` —— 反向代理只转发 `/api/*` 时用这个地址；页面本身公开（只含一个要用户填管理员密码的登录框），它读的数据仍然走带 Bearer Token 的 `/api/collector/*`。
+
+页面里两块：
+
+1. **待执行队列**：按站点/状态过滤、按目标或分区搜索、分页；汇总行显示 `待执行 / 已排队 / 采集中 / 已退休 / 已完成`；「恢复已退休」把 `retired` 放回 `pending`。
+2. **登录态中枢**：每个站点的登录状态、账号、Cookie 数、会话年龄、最近验证时间；「登录」触发 broker 重登；底部「导入会话」上传 `capture_session.py` 导出的 JSON。
+
+状态文案：`pending 待执行`、`queued 已排队`、`dispatching 派发中`、`running 采集中`、`retired 已退休`、`done 已完成`；登录态 `missing 无会话`、`valid 有效`、`expiring 即将过期`、`expired 已过期`、`invalid_state 会话无效`、`unverified 未验证`、`needs_human 需要人工`。

@@ -254,6 +254,9 @@ AUTH_EXEMPT_PATHS = {
     "/api/health",
     "/api/system/version",
     "/api/system/update/status",
+    # The console page is HTML that collects a token itself; the data it reads
+    # still goes through the authorized API routes.
+    "/api/collector-console",
 }
 def _auth_enabled() -> bool:
     return os.environ.get("DARKWEB_API_AUTH_DISABLED") != "1"
@@ -560,11 +563,14 @@ def healthcheck_page() -> FileResponse:
 
 @app.get("/collector-console", include_in_schema=False)
 @app.get("/collector-console/", include_in_schema=False)
+@app.get("/api/collector-console", include_in_schema=False)
 def collector_console_page() -> FileResponse:
     """Serve the queue and login console.
 
     The dashboard that ships with the product is a separate build, so this small
     standalone page is what an operator gets without rebuilding the front end.
+    ``/api/collector-console`` exists because a reverse proxy may only forward
+    ``/api/*`` to this service; the page itself is public and asks for the token.
     """
     path = Path(__file__).resolve().parents[2] / "templates" / "collector_console.html"
     return FileResponse(path, media_type="text/html", headers={"Cache-Control": "no-store"})
