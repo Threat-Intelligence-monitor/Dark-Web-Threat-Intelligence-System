@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -577,14 +578,18 @@ def probe(site_name: str, *, config=None, proxy_server: str | None = None) -> di
         # a session" from "has a file we cannot judge", which is what the
         # console shows.
         exists = state_path.exists()
+        state = login_state(site_name)
         return {"site_name": site_name, "status": "unverified" if exists else "missing",
                 "detail": "no URL known for this site", "has_credentials": bool(credentials),
                 "cookie_count": 0, "age_seconds": 0.0, "path": str(state_path),
                 "max_age_seconds": None, "origin": "", "user_agent": "", "browser_engine": "",
-                "verified_at": "", "revision": ""}
+                "verified_at": "", "revision": "",
+                "busy": state["busy"], "last_result": state["last"]}
     info = session_status(state_path, url, proxy_server)
+    state = login_state(site_name)
     info.update({"site_name": site_name, "has_credentials": bool(credentials),
-                 "username": credentials.username if credentials else ""})
+                 "username": credentials.username if credentials else "",
+                 "busy": state["busy"], "last_result": state["last"]})
     return info
 
 
@@ -600,6 +605,81 @@ def status_all() -> list[dict]:
 
 def login_all(*, headless: bool = True) -> list[LoginReport]:
     return [login(name, headless=headless) for name in configured_sites()]
+
+
+# --- background logins -------------------------------------------------------
+#
+# Driving a browser through a login takes 10-75 seconds, so the console cannot
+# wait on the HTTP response: the request would time out and every control would
+# stay disabled with nothing to show for it.  Each site therefore gets a
+# worker thread, and the status endpoint reports `busy` while it runs.
+_LOGIN_LOCK = threading.Lock()
+_LOGIN_STATE: dict[str, dict[str, Any]] = {}
+
+
+def _set_login_state(site_name: str, **fields: Any) -> None:
+    with _LOGIN_LOCK:
+        _LOGIN_STATE.setdefault(site_name, {}).update(fields)
+
+
+def login_state(site_name: str) -> dict:
+    """Whether a background login is running for this site, and its last result."""
+    with _LOGIN_LOCK:
+        entry = _LOGIN_STATE.get(site_name) or {}
+        return {"busy": bool(entry.get("busy")), "last": entry.get("last"),
+                "started_at": float(entry.get("started_at") or 0.0)}
+
+
+def busy_sites() -> list[str]:
+    with _LOGIN_LOCK:
+        return sorted(name for name, entry in _LOGIN_STATE.items() if entry.get("busy"))
+
+
+def _run_login(site_name: str, headless: bool) -> None:
+    report: LoginReport
+    try:
+        report = login(site_name, headless=headless)
+    except Exception as exc:  # pragma: no cover - defensive, login() reports its own failures
+        logger.exception("background login crashed for %s", site_name)
+        report = LoginReport(site_name, False, "failed", "internal", str(exc))
+    _set_login_state(site_name, busy=False, last=report.as_dict(), finished_at=time.time())
+    logger.info("background login site=%s ok=%s status=%s", site_name, report.ok, report.status)
+
+
+def start_login(site_name: str, *, headless: bool = True) -> bool:
+    """Start a login for one site on a worker thread.
+
+    Returns ``False`` when that site already has a login in flight, so a double
+    click cannot stack two browsers against the same account.
+    """
+    with _LOGIN_LOCK:
+        entry = _LOGIN_STATE.setdefault(site_name, {})
+        if entry.get("busy"):
+            return False
+        entry.update({"busy": True, "started_at": time.time(), "last": None})
+    thread = threading.Thread(target=_run_login, args=(site_name, headless),
+                              name=f"login-{site_name}", daemon=True)
+    thread.start()
+    return True
+
+
+def start_login_all(*, headless: bool = True) -> list[str]:
+    """Queue a login for every configured site, one after another."""
+    names = configured_sites()
+    queued: list[str] = []
+    with _LOGIN_LOCK:
+        for name in names:
+            if not (_LOGIN_STATE.setdefault(name, {}).get("busy")):
+                queued.append(name)
+
+    def worker() -> None:
+        for name in queued:
+            if start_login(name, headless=headless):
+                while login_state(name)["busy"]:
+                    time.sleep(1.0)
+
+    threading.Thread(target=worker, name="login-all", daemon=True).start()
+    return queued
 
 
 # --- CLI ---------------------------------------------------------------------

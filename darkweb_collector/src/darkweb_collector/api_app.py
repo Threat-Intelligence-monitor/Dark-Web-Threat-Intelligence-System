@@ -1468,14 +1468,34 @@ def collector_login_save_credentials(request: Request, site_name: str, payload: 
 
 @app.post("/api/collector/logins/{site_name}/refresh")
 def collector_login_refresh(request: Request, site_name: str) -> dict:
-    """Log in with the stored credentials and replace this site's session."""
-    _require_collector_access(request)
-    from darkweb_collector.login_broker import login
+    """Start a login for this site and return immediately.
 
-    report = login(site_name)
-    if report.status == "no_credentials":
-        raise HTTPException(status_code=404, detail=report.detail)
-    return report.as_dict()
+    The browser flow takes 10-75 seconds; holding the HTTP request open made the
+    console look frozen (every control disabled) and timed out in the proxy.  The
+    status endpoint reports ``busy`` until the worker finishes.
+    """
+    _require_collector_access(request)
+    from darkweb_collector.login_broker import load_credentials, start_login
+
+    try:
+        credentials = load_credentials(site_name)
+    except Exception:  # pragma: no cover - defensive
+        credentials = None
+    if credentials is None:
+        raise HTTPException(status_code=404, detail="该站点还没有保存账号")
+    if not start_login(site_name):
+        raise HTTPException(status_code=409, detail="该站点正在登录，请稍候")
+    return {"site_name": site_name, "started": True}
+
+
+@app.post("/api/collector/logins/refresh")
+def collector_logins_refresh_all(request: Request) -> dict:
+    """Start a login for every site that has credentials."""
+    _require_collector_access(request)
+    from darkweb_collector.login_broker import start_login_all
+
+    queued = start_login_all()
+    return {"queued": queued, "count": len(queued)}
 
 
 @app.post("/api/collector/logins/{site_name}/state")
@@ -1489,15 +1509,6 @@ def collector_login_import_state(request: Request, site_name: str, payload: dict
     except Exception as exc:  # pragma: no cover - defensive for malformed uploads
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return report.as_dict()
-
-
-@app.post("/api/collector/logins/refresh")
-def collector_login_refresh_all(request: Request) -> dict:
-    """Refresh every site that has credentials on file."""
-    _require_collector_access(request)
-    from darkweb_collector.login_broker import login_all
-
-    return {"items": [report.as_dict() for report in login_all()]}
 
 
 @app.get("/api/sites/{site_name}/cookie")

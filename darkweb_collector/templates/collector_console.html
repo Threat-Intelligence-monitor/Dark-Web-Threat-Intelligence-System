@@ -144,7 +144,7 @@
     'use strict';
     const $ = (id) => document.getElementById(id);
     const tokenKey = 'dwti-collector-console-token';
-    let token = '', queuePage = 1, queuePages = 1, busy = false;
+    let token = '', queuePage = 1, queuePages = 1, busy = false, loginPoll = null;
     try { token = sessionStorage.getItem(tokenKey) || ''; } catch {}
 
     function node(tag, text, className = '') {
@@ -283,15 +283,25 @@
         const row = document.createElement('tr');
         const siteCell = node('td', item.site_name);
         const statusCell = document.createElement('td');
-        statusCell.append(pill(loginLabels[item.status] || item.status, item.status));
+        if (item.busy) {
+          statusCell.append(pill('登录中…', 'pending'));
+        } else {
+          statusCell.append(pill(loginLabels[item.status] || item.status, item.status));
+          const last = item.last_result;
+          if (last && !last.ok) {
+            const note = node('div', last.needs_human ? '需要人工' : (last.status || '失败'), 'note');
+            note.title = last.detail || '';
+            statusCell.append(note);
+          }
+        }
         const userCell = node('td', item.username || '—');
         const cookieCell = node('td', item.cookie_count ? String(item.cookie_count) : '—');
         const ageCell = node('td', ageLabel(item.age_seconds));
         const verifiedCell = node('td', item.verified_at ? timeLabel(item.verified_at) : '—');
         const actionCell = document.createElement('td');
-        const button = node('button', item.status === 'valid' ? '重新登录' : '登录');
+        const button = node('button', item.busy ? '登录中…' : (item.status === 'valid' ? '重新登录' : '登录'));
         button.type = 'button';
-        button.disabled = busy || !item.has_credentials;
+        button.disabled = busy || item.busy || !item.has_credentials;
         button.addEventListener('click', () => refreshLogin(item.site_name));
         actionCell.append(button);
         row.append(siteCell, statusCell, userCell, cookieCell, ageCell, verifiedCell, actionCell);
@@ -337,27 +347,49 @@
     async function loadLogins() {
       const payload = await request('/api/collector/logins');
       renderLogins(payload);
+      if ((payload.items || []).some((item) => item.busy)) pollLogins();
+    }
+
+    function pollLogins() {
+      if (loginPoll) return;
+      loginPoll = setInterval(async () => {
+        try {
+          const payload = await request('/api/collector/logins');
+          renderLogins(payload);
+          const running = (payload.items || []).filter((item) => item.busy);
+          if (running.length) {
+            message(`正在登录：${running.map((item) => item.site_name).join('、')}…`);
+            return;
+          }
+          clearInterval(loginPoll); loginPoll = null;
+          const results = (payload.items || []).filter((item) => item.last_result);
+          const failed = results.filter((item) => !item.last_result.ok);
+          const human = failed.filter((item) => item.last_result.needs_human).length;
+          if (!results.length) message('登录已结束');
+          else if (!failed.length) message(`登录完成：${results.length} 个站点成功`);
+          else message(`登录结束：${failed.length} 个站点未成功${human ? `（其中 ${human} 个需要人工）` : ''}`);
+        } catch (error) {
+          clearInterval(loginPoll); loginPoll = null;
+          message(String(error.message || error));
+        }
+      }, 2500);
     }
 
     async function refreshLogin(site) {
-      setBusy(true, `正在让 ${site} 重新登录…`);
+      message(`已把 ${site} 交给后台登录，页面可以继续操作…`);
       try {
-        const report = await request(`/api/collector/logins/${encodeURIComponent(site)}/refresh`, { method: 'POST' });
-        message(report && report.ok ? `${site} 已登录` : `${site}：${(report && (report.detail || report.status)) || '未知结果'}`);
-        await loadLogins();
+        await request(`/api/collector/logins/${encodeURIComponent(site)}/refresh`, { method: 'POST' });
+        pollLogins();
       } catch (error) { message(String(error.message || error)); }
-      finally { setBusy(false); }
     }
 
     async function refreshAllLogins() {
-      setBusy(true, '正在依次刷新所有站点…');
+      message('已把有账号的站点交给后台依次登录…');
       try {
-        const reports = await request('/api/collector/logins/refresh', { method: 'POST' });
-        const failed = (reports || []).filter((report) => !report.ok).length;
-        message(failed ? `刷新完成，${failed} 个站点需要关注` : '全部站点登录成功');
-        await loadLogins();
+        const payload = await request('/api/collector/logins/refresh', { method: 'POST' });
+        if (!payload || !payload.count) { message('没有可登录的站点：先添加账号'); return; }
+        pollLogins();
       } catch (error) { message(String(error.message || error)); }
-      finally { setBusy(false); }
     }
 
     async function resetRetired() {
