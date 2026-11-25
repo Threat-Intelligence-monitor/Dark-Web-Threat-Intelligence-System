@@ -4,11 +4,14 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 import time
 
 from darkweb_collector.models import DetailTask
 
+
+logger = logging.getLogger(__name__)
 
 DISPATCH_RESERVATION_SECONDS = 60
 RETIRED_STATUS = "retired"
@@ -119,20 +122,62 @@ def ensure_frontier_schema(connection) -> None:
     ensure_collection_schema(connection)
 
 
+def _is_duplicate_column(exc: BaseException) -> bool:
+    """True when *exc* only says the column is already there.
+
+    SQLite spells it "duplicate column name"; psycopg raises ``DuplicateColumn``
+    whose ``str()`` is just the class name, so the message alone is not enough.
+    """
+    if str(getattr(exc, "sqlstate", "") or getattr(exc, "pgcode", "") or "") == "42701":
+        return True
+    name = type(exc).__name__.lower()
+    if "duplicatecolumn" in name:
+        return True
+    message = str(exc).lower()
+    return "duplicate column" in message or "already exists" in message
+
+
+def _rollback_to_savepoint(connection, savepoint: str) -> None:
+    """Undo a failed ALTER without poisoning the surrounding transaction.
+
+    PostgreSQL aborts the whole transaction on any error; swallowing the
+    exception alone leaves the connection unusable ("InFailedSqlTransaction")
+    and the next query fails for an unrelated reason.
+    """
+    for statement in (f"ROLLBACK TO SAVEPOINT {savepoint}", f"RELEASE SAVEPOINT {savepoint}"):
+        try:
+            connection.execute(statement)
+        except Exception:  # noqa: BLE001 - best effort cleanup
+            logger.debug("frontier schema savepoint cleanup failed: %s", statement, exc_info=True)
+
+
 def _add_frontier_columns(connection) -> None:
     """Upgrade a frontier table that predates the retirement bookkeeping.
 
     ``CREATE TABLE IF NOT EXISTS`` never widens an existing table, so existing
     installs need an explicit ALTER.  Both SQLite and PostgreSQL report a
-    duplicate column; that is the only error we swallow here.
+    duplicate column; that is the only error we swallow here, and it is undone
+    through a savepoint so the connection stays inside a usable transaction.
     """
     for name, definition in FRONTIER_ADDED_COLUMNS:
+        savepoint = f"dwti_frontier_add_{name}"
+        try:
+            connection.execute(f"SAVEPOINT {savepoint}")
+        except Exception:  # noqa: BLE001 - dialect without savepoints
+            try:
+                connection.execute(f"ALTER TABLE crawl_frontier ADD COLUMN {name} {definition}")
+            except Exception as exc:  # noqa: BLE001 - dialect specific duplicate column
+                if not _is_duplicate_column(exc):
+                    raise
+            continue
         try:
             connection.execute(f"ALTER TABLE crawl_frontier ADD COLUMN {name} {definition}")
-        except Exception as exc:  # noqa: BLE001 - dialect specific duplicate column errors
-            message = str(exc).lower()
-            if "duplicate column" not in message and "already exists" not in message:
+        except Exception as exc:  # noqa: BLE001 - dialect specific duplicate column
+            _rollback_to_savepoint(connection, savepoint)
+            if not _is_duplicate_column(exc):
                 raise
+        else:
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
 
 def _timestamp(now: float | None) -> float:
