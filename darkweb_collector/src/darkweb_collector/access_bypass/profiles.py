@@ -132,13 +132,16 @@ BUILTIN_DEFAULTS: dict[str, dict[str, Any]] = {
         "challenge_interactive": False,
     },
     "pwnfrm": {
-        "hosts": [],
-        "protection": "tor",
-        "http_strategy": "curl",
-        "browser_engine": "firefox",
-        "stealth": "basic",
-        "challenge_interactive": False,
-        "notes": "MyBB onion mirror; disabled in sites.yaml, cookie auth via env",
+        "hosts": ["pwnforums.st", "www.pwnforums.st"],
+        "protection": "cloudflare",
+        "http_strategy": "auto",
+        "impersonate": "chrome",
+        "browser_engine": "chromium",
+        "stealth": "full",
+        "challenge_interactive": True,
+        "challenge_wait_seconds": 30.0,
+        "notes": "Clearnet mirror pwnforums.st (the .onion has been dead since 2026-07); "
+                 "Cloudflare managed challenge in front of MyBB",
     },
     "chaos": {
         "hosts": ["hptqq2o2qjva7lcaaq67w36jihzivkaitkexorauw7b2yul2z6zozpqd.onion"],

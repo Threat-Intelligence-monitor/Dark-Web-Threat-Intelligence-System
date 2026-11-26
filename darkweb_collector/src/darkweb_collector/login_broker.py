@@ -606,9 +606,13 @@ def import_session_state(site_name: str, payload: dict, *, config=None, proxy_se
     elapsed = int((time.monotonic() - started) * 1000)
     cookies = len([cookie for cookie in state.get("cookies", []) if isinstance(cookie, dict)])
     logger.info("import_state site=%s cookies=%d committed=%s", site_name, cookies, committed)
-    return LoginReport(site_name, True, "imported", "import",
-                       "session stored" if committed else "a newer session replaced the imported one",
-                       False, elapsed, cookies, str(state_path), user_agent)
+    report = LoginReport(site_name, True, "imported", "import",
+                         "session stored" if committed else "a newer session replaced the imported one",
+                         False, elapsed, cookies, str(state_path), user_agent)
+    # Keep the console row consistent: a successful import must not keep showing
+    # the previous failed attempt as its last result.
+    _set_login_state(site_name, busy=False, last=report.as_dict(), finished_at=time.time())
+    return report
 
 
 def probe(site_name: str, *, config=None, proxy_server: str | None = None) -> dict:

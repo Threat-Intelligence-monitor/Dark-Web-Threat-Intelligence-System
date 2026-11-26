@@ -18,11 +18,15 @@ from darkweb_collector.sites.darkforums import (
 )
 
 
-PWNFRM_ONION_HOST = "pwnfrm7rbf6kyerigxi677lcz5ifmoagdbqqknwdu2by27wfdst5qmqd.onion"
+PWNFRM_HOST = "pwnforums.st"
 
+# Clearnet mirror (the .onion mirror has been unreachable since 2026-07).
+# MyBB board, same forum slugs as before, behind a Cloudflare managed challenge.
 FORUM_SECTIONS = {
-    "databases": f"http://{PWNFRM_ONION_HOST}/Forum-Databases?sortby=started&order=desc&datecut=9999&prefix=0",
-    "other_leaks": f"http://{PWNFRM_ONION_HOST}/Forum-Other-Leaks?sortby=started&order=desc&datecut=9999&prefix=0",
+    "databases": f"https://{PWNFRM_HOST}/Forum-Databases?sortby=started&order=desc&datecut=9999&prefix=0",
+    "other_leaks": f"https://{PWNFRM_HOST}/Forum-Other-Leaks?sortby=started&order=desc&datecut=9999&prefix=0",
+    "sellers_place": f"https://{PWNFRM_HOST}/Forum-Sellers-Place?sortby=started&order=desc&datecut=9999&prefix=0",
+    "stealer_logs": f"https://{PWNFRM_HOST}/Forum-Stealer-Logs?sortby=started&order=desc&datecut=9999&prefix=0",
 }
 
 
