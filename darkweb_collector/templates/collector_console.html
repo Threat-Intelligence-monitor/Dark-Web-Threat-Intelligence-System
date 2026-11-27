@@ -112,9 +112,13 @@
       <section class="panel" aria-live="polite" id="logins-panel">
         <div class="heading">
           <h2>登录态中枢</h2>
-          <div class="actions"><button id="logins-refresh" type="button">刷新全部</button></div>
+          <div class="actions">
+            <button id="logins-cycle" type="button">立即检查续期</button>
+            <button id="logins-refresh" type="button">刷新全部</button>
+          </div>
         </div>
         <p class="note">「刷新」会让服务端用已保存的账号重新登录该站；登录页有强挑战的站点会返回「需要人工」，这时请在浏览器登录一次后导出会话，再从下面的导入框上传。</p>
+        <p class="note" id="refresh-policy">自动续期：读取中…</p>
         <div class="table-wrap">
           <table>
             <thead><tr><th>站点</th><th>状态</th><th>账号</th><th>Cookie</th><th>会话年龄</th><th>最近验证</th><th>操作</th></tr></thead>
@@ -392,6 +396,40 @@
       } catch (error) { message(String(error.message || error)); }
     }
 
+    function describeSchedule(payload) {
+      const items = (payload && payload.items) || [];
+      const hours = Math.round(((payload && payload.refresh_after_seconds) || 0) / 360) / 10;
+      const minutes = Math.max(1, Math.round(((payload && payload.poll_seconds) || 600) / 60));
+      const due = items.filter((item) => item.due).map((item) => item.site_name);
+      const human = items.filter((item) => item.last_status === 'needs_human').map((item) => item.site_name);
+      const parts = [`自动续期：每 ${minutes} 分钟检查一次，会话满 ${hours} 小时就提前重登。`];
+      if (due.length) parts.push(`本次待续期：${due.join('、')}。`);
+      if (human.length) parts.push(`上次需要人工：${human.join('、')}（自动登录过不去的站点，只能用「导入会话」）。`);
+      return parts.join('');
+    }
+
+    async function loadSchedule() {
+      try {
+        const payload = await request('/api/collector/logins/schedule');
+        $('refresh-policy').textContent = describeSchedule(payload);
+      } catch (error) {
+        $('refresh-policy').textContent = `自动续期状态读取失败：${error.message || error}`;
+      }
+    }
+
+    async function runRefreshCycle() {
+      message('正在检查哪些站点的会话该续期…');
+      try {
+        const payload = await request('/api/collector/logins/schedule/refresh', { method: 'POST' });
+        const refreshed = (payload && payload.refreshed) || [];
+        const failed = (payload && payload.failed) || [];
+        if (!refreshed.length && !failed.length) message('所有会话都在有效期内，无需续期');
+        else message(`续期完成：成功 ${refreshed.length} 个${refreshed.length ? '（' + refreshed.join('、') + '）' : ''}${failed.length ? `，失败 ${failed.length} 个（${failed.join('、')}）` : ''}`);
+        await loadLogins();
+        await loadSchedule();
+      } catch (error) { message(String(error.message || error)); }
+    }
+
     async function resetRetired() {
       const retired = Number($('queue-reset-retired').dataset.count || 0);
       if (!retired) return;
@@ -444,7 +482,7 @@
     async function start() {
       setBusy(false);
       try {
-        await Promise.all([loadQueue(), loadLogins()]);
+        await Promise.all([loadQueue(), loadLogins(), loadSchedule()]);
         showPages();
         message();
       } catch (error) {
@@ -472,6 +510,7 @@
     $('queue-next').addEventListener('click', () => { if (queuePage < queuePages) { queuePage += 1; setBusy(true); loadQueue().catch((error) => message(String(error.message || error))).finally(() => setBusy(false)); } });
     $('queue-reset-retired').addEventListener('click', resetRetired);
     $('logins-refresh').addEventListener('click', refreshAllLogins);
+    $('logins-cycle').addEventListener('click', runRefreshCycle);
     $('import-form').addEventListener('submit', (event) => { event.preventDefault(); importSession(); });
     $('account-form').addEventListener('submit', (event) => { event.preventDefault(); saveAccount(); });
 

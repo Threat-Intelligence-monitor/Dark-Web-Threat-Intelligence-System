@@ -359,6 +359,15 @@ def execute_detail_job(
     def record_failure(connection, failure, *, finalization=False):
         reason = safe_failure_text(str(failure))
         message = f"{failure.kind}: task finalization failed; {reason}" if finalization else f"{failure.kind}: {reason}"
+        # A wall that a fresh login could clear should pull the next renewal
+        # forward instead of waiting for the timer; a dead link must not.
+        if failure.kind in {"auth_required", "restricted", "blocked"}:
+            try:
+                from darkweb_collector.session_refresh import request_refresh
+
+                request_refresh(site_name, reason=failure.kind)
+            except Exception:  # noqa: BLE001 - scheduling is best effort
+                logger.debug("could not schedule a session refresh for %s", site_name, exc_info=True)
         connection.execute("""UPDATE crawl_jobs SET status = ?, finished_at = ?, duration_ms = ?, error_message = ?
             WHERE job_id = ? AND site_name = ? AND target = ?
                 AND status IN ('enqueued', 'running') AND finished_at IS NULL""",

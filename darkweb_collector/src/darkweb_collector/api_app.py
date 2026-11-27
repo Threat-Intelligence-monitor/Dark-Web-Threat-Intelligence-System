@@ -514,6 +514,12 @@ def warm_payloads_on_startup() -> None:
     except Exception:
         logger.exception("failed to start daily site connectivity monitor")
     try:
+        from darkweb_collector.session_refresh import start_worker as start_session_refresh_worker
+
+        start_session_refresh_worker()
+    except Exception:
+        logger.exception("failed to start the session refresh worker")
+    try:
         start_normalization_worker()
     except Exception:
         logger.exception("failed to start normalized intelligence background refresh")
@@ -542,6 +548,12 @@ def stop_background_workers() -> None:
     stop_tor_bridge_recovery()
     stop_normalization_worker()
     stop_social_worker()
+    try:
+        from darkweb_collector.session_refresh import stop_worker as stop_session_refresh_worker
+
+        stop_session_refresh_worker()
+    except Exception:
+        logger.exception("failed to stop the session refresh worker")
 
 
 @app.get("/api/health")
@@ -1434,6 +1446,28 @@ def collector_login_status(request: Request) -> dict:
     from darkweb_collector.login_broker import status_all
 
     return {"items": status_all()}
+
+
+@app.get("/api/collector/logins/schedule")
+def collector_login_schedule(request: Request) -> dict:
+    """When each site's session will be renewed, and why it is due (or not)."""
+    _require_collector_access(request)
+    from darkweb_collector.session_refresh import poll_seconds, refresh_after_seconds, schedule
+
+    return {
+        "items": schedule(),
+        "refresh_after_seconds": refresh_after_seconds(),
+        "poll_seconds": poll_seconds(),
+    }
+
+
+@app.post("/api/collector/logins/schedule/refresh")
+def collector_login_schedule_refresh(request: Request) -> dict:
+    """Run one renewal cycle now instead of waiting for the timer."""
+    _require_collector_access(request)
+    from darkweb_collector.session_refresh import refresh_due
+
+    return refresh_due()
 
 
 @app.post("/api/collector/logins/{site_name}/credentials")
